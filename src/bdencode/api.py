@@ -128,7 +128,12 @@ def create_app(
     async def configuration_handler(
         _request: Request, exc: ConfigurationError
     ) -> JSONResponse:
-        return JSONResponse(status_code=422, content={"detail": str(exc)})
+        content: dict[str, object] = {"detail": str(exc)}
+        if exc.code:
+            content["code"] = exc.code
+        if exc.context:
+            content["context"] = exc.context
+        return JSONResponse(status_code=422, content=content)
 
     @application.get(f"{API_PREFIX}/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -349,7 +354,13 @@ def create_app(
             scan = _scan_from_dict(scan_row.result)
             selection = parse_selection(candidate, scan)
         except ReviewRequired as exc:
-            raise ConfigurationError(str(exc)) from exc
+            details = dict(exc.details)
+            code = details.pop("code", None)
+            raise ConfigurationError(
+                str(exc),
+                code=str(code) if code else None,
+                context=details,
+            ) from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise ConfigurationError(f"stored scan result is invalid: {exc}") from exc
 

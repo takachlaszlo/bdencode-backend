@@ -14,6 +14,10 @@ from typing import Sequence
 
 from .config import Settings, load_settings
 from .db import Database
+from .models import JobState
+
+
+INSTALL_SAFE_OPERATOR_PAUSES = frozenset({JobState.AWAITING_SELECTION})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,8 +52,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--json", action="store_true", help="retained for scripting compatibility"
     )
-    commands.add_parser(
+    queue_idle = commands.add_parser(
         "queue-idle", help="succeed only when no job blocks the pipeline"
+    )
+    queue_idle.add_argument(
+        "--allow-review",
+        action="store_true",
+        help=(
+            "also succeed only for AWAITING_SELECTION; NEEDS_REVIEW and all "
+            "runnable pipeline states remain busy"
+        ),
     )
     return parser
 
@@ -196,6 +208,9 @@ def _queue_idle(args: argparse.Namespace) -> int:
     database.initialize()
     active = database.active_job()
     if active is not None:
+        if args.allow_review and active.state in INSTALL_SAFE_OPERATOR_PAUSES:
+            print(f"operator-pause: {active.id} {active.state.value}")
+            return 0
         print(f"busy: {active.id} {active.state.value}", file=sys.stderr)
         # A distinct code lets maintenance scripts distinguish an expected
         # busy queue from an unreadable database or invalid configuration.

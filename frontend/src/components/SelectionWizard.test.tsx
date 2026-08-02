@@ -2,7 +2,7 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SelectionValidation } from "../api/types";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import { makeJob, makeScan } from "../test/fixtures";
 import { renderApp } from "../test/render";
 import { SelectionWizard } from "./SelectionWizard";
@@ -120,5 +120,90 @@ describe("SelectionWizard", () => {
     await user.click(screen.getByRole("button", { name: "Tovább" }));
     expect(screen.getByRole("heading", { name: "Hangsávok" })).toBeInTheDocument();
     expect(screen.getByDisplayValue("eng")).toBeInTheDocument();
+  });
+
+  it("lists missing source color fields and sends the explicitly confirmed BD defaults", async () => {
+    const user = userEvent.setup();
+    const scan = makeScan();
+    const sourceVideo = scan.playlists[0].streams[0].video;
+    if (!sourceVideo) throw new Error("A teszt videósávja hiányzik");
+    scan.playlists[0].streams[0] = {
+      ...scan.playlists[0].streams[0],
+      video: {
+        ...sourceVideo,
+        color_primaries: null,
+        color_transfer: null,
+        color_matrix: null,
+      },
+    };
+    const job = makeJob({ state: "AWAITING_SELECTION", settings: { detail_level: "beginner" } });
+
+    const view = renderApp(<SelectionWizard job={job} scan={scan} onComplete={vi.fn()} />);
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+
+    expect(view.getByRole("heading", { name: "Forrás színinformációjának megerősítése" })).toBeInTheDocument();
+    expect(view.getByText("Színprimerek", { selector: ".badge" })).toBeInTheDocument();
+    expect(view.getByText("Átviteli karakterisztika", { selector: ".badge" })).toBeInTheDocument();
+    expect(view.getByText("Mátrixegyütthatók", { selector: ".badge" })).toBeInTheDocument();
+    expect(view.getByText("Ajánlott alapérték: SDR Blu-ray · BT.709")).toBeInTheDocument();
+
+    await user.click(view.getByRole("button", { name: "Ezeknek az értékeknek a jóváhagyása" }));
+    expect(view.getByText("Jóváhagyva")).toBeInTheDocument();
+
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Terv ellenőrzése" }));
+    await waitFor(() => expect(api.validateSelection).toHaveBeenCalled());
+    expect(api.validateSelection).toHaveBeenCalledWith(
+      "job-1",
+      expect.objectContaining({
+        video: expect.objectContaining({
+          settings: expect.objectContaining({
+            color: {
+              primaries: "bt709",
+              transfer: "bt709",
+              matrix: "bt709",
+              range: "limited",
+              chroma_location: "left",
+            },
+          }),
+        }),
+      }),
+      1,
+    );
+  });
+
+  it("turns the structured source color API error into an actionable Hungarian message", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.validateSelection).mockRejectedValueOnce(new ApiError(
+      422,
+      "source color metadata is incomplete; confirm it before encoding",
+      {
+        detail: "source color metadata is incomplete; confirm it before encoding",
+        code: "source_color_confirmation_required",
+        context: {
+          missing_fields: ["primaries", "matrix"],
+          suggested: {
+            primaries: "bt709",
+            transfer: "bt709",
+            matrix: "bt709",
+            range: "limited",
+            chroma_location: "left",
+          },
+        },
+      },
+    ));
+
+    const view = renderApp(<SelectionWizard job={makeJob({ state: "AWAITING_SELECTION" })} scan={makeScan()} onComplete={vi.fn()} />);
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Terv ellenőrzése" }));
+
+    expect(await view.findByText("Hiányos forrás-színinformáció")).toBeInTheDocument();
+    expect(view.getAllByText(/Színprimerek, Mátrixegyütthatók/)).toHaveLength(2);
+    await user.click(view.getByRole("button", { name: "Színadatok megnyitása" }));
+    expect(view.getByRole("heading", { name: "Forrás színinformációjának megerősítése" })).toBeInTheDocument();
+    expect(view.queryByText(/source color metadata is incomplete/i)).not.toBeInTheDocument();
   });
 });

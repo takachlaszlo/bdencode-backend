@@ -127,6 +127,8 @@ Az APT guard kizárólag a vaultban szereplő helyi csomagokat engedi a `dpkg` e
 
 A telepítő külön, fix célpontlistás rollback-snapshotot tart a változó host unitokról, az APT drop-injeiről, nginx beállításáról és az app/tool release pointereiről. Az `apt-daily` timerek aktív/engedélyezett állapota is a journal része: a telepítő a csomagművelet előtt leállítja őket, kivárja a futó dpkg-t, korán telepíti a media pint, majd pontosan visszaállítja az előállapotot. A telepítő `apt-get` gyermeke külön tartós lockot örököl; a watchdog kivárja ezt és a natív apt/dpkg lockokat, majd tiszta `dpkg --audit` és `apt-get check` nélkül nem indít runtime-ot. A recovery helper, az API/worker stabil recovery drop-inje és az install-watchdog szándékosan a snapshoton kívül marad, így a visszaállítás a régi runtime-unitok visszatérése után is folytatható. A journal két fázist különböztet meg: a queue vizsgálata alatt egy futó encode-ot soha nem állít le, tényleges mutáció után viszont teljes rollbacket végez. Normál hiba esetén azonnal, SIGKILL után a négy install/runtime/APT markert figyelő `bdencode-install-recovery.path`, rebootkor pedig a recovery gate fejezi be; a journal helye `/var/lib/bdencode/install-transactions`.
 
+A telepítő egy kizárólag `AWAITING_SELECTION` állapotban szünetelő job mellett is frissítheti az alkalmazást, mert ekkor még nem készült encode és a választás nincs jóváhagyva. `READY`, `NEEDS_REVIEW`, kódolás, mux, QC, comparison vagy feltöltés alatt továbbra is fail-closed módon elhalasztja a telepítést.
+
 ## Teszt
 
 ```bash

@@ -12,6 +12,17 @@ from typing import Any, Mapping
 class ConfigurationError(ValueError):
     """Raised when a configuration value violates a safety invariant."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.context = dict(context or {})
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:

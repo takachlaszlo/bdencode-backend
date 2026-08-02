@@ -11,6 +11,7 @@ import {
   Languages,
   ListVideo,
   Music,
+  Palette,
   ScanLine,
   Search,
   Settings2,
@@ -34,6 +35,16 @@ import type {
   TrackSelection,
 } from "../api/types";
 import { api, ApiError } from "../api/client";
+import {
+  blockingSourceColorFields,
+  hasSafeSourceColorRecommendation,
+  missingSourceColorFields,
+  parseSourceColor,
+  SOURCE_COLOR_FIELD_LABELS,
+  sourceColorIssueFromPayload,
+  suggestedSourceColor,
+} from "../colorMetadata";
+import type { SourceColorField, SourceColorMetadata } from "../colorMetadata";
 import { normalizeStoredSelection } from "../selection";
 import type { StoredTrackSelection } from "../selection";
 import { basename, formatDuration, humanize, suggestedOutputName } from "../utils";
@@ -211,6 +222,12 @@ export function SelectionWizard({
   const [settings, setSettings] = useState<Record<string, unknown>>(initial?.settings ?? {});
   const [settingsSearch, setSettingsSearch] = useState("");
   const [validation, setValidation] = useState<SelectionValidation | null>(null);
+  const initialVideo = defaultPlaylist?.streams.find((stream) => stream.kind === "video")?.video;
+  const initialConfirmedColor = parseSourceColor(initial?.settings.color);
+  const [colorDraft, setColorDraft] = useState<SourceColorMetadata>(
+    initialConfirmedColor ?? suggestedSourceColor(initialVideo, scan.disc_kind),
+  );
+  const [colorConfirmed, setColorConfirmed] = useState(Boolean(initialConfirmedColor));
   const initializedRecommendation = useRef(
     initial && Object.keys(initial.settings).length > 0 ? `${encoder}:${detailLevel}` : "",
   );
@@ -229,7 +246,10 @@ export function SelectionWizard({
   useEffect(() => {
     const key = `${encoder}:${detailLevel}`;
     if (!schema.data || !recommendation.data || initializedRecommendation.current === key) return;
-    setSettings(editableRecommendation(schema.data.fields, recommendation.data.settings));
+    setSettings((current) => ({
+      ...editableRecommendation(schema.data.fields, recommendation.data.settings),
+      ...(parseSourceColor(current.color) ? { color: current.color } : {}),
+    }));
     initializedRecommendation.current = key;
   }, [detailLevel, encoder, recommendation.data, schema.data]);
 
@@ -261,6 +281,18 @@ export function SelectionWizard({
     },
   });
 
+  function clearPlanFeedback() {
+    setValidation(null);
+    validate.reset();
+    save.reset();
+  }
+
+  function confirmSourceColor() {
+    setSettings((current) => ({ ...current, color: colorDraft }));
+    setColorConfirmed(true);
+    clearPlanFeedback();
+  }
+
   function choosePlaylist(id: string) {
     const selected = scan.playlists.find((item) => item.playlist_id === id);
     if (!selected) return;
@@ -268,7 +300,15 @@ export function SelectionWizard({
     setAngle(1);
     setTracks(initialTrackSelections(selected));
     setTemporalFilter(suggestedTemporalFilter(selected));
-    setValidation(null);
+    const selectedVideo = selected.streams.find((stream) => stream.kind === "video")?.video;
+    setColorDraft(suggestedSourceColor(selectedVideo, scan.disc_kind));
+    setColorConfirmed(false);
+    setSettings((current) => {
+      const next = { ...current };
+      delete next.color;
+      return next;
+    });
+    clearPlanFeedback();
   }
 
   function updateTrack(streamId: string, update: Partial<TrackSelection>) {
@@ -307,6 +347,16 @@ export function SelectionWizard({
   const retainedTracks = tracks.filter((item) => item.action !== "omit");
   const unresolvedTracks = retainedTracks.filter((item) => !item.language);
   const videoStream = playlist?.streams.find((stream) => stream.kind === "video");
+  const missingColorFields = missingSourceColorFields(videoStream?.video);
+  const colorApiIssue = validate.error instanceof ApiError
+    ? sourceColorIssueFromPayload(validate.error.payload)
+    : null;
+  const needsColorConfirmation = blockingSourceColorFields(videoStream?.video).length > 0
+    || Boolean(colorApiIssue);
+  const safeColorRecommendation = hasSafeSourceColorRecommendation(videoStream?.video, scan.disc_kind);
+  const reportedMissingColorFields = colorApiIssue?.missing.length
+    ? colorApiIssue.missing
+    : missingColorFields;
   const sourceInterlaced = videoStream?.video?.field_order && !["progressive", "unknown"].includes(videoStream.video.field_order);
   const expectedTrackIds = playlist?.streams.filter((stream) => stream.kind !== "video").map((stream) => stream.id) ?? [];
   const selectedTrackIds = new Set(tracks.map((track) => track.stream_id));
@@ -419,6 +469,27 @@ export function SelectionWizard({
       {step === 3 && playlist && (
         <div className="video-settings-layout">
           <div className="video-settings-main">
+            {needsColorConfirmation && (
+              <SourceColorConfirmation
+                video={videoStream?.video}
+                discKind={scan.disc_kind}
+                missing={reportedMissingColorFields}
+                value={colorDraft}
+                confirmed={colorConfirmed}
+                safeRecommendation={safeColorRecommendation}
+                onChange={(next) => {
+                  setColorDraft(next);
+                  setColorConfirmed(false);
+                  setSettings((current) => {
+                    const updated = { ...current };
+                    delete updated.color;
+                    return updated;
+                  });
+                  clearPlanFeedback();
+                }}
+                onConfirm={confirmSourceColor}
+              />
+            )}
             <Card className="settings-card">
               <div className="section-heading">
                 <div><span className="section-heading__icon"><WandSparkles size={19} /></span><div><h3>Ajánlott profil</h3><p>A scan és a tartalomtípus alapján</p></div></div>
@@ -515,7 +586,24 @@ export function SelectionWizard({
             {!validation && (
               <Notice tone="info" title="Még nincs jóváhagyva">Az „Ellenőrzés” gomb a backend valódi plannerével validálja a sávokat, cropot, HDR-t és x264/x265 paramétereket, de még nem indít kódolást.</Notice>
             )}
-            {validate.isError && <Notice tone="danger" title="A terv nem indítható">{validate.error instanceof ApiError ? validate.error.detail : validate.error.message}</Notice>}
+            {needsColorConfirmation && !colorConfirmed && (
+              <Notice tone="warning" title="A forrás színadatait még jóvá kell hagynod">
+                <p>A lemezből hiányzik: {reportedMissingColorFields.map((field) => SOURCE_COLOR_FIELD_LABELS[field]).join(", ")}.</p>
+                <p>{safeColorRecommendation
+                  ? "A forrás jellemzői alapján ajánlott biztonságos értékeket egy érintéssel jóváhagyhatod; ez nem végez színkonverziót."
+                  : "Ehhez a forráshoz nem adható biztonságos automatikus alapérték. Nyisd meg a mezőket, és csak ellenőrzött értékeket adj meg."}</p>
+                {safeColorRecommendation
+                  ? <Button variant="secondary" icon={<Palette size={17} />} onClick={confirmSourceColor}>Ajánlott értékek jóváhagyása</Button>
+                  : <Button variant="secondary" icon={<Palette size={17} />} onClick={() => setStep(3)}>Színadatok kézi megadása</Button>}
+              </Notice>
+            )}
+            {validate.isError && !colorApiIssue && <Notice tone="danger" title="A terv nem indítható">{validate.error instanceof ApiError ? validate.error.detail : validate.error.message}</Notice>}
+            {validate.isError && colorApiIssue && (
+              <Notice tone="danger" title="Hiányos forrás-színinformáció">
+                <p>A kódolás biztonsága érdekében erősítsd meg ezeket: {reportedMissingColorFields.map((field) => SOURCE_COLOR_FIELD_LABELS[field]).join(", ")}.</p>
+                <Button variant="secondary" onClick={() => setStep(3)}>Színadatok megnyitása</Button>
+              </Notice>
+            )}
             {save.isError && <Notice tone="danger" title="A jóváhagyás nem menthető">{save.error instanceof ApiError ? save.error.detail : save.error.message}</Notice>}
           </Card>
 
@@ -538,7 +626,7 @@ export function SelectionWizard({
               </>
             )}
             {!validation ? (
-              <Button icon={<Check size={17} />} onClick={() => validate.mutate()} loading={validate.isPending}>Terv ellenőrzése</Button>
+              <Button icon={<Check size={17} />} onClick={() => validate.mutate()} loading={validate.isPending} disabled={needsColorConfirmation && !colorConfirmed}>Terv ellenőrzése</Button>
             ) : (
               <Button icon={<Clapperboard size={18} />} onClick={() => save.mutate()} loading={save.isPending}>Jóváhagyás és várólistára helyezés</Button>
             )}
@@ -551,6 +639,138 @@ export function SelectionWizard({
         {step < 4 && <Button icon={<ArrowRight size={17} />} onClick={() => { setStep((value) => Math.min(4, value + 1)); setValidation(null); }} disabled={!canNext}>Tovább</Button>}
       </div>
     </div>
+  );
+}
+
+const SOURCE_COLOR_OPTIONS: Record<SourceColorField, Array<{ value: string; label: string }>> = {
+  primaries: [
+    { value: "bt709", label: "BT.709" },
+    { value: "bt2020", label: "BT.2020" },
+    { value: "smpte170m", label: "SMPTE 170M" },
+    { value: "smpte240m", label: "SMPTE 240M" },
+    { value: "bt470m", label: "BT.470 M" },
+    { value: "bt470bg", label: "BT.470 BG" },
+  ],
+  transfer: [
+    { value: "bt709", label: "BT.709" },
+    { value: "smpte2084", label: "PQ / SMPTE ST 2084" },
+    { value: "arib-std-b67", label: "HLG / ARIB STD-B67" },
+    { value: "smpte170m", label: "SMPTE 170M" },
+    { value: "smpte240m", label: "SMPTE 240M" },
+    { value: "bt470m", label: "BT.470 M" },
+    { value: "bt470bg", label: "BT.470 BG" },
+    { value: "linear", label: "Lineáris" },
+  ],
+  matrix: [
+    { value: "bt709", label: "BT.709" },
+    { value: "bt2020nc", label: "BT.2020 nem konstans fényesség" },
+    { value: "bt2020c", label: "BT.2020 konstans fényesség" },
+    { value: "smpte170m", label: "SMPTE 170M" },
+    { value: "bt470bg", label: "BT.470 BG" },
+    { value: "rgb", label: "RGB" },
+  ],
+  range: [
+    { value: "limited", label: "Korlátozott / TV" },
+    { value: "full", label: "Teljes / PC" },
+  ],
+  chroma_location: [
+    { value: "left", label: "Bal" },
+    { value: "center", label: "Közép" },
+    { value: "topleft", label: "Bal felső" },
+    { value: "top", label: "Felső" },
+    { value: "bottomleft", label: "Bal alsó" },
+    { value: "bottom", label: "Alsó" },
+  ],
+};
+
+function SourceColorConfirmation({
+  video,
+  discKind,
+  missing,
+  value,
+  confirmed,
+  safeRecommendation,
+  onChange,
+  onConfirm,
+}: {
+  video: MediaStream["video"] | undefined;
+  discKind: DiscScanResult["disc_kind"];
+  missing: SourceColorField[];
+  value: SourceColorMetadata;
+  confirmed: boolean;
+  safeRecommendation: boolean;
+  onChange: (value: SourceColorMetadata) => void;
+  onConfirm: () => void;
+}) {
+  const profileName = discKind === "uhd" && video?.hdr10
+    ? "HDR10 UHD Blu-ray · BT.2020 / PQ"
+    : "SDR Blu-ray · BT.709";
+  const fields = Object.keys(SOURCE_COLOR_FIELD_LABELS) as SourceColorField[];
+  const complete = Object.values(value).every((item) => Boolean(item));
+  const manualReason = discKind === "uhd" && !video?.hdr10
+    ? "Az SDR UHD-forrás színtere nem következtethető ki biztonságosan a lemeztípusból."
+    : "Automatikus BT.709 csak legalább 1280×720-as, 8 bites SDR Blu-ray forráshoz használható biztonságosan.";
+
+  return (
+    <Card className={confirmed ? "source-color-card source-color-card--confirmed" : "source-color-card"}>
+      <div className="section-heading">
+        <div>
+          <span className="section-heading__icon"><Palette size={19} /></span>
+          <div>
+            <h3>Forrás színinformációjának megerősítése</h3>
+            <p>A scan nem tudott minden kötelező jelölést kiolvasni</p>
+          </div>
+        </div>
+        <Badge tone={confirmed ? "success" : "warning"}>{confirmed ? "Jóváhagyva" : "Teendő"}</Badge>
+      </div>
+
+      <div className="source-color-missing" aria-label="Hiányzó forrásadatok">
+        <strong>Hiányzik a lemezből:</strong>
+        <div>{missing.map((field) => <Badge key={field} tone="warning">{SOURCE_COLOR_FIELD_LABELS[field]}</Badge>)}</div>
+      </div>
+
+      <Notice tone={confirmed ? "success" : safeRecommendation ? "info" : "warning"} title={confirmed ? "A színjelölés megerősítve" : safeRecommendation ? `Ajánlott alapérték: ${profileName}` : "Kézi ellenőrzés szükséges"}>
+        {confirmed
+          ? "A kódoló a jóváhagyott jelölést írja a kimenetbe. Színkonverzió nem történik."
+          : safeRecommendation
+            ? "A lemeztípus, a felbontás, a bitmélység és a HDR-jelzés alapján töltöttük ki. Nézd át, majd hagyd jóvá; ettől még nem indul el a kódolás."
+            : `${manualReason} Válaszd ki a lemez dokumentációjával vagy hiteles elemzéssel ellenőrzött értékeket.`}
+      </Notice>
+
+      <details className="source-color-details" open={!confirmed}>
+        <summary>{confirmed ? "Jóváhagyott értékek megtekintése" : "Ajánlott értékek ellenőrzése"}</summary>
+        <div className="source-color-fields">
+          {fields.map((field) => {
+            const editable = missing.includes(field);
+            const options = SOURCE_COLOR_OPTIONS[field];
+            const knownOption = options.some((option) => option.value === value[field]);
+            return (
+              <label key={field} className="source-color-field">
+                <span>
+                  <strong>{SOURCE_COLOR_FIELD_LABELS[field]}</strong>
+                  <small>{editable ? "Hiányzott · ajánlott érték" : "A scanből rögzítve / BD-alapérték"}</small>
+                </span>
+                <select
+                  value={value[field]}
+                  disabled={!editable}
+                  onChange={(event) => onChange({ ...value, [field]: event.target.value })}
+                >
+                  {!value[field] && <option value="">— Válassz ellenőrzött értéket —</option>}
+                  {!knownOption && value[field] && <option value={value[field]}>{value[field]}</option>}
+                  {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+              </label>
+            );
+          })}
+        </div>
+      </details>
+
+      {!confirmed && (
+        <Button className="source-color-confirm" icon={<Check size={17} />} onClick={onConfirm} disabled={!complete}>
+          {safeRecommendation ? "Ezeknek az értékeknek a jóváhagyása" : "A kézzel ellenőrzött értékek jóváhagyása"}
+        </Button>
+      )}
+    </Card>
   );
 }
 

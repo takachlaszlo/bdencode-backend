@@ -64,6 +64,8 @@ Minden audio- és feliratsávhoz explicit `copy`, `flac` vagy `omit` szükséges
 
 Az opcionális `dual_type_match` alapértéke `true`: progresszív timeline esetén az I/P/B pár csak akkor fogadható el, ha ugyanazon presentation frame az eredeti és a kész bitstreamben is ugyanabba a kategóriába tartozik. IVTC/deinterlace után a tömörítetlen referencia nem rendelkezik forrás-bitstream képtípussal, ezért ott a kategória a kész encode típusa, az index/PTS-egyezés továbbra is kötelező.
 
+Ha a videó-bitfolyamból hiányzik a színprimerek, az átviteli karakterisztika vagy a mátrix jelölése, a validate végpont `422` választ ad `source_color_confirmation_required` kóddal, a hiányzó mezőkkel és – csak egyértelmű HD SDR BD vagy HDR10 UHD esetén – biztonságos javaslattal. A felhasználó a teljes `video.settings.color` objektummal erősítheti meg a `primaries`, `transfer`, `matrix`, `range` és `chroma_location` értékeket. A backend a lemezről ténylegesen kiolvasott érték felülírását továbbra is elutasítja; ez címkézés, nem színkonverzió.
+
 Ha a job `NEEDS_REVIEW`, a korrigált teljes `selection` ugyanerre az endpointra küldhető. A backend ilyenkor mindig `READY` állapotból játssza újra a függőség-ellenőrzést; egy késői review nem párosíthat régi videót új beállítás-manifesttel.
 
 Nyelv nélkül megtartott audiónál a worker a reference remuxból hat, filmen elosztott CPU-only beszédmintát elemez. Csak magas bizalmú konszenzust alkalmaz automatikusan; konfliktus, kevés beszéd, ismeretlen PGS vagy hiányzó modell esetén a job review-ba kerül, és kézi ISO 639-2/BCP 47 override szükséges.

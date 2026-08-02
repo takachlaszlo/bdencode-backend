@@ -245,6 +245,49 @@ wait_for_api() {
     done
     return 1
 }
+
+queue_is_install_safe() {
+    local queue_command queue_help queue_output queue_status legacy_cli
+    local -a queue_args
+    queue_command="$app_root/current/venv/bin/bdencode"
+    legacy_cli=1
+
+    # The first deployment of --allow-review necessarily invokes a previous
+    # release which does not know the option yet. Detect support without opening
+    # the database, then keep the compatibility path fail-closed and restricted
+    # to the old CLI's exact AWAITING_SELECTION busy result.
+    if ! queue_help="$("$queue_command" queue-idle --help 2>&1)"; then
+        echo "Unable to inspect the installed queue-idle command" >&2
+        return 1
+    fi
+    queue_args=(queue-idle)
+    if [[ "$queue_help" == *"--allow-review"* ]]; then
+        queue_args+=(--allow-review)
+        legacy_cli=0
+    fi
+
+    queue_status=0
+    queue_output="$(
+        env \
+            BDENCODE_CONFIG=/etc/bdencode/config.toml \
+            PATH="$app_root/tools/current/bin:$app_root/current/venv/bin:/usr/local/bin:/usr/bin:/bin" \
+            XDG_CACHE_HOME="$data_root/cache" \
+            XDG_CONFIG_HOME="$app_root/tools/current/config" \
+            "$queue_command" "${queue_args[@]}" 2>&1
+    )" || queue_status=$?
+    if [[ -n "$queue_output" ]]; then
+        printf '%s\n' "$queue_output" >&2
+    fi
+    if [[ "$queue_status" -eq 0 ]]; then
+        return 0
+    fi
+    if [[ "$legacy_cli" -eq 1 && "$queue_status" -eq 3 && \
+        "$queue_output" =~ ^busy:\ [^[:space:]]+\ AWAITING_SELECTION$ ]]; then
+        echo "Legacy queue gate accepted the persisted AWAITING_SELECTION pause" >&2
+        return 0
+    fi
+    return "$queue_status"
+}
 trap finish EXIT
 
 # Publish a stable, atomically replaced recovery bootstrap before any pointer
@@ -323,12 +366,7 @@ if [[ "$api_was_active" -eq 1 ]]; then
 fi
 if [[ -x "$app_root/current/venv/bin/bdencode" ]]; then
     set +e
-    env \
-        BDENCODE_CONFIG=/etc/bdencode/config.toml \
-        PATH="$app_root/tools/current/bin:$app_root/current/venv/bin:/usr/local/bin:/usr/bin:/bin" \
-        XDG_CACHE_HOME="$data_root/cache" \
-        XDG_CONFIG_HOME="$app_root/tools/current/config" \
-        "$app_root/current/venv/bin/bdencode" queue-idle
+    queue_is_install_safe
     idle_status=$?
     set -e
     if [[ "$idle_status" -eq 3 ]]; then

@@ -10,7 +10,11 @@ def make_client(tmp_path) -> TestClient:
     return TestClient(create_app(Database(tmp_path / "api.sqlite3")))
 
 
-def scan_result(*, warnings: list[str] | None = None) -> dict[str, object]:
+def scan_result(
+    *,
+    warnings: list[str] | None = None,
+    incomplete_color: bool = False,
+) -> dict[str, object]:
     return {
         "source": "/storage/Film",
         "disc_kind": "bd",
@@ -37,10 +41,10 @@ def scan_result(*, warnings: list[str] | None = None) -> dict[str, object]:
                             "field_order": "progressive",
                             "bit_depth": 8,
                             "pixel_format": "yuv420p",
-                            "color_primaries": "bt709",
-                            "color_transfer": "bt709",
-                            "color_matrix": "bt709",
-                            "color_range": "limited",
+                            "color_primaries": None if incomplete_color else "bt709",
+                            "color_transfer": None if incomplete_color else "bt709",
+                            "color_matrix": None if incomplete_color else "bt709",
+                            "color_range": None if incomplete_color else "limited",
                             "chroma_location": "left",
                         },
                     }
@@ -54,7 +58,12 @@ def scan_result(*, warnings: list[str] | None = None) -> dict[str, object]:
     }
 
 
-def awaiting_selection_job(client: TestClient, *, warnings: list[str] | None = None):
+def awaiting_selection_job(
+    client: TestClient,
+    *,
+    warnings: list[str] | None = None,
+    incomplete_color: bool = False,
+):
     job = client.post(
         "/api/v1/jobs", json={"source_path": "/storage/Film", "name": "Film"}
     ).json()
@@ -64,7 +73,7 @@ def awaiting_selection_job(client: TestClient, *, warnings: list[str] | None = N
         f"/api/v1/scans/{scan['id']}",
         json={
             "status": "AWAITING_SELECTION",
-            "result": scan_result(warnings=warnings),
+            "result": scan_result(warnings=warnings, incomplete_color=incomplete_color),
         },
     )
     assert response.status_code == 200
@@ -269,6 +278,53 @@ def test_selection_validation_rejects_invalid_selection_without_mutation(tmp_pat
         assert unchanged["state"] == "AWAITING_SELECTION"
         assert unchanged["selection"] is None
         assert unchanged["version"] == job["version"]
+
+
+def test_selection_validation_explains_and_accepts_color_confirmation(tmp_path):
+    with make_client(tmp_path) as client:
+        job = awaiting_selection_job(client, incomplete_color=True)
+        selection = valid_selection()
+
+        response = client.post(
+            f"/api/v1/jobs/{job['id']}/selection/validate",
+            json={"selection": selection},
+        )
+
+        assert response.status_code == 422
+        problem = response.json()
+        assert problem["code"] == "source_color_confirmation_required"
+        assert problem["context"]["playlist_id"] == "00001"
+        assert problem["context"]["missing_fields"] == [
+            "primaries",
+            "transfer",
+            "matrix",
+            "range",
+        ]
+        assert problem["context"]["blocking_fields"] == [
+            "primaries",
+            "transfer",
+            "matrix",
+        ]
+        assert problem["context"]["confirmation_field"] == (
+            "selection.video.settings.color"
+        )
+        assert problem["context"]["safe_defaults"] == {"range": "limited"}
+        assert problem["context"]["suggested"] == {
+            "primaries": "bt709",
+            "transfer": "bt709",
+            "matrix": "bt709",
+            "range": "limited",
+            "chroma_location": "left",
+        }
+
+        selection["video"]["settings"]["color"] = problem["context"]["suggested"]
+        confirmed = client.post(
+            f"/api/v1/jobs/{job['id']}/selection/validate",
+            json={"selection": selection},
+        )
+
+        assert confirmed.status_code == 200
+        assert confirmed.json()["settings"]["color"] == problem["context"]["suggested"]
 
 
 def test_selection_validation_requires_successful_scan(tmp_path):

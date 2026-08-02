@@ -673,23 +673,23 @@ def _derive_hdr10(scan: DiscScan, playlist_id: str) -> Hdr10Metadata:
     )
 
 
-def _derive_color(scan: DiscScan, playlist_id: str) -> ColorMetadata:
+def _derive_color(
+    scan: DiscScan,
+    playlist_id: str,
+    confirmation: Mapping[str, Any] | None = None,
+) -> ColorMetadata:
     playlist = scan.playlist(playlist_id)
     if not playlist.video_streams:
         raise ReviewRequired("the selected playlist has no video stream")
     video = playlist.video_streams[0].video
     assert video is not None
-    required = {
+    scanned = {
         "primaries": video.color_primaries,
         "transfer": video.color_transfer,
         "matrix": video.color_matrix,
+        "range": video.color_range,
+        "chroma_location": video.chroma_location,
     }
-    missing = [name for name, value in required.items() if not value]
-    if missing:
-        raise ReviewRequired(
-            "source color metadata is incomplete; confirm it before encoding",
-            details={"playlist_id": playlist.playlist_id, "missing": missing},
-        )
     range_aliases = {
         "tv": "limited",
         "mpeg": "limited",
@@ -699,6 +699,147 @@ def _derive_color(scan: DiscScan, playlist_id: str) -> ColorMetadata:
         "full": "full",
     }
     matrix_aliases = {"bt2020ncl": "bt2020nc", "bt2020cl": "bt2020c"}
+    normalized_scanned = {
+        "primaries": (
+            str(video.color_primaries).casefold() if video.color_primaries else None
+        ),
+        "transfer": (
+            str(video.color_transfer).casefold() if video.color_transfer else None
+        ),
+        "matrix": (
+            matrix_aliases.get(
+                str(video.color_matrix).casefold(),
+                str(video.color_matrix).casefold(),
+            )
+            if video.color_matrix
+            else None
+        ),
+        "range": (
+            range_aliases.get(str(video.color_range).casefold())
+            if video.color_range
+            else None
+        ),
+        "chroma_location": (
+            str(video.chroma_location).casefold() if video.chroma_location else None
+        ),
+    }
+    blocking_fields = [
+        name for name in ("primaries", "transfer", "matrix") if not scanned[name]
+    ]
+    if video.color_range and normalized_scanned["range"] is None:
+        raise ReviewRequired(
+            "source color range is unsupported",
+            details={
+                "code": "unsupported_source_color_metadata",
+                "playlist_id": playlist.playlist_id,
+                "field": "range",
+                "value": video.color_range,
+            },
+        )
+    if blocking_fields and confirmation is None:
+        missing_source_fields = [name for name, value in scanned.items() if not value]
+        suggested = None
+        suggestion_reason = None
+        if (
+            scan.disc_kind is DiscKind.BD
+            and video.codec in {VideoCodec.AVC, VideoCodec.VC1, VideoCodec.MPEG2}
+            and (video.width or 0) >= 1280
+            and (video.height or 0) >= 720
+            and video.bit_depth == 8
+            and not video.hdr10
+        ):
+            suggested = {
+                "primaries": normalized_scanned["primaries"] or "bt709",
+                "transfer": normalized_scanned["transfer"] or "bt709",
+                "matrix": normalized_scanned["matrix"] or "bt709",
+                "range": normalized_scanned["range"] or "limited",
+                "chroma_location": normalized_scanned["chroma_location"] or "left",
+            }
+            suggestion_reason = "HD SDR Blu-ray source profile"
+        raise ReviewRequired(
+            "A forr\u00e1s sz\u00ednmetaadata hi\u00e1nyos. Ellen\u0151rizd \u00e9s er\u0151s\u00edtsd meg "
+            "a sz\u00ednteret a vide\u00f3be\u00e1ll\u00edt\u00e1sokn\u00e1l.",
+            details={
+                "code": "source_color_confirmation_required",
+                "playlist_id": playlist.playlist_id,
+                "missing_fields": missing_source_fields,
+                "blocking_fields": blocking_fields,
+                "detected": normalized_scanned,
+                "safe_defaults": {
+                    name: value
+                    for name, value in {
+                        "range": "limited",
+                        "chroma_location": "left",
+                    }.items()
+                    if not scanned[name]
+                },
+                "confirmation_field": "selection.video.settings.color",
+                "suggested": suggested,
+                "suggestion_reason": suggestion_reason,
+            },
+        )
+
+    if confirmation is not None:
+        expected_fields = {
+            "primaries",
+            "transfer",
+            "matrix",
+            "range",
+            "chroma_location",
+        }
+        if set(confirmation) != expected_fields:
+            missing_confirmation = sorted(expected_fields - set(confirmation))
+            unknown_confirmation = sorted(set(confirmation) - expected_fields)
+            raise ReviewRequired(
+                "A sz\u00ednmetaadat meger\u0151s\u00edt\u00e9se nem teljes.",
+                details={
+                    "code": "invalid_source_color_confirmation",
+                    "playlist_id": playlist.playlist_id,
+                    "confirmation_field": "selection.video.settings.color",
+                    "missing_fields": missing_confirmation,
+                    "unknown_fields": unknown_confirmation,
+                },
+            )
+        try:
+            confirmed = ColorMetadata(
+                primaries=str(confirmation["primaries"]).casefold(),
+                transfer=str(confirmation["transfer"]).casefold(),
+                matrix=matrix_aliases.get(
+                    str(confirmation["matrix"]).casefold(),
+                    str(confirmation["matrix"]).casefold(),
+                ),
+                range=range_aliases.get(
+                    str(confirmation["range"]).casefold(),
+                    str(confirmation["range"]).casefold(),
+                ),
+                chroma_location=str(confirmation["chroma_location"]).casefold(),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReviewRequired(
+                f"A sz\u00ednmetaadat meger\u0151s\u00edt\u00e9se \u00e9rv\u00e9nytelen: {exc}",
+                details={
+                    "code": "invalid_source_color_confirmation",
+                    "playlist_id": playlist.playlist_id,
+                    "confirmation_field": "selection.video.settings.color",
+                },
+            ) from exc
+        conflicts = {
+            name: {"scanned": value, "confirmed": getattr(confirmed, name)}
+            for name, value in normalized_scanned.items()
+            if value is not None and value != getattr(confirmed, name)
+        }
+        if conflicts:
+            raise ReviewRequired(
+                "changing color metadata without an explicit color conversion is not allowed",
+                details={
+                    "code": "source_color_confirmation_conflict",
+                    "playlist_id": playlist.playlist_id,
+                    "confirmation_field": "selection.video.settings.color",
+                    "conflicts": conflicts,
+                },
+            )
+        return confirmed
+
     # Blu-ray 4:2:0 video is studio/limited range with left chroma siting when
     # those VUI fields are omitted. Primaries/transfer/matrix are never guessed.
     color_range = range_aliases.get(str(video.color_range or "limited").casefold())
@@ -790,7 +931,17 @@ def parse_selection(job: Job, scan: DiscScan) -> ParsedSelection:
             raise ReviewRequired(
                 f"{scan.disc_kind.value.upper()} output must use {encoder.value}"
             )
-    source_color = _derive_color(scan, playlist_id)
+    manual_color = overrides_raw.get("color")
+    if manual_color is not None and not isinstance(manual_color, Mapping):
+        raise ReviewRequired(
+            "video.settings.color must be an object",
+            details={
+                "code": "invalid_source_color_confirmation",
+                "playlist_id": playlist_id,
+                "confirmation_field": "selection.video.settings.color",
+            },
+        )
+    source_color = _derive_color(scan, playlist_id, manual_color)
     hdr10 = None
     if encoder is VideoEncoder.X265:
         manual_hdr = overrides_raw.get("hdr10")

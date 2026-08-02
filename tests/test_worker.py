@@ -27,6 +27,7 @@ from bdencode.media.bluray import (
     VideoCodec,
     VideoProperties,
 )
+from bdencode.media.profiles import ColorMetadata
 from bdencode.models import (
     ArtifactKind,
     ContentType,
@@ -907,6 +908,84 @@ def test_selection_propagates_scanned_sdr_color_without_retagging(context):
     }
     with pytest.raises(ReviewRequired, match="explicit color conversion"):
         parse_selection(job.model_copy(update={"selection": selection}), sd_scan)
+
+
+def test_incomplete_hd_sdr_color_requires_explicit_matching_confirmation(context):
+    database, _settings, scan, _scanner, _runner, _worker = context
+    source_stream = scan.playlists[0].video_streams[0]
+    incomplete_stream = replace(
+        source_stream,
+        video=replace(
+            source_stream.video,
+            color_primaries=None,
+            color_transfer=None,
+            color_matrix=None,
+            color_range=None,
+            chroma_location="left",
+        ),
+    )
+    incomplete_scan = replace(
+        scan,
+        playlists=(replace(scan.playlists[0], streams=(incomplete_stream,)),),
+    )
+    job = _enqueue(database, scan.source)
+    selection = _selection()
+
+    with pytest.raises(ReviewRequired) as error:
+        parse_selection(
+            job.model_copy(update={"selection": selection}), incomplete_scan
+        )
+
+    assert error.value.details["code"] == "source_color_confirmation_required"
+    assert error.value.details["missing_fields"] == [
+        "primaries",
+        "transfer",
+        "matrix",
+        "range",
+    ]
+    assert error.value.details["suggested"] == {
+        "primaries": "bt709",
+        "transfer": "bt709",
+        "matrix": "bt709",
+        "range": "limited",
+        "chroma_location": "left",
+    }
+
+    selection["video"]["settings"]["color"] = error.value.details["suggested"]
+    parsed = parse_selection(
+        job.model_copy(update={"selection": selection}), incomplete_scan
+    )
+    assert parsed.settings.color == ColorMetadata()
+
+
+def test_color_confirmation_cannot_override_known_scan_fields(context):
+    database, _settings, scan, _scanner, _runner, _worker = context
+    source_stream = scan.playlists[0].video_streams[0]
+    partial_stream = replace(
+        source_stream,
+        video=replace(source_stream.video, color_transfer=None),
+    )
+    partial_scan = replace(
+        scan,
+        playlists=(replace(scan.playlists[0], streams=(partial_stream,)),),
+    )
+    selection = _selection()
+    selection["video"]["settings"]["color"] = {
+        "primaries": "bt470bg",
+        "transfer": "bt709",
+        "matrix": "bt709",
+        "range": "limited",
+        "chroma_location": "left",
+    }
+    job = _enqueue(database, scan.source)
+
+    with pytest.raises(ReviewRequired) as error:
+        parse_selection(job.model_copy(update={"selection": selection}), partial_scan)
+
+    assert error.value.details["code"] == "source_color_confirmation_conflict"
+    assert error.value.details["conflicts"] == {
+        "primaries": {"scanned": "bt709", "confirmed": "bt470bg"}
+    }
 
 
 def test_manual_hdr10_settings_can_complete_incomplete_uhd_scan(context):
