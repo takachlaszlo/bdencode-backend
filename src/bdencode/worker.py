@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import time
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
@@ -153,6 +154,51 @@ _SELECTION_KEYS = {
     "dual_type_match",
 }
 _HASH_CACHE: dict[tuple[str, int, int, int, int, int], str] = {}
+_MAINTENANCE_MARKERS = (
+    Path("/var/lib/bdencode/install-transactions/active"),
+    Path("/var/lib/bdencode/update-runtime/active.json"),
+    Path("/var/lib/bdencode/apt-transactions/active"),
+)
+
+
+def _maintenance_active() -> bool:
+    """Return true while an installer or toolchain transaction is published."""
+
+    return any(os.path.lexists(marker) for marker in _MAINTENANCE_MARKERS)
+
+
+def _sd_notify(message: str) -> bool:
+    """Send one systemd notification without requiring libsystemd bindings.
+
+    ``NOTIFY_SOCKET`` is absent during ordinary CLI and Windows execution, in
+    which case notification is intentionally a no-op.  Removing it before the
+    send also prevents media-tool child processes from inheriting the service
+    manager's notification endpoint.
+    """
+
+    address = os.environ.pop("NOTIFY_SOCKET", None)
+    if not address:
+        return False
+    if address.startswith("@"):
+        # systemd exposes Linux abstract namespace sockets with a leading '@',
+        # while Python's AF_UNIX API represents the leading NUL explicitly.
+        address = "\0" + address[1:]
+    elif not address.startswith("/"):
+        raise RuntimeError("NOTIFY_SOCKET must be an absolute or abstract path")
+
+    payload = message.encode("utf-8")
+    unix_family = getattr(socket, "AF_UNIX", None)
+    if unix_family is None:
+        raise RuntimeError("systemd notification requires Unix-domain sockets")
+    notifier = socket.socket(unix_family, socket.SOCK_DGRAM)
+    try:
+        notifier.connect(address)
+        sent = notifier.send(payload)
+        if sent != len(payload):
+            raise OSError("short write to systemd notification socket")
+    finally:
+        notifier.close()
+    return True
 
 
 def sha256_file(path: Path) -> str:
@@ -2554,7 +2600,11 @@ def run_worker(
         except (ValueError, OSError):
             pass
     try:
+        _sd_notify("READY=1\nSTATUS=Ready; waiting for an encode job")
         while not stopping:
+            if _maintenance_active():
+                time.sleep(min(interval or 0.2, 0.2))
+                continue
             if fcntl_module is not None:
                 # The updater/installer takes this lock exclusively before it
                 # checks queue-idle. Holding a shared lock across the atomic DB
@@ -2574,9 +2624,12 @@ def run_worker(
                     if stopping:
                         return 0
                     try:
-                        job = database.active_job()
-                        if job is None:
-                            job = worker.queue.claim_next()
+                        if _maintenance_active():
+                            job = None
+                        else:
+                            job = database.active_job()
+                            if job is None:
+                                job = worker.queue.claim_next()
                     finally:
                         fcntl_module.flock(
                             deployment_lock.fileno(), fcntl_module.LOCK_UN

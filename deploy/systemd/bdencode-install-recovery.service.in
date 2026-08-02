@@ -1,0 +1,15 @@
+[Unit]
+Description=Finalize an interrupted BDEncode host mutation
+Wants=bdencode-update-recovery.service
+After=local-fs.target bdencode-update-recovery.service bdencode-update.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=BDENCODE_USER=@USER@
+Environment=BDENCODE_DATA_ROOT=@DATA_ROOT@
+ExecStart=/usr/local/libexec/bdencode-update-recover --finalize
+TimeoutStartSec=infinity
+Restart=on-failure
+RestartSec=5s

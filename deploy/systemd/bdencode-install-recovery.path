@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for unfinished BDEncode installations
+
+[Path]
+PathExists=/var/lib/bdencode/install-transactions/active
+PathExists=/var/lib/bdencode/install-transactions/services-pending
+PathExists=/var/lib/bdencode/update-runtime/active.json
+PathExists=/var/lib/bdencode/apt-transactions/active
+Unit=bdencode-install-recovery.service
+
+[Install]
+WantedBy=multi-user.target

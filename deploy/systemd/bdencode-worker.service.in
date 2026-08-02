@@ -1,20 +1,25 @@
 [Unit]
 Description=BDEncode single-job worker
-After=network-online.target bdencode-api.service
+Requires=bdencode-update-recovery.service
+After=network-online.target bdencode-update-recovery.service bdencode-api.service
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=@USER@
 Group=@GROUP@
 WorkingDirectory=@DATA_ROOT@
 Environment=BDENCODE_CONFIG=/etc/bdencode/config.toml
+Environment=BDENCODE_USER=@USER@
+Environment=BDENCODE_DATA_ROOT=@DATA_ROOT@
 Environment=XDG_CACHE_HOME=@DATA_ROOT@/cache
 Environment=XDG_CONFIG_HOME=@APP_ROOT@/tools/current/config
 Environment=PATH=@APP_ROOT@/tools/current/bin:@APP_ROOT@/current/venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=@APP_ROOT@/current/venv/bin/bdencode worker
 Restart=on-failure
 RestartSec=10s
+TimeoutStartSec=120s
 TimeoutStopSec=300s
 KillMode=control-group
 KillSignal=SIGINT

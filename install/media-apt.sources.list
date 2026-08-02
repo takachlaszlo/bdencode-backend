@@ -1,0 +1,6 @@
+# Deliberately excludes proposed-updates, backports and third-party repositories.
+# The transaction guard separately restricts candidates to the media source
+# package allowlist.
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian bookworm main
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian bookworm-updates main
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian-security bookworm-security main

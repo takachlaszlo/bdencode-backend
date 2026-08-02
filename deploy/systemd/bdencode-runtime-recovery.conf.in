@@ -1,0 +1,4 @@
+[Service]
+Environment=BDENCODE_USER=@USER@
+Environment=BDENCODE_DATA_ROOT=@DATA_ROOT@
+ExecCondition=/usr/local/libexec/bdencode-recovery-check --runtime

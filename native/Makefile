@@ -8,7 +8,7 @@ SOURCE := libbluray_scan.c
 
 CPPFLAGS += $(shell $(PKG_CONFIG) --cflags libbluray)
 CFLAGS ?= -O2 -g
-CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wformat=2 -Wshadow \
+CFLAGS += $(REPRO_CFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Wformat=2 -Wshadow \
 	-Wconversion -Wstrict-prototypes -fstack-protector-strong
 LDFLAGS += -Wl,-z,relro,-z,now
 LDLIBS += $(shell $(PKG_CONFIG) --libs libbluray)

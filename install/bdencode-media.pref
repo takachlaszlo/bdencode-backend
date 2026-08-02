@@ -1,0 +1,33 @@
+# BDEncode owns these media source packages. Global APT and
+# unattended-upgrades must not bypass its rollback vault and health gates.
+Package: src:ffmpeg:any
+Pin: version *
+Pin-Priority: -1
+
+Package: src:libbluray:any
+Pin: version *
+Pin-Priority: -1
+
+Package: src:mediainfo:any
+Pin: version *
+Pin-Priority: -1
+
+Package: src:libmediainfo:any
+Pin: version *
+Pin-Priority: -1
+
+Package: src:libzen:any
+Pin: version *
+Pin-Priority: -1
+
+Package: src:mkvtoolnix:any
+Pin: version *
+Pin-Priority: -1
+
+Package: src:x264:any
+Pin: version *
+Pin-Priority: -1
+
+Package: src:x265:any
+Pin: version *
+Pin-Priority: -1

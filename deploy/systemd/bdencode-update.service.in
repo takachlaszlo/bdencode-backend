@@ -1,6 +1,7 @@
 [Unit]
 Description=Stage and validate BDEncode program updates
-After=network-online.target
+Requires=bdencode-update-recovery.service
+After=network-online.target bdencode-update-recovery.service bdencode-api.service bdencode-worker.service
 Wants=network-online.target
 
 [Service]
@@ -11,10 +12,15 @@ Environment=BDENCODE_CONFIG=/etc/bdencode/config.toml
 Environment=BDENCODE_USER=@USER@
 Environment=BDENCODE_DATA_ROOT=@DATA_ROOT@
 ExecStart=/usr/local/libexec/bdencode-daily-update
+# Recovery runs in a separate oneshot after this stop job has completed. This
+# avoids a stop-ordering deadlock when the recovery starts API/worker again.
+ExecStopPost=/usr/bin/systemctl --no-block start bdencode-install-recovery.service
 TimeoutStartSec=2h
-TimeoutStopSec=5min
+TimeoutStopSec=infinity
 Nice=15
 IOSchedulingClass=idle
+CPUAccounting=true
+CPUQuota=@CPU_QUOTA@
 ProtectHome=read-only
 ReadWritePaths=@DATA_ROOT@
 PrivateTmp=true

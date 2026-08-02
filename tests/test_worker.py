@@ -10,6 +10,7 @@ from typing import Any, Sequence
 
 import pytest
 
+import bdencode.worker as worker_module
 from bdencode.config import Settings
 from bdencode.db import Database
 from bdencode.media.bluray import (
@@ -41,7 +42,144 @@ from bdencode.worker import (
     _FFPROBE_PROFILE_NAMES,
     _current_comparison_pngs,
     parse_selection,
+    run_worker,
 )
+
+
+def test_sd_notify_is_noop_outside_systemd(monkeypatch) -> None:
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+
+    def unexpected_socket(*_args: Any, **_kwargs: Any):
+        pytest.fail("a notification socket was opened outside systemd")
+
+    monkeypatch.setattr(worker_module.socket, "socket", unexpected_socket)
+    assert worker_module._sd_notify("READY=1") is False
+
+
+def test_sd_notify_sends_one_abstract_unix_datagram(monkeypatch) -> None:
+    class FakeNotifier:
+        def __init__(self) -> None:
+            self.address: str | None = None
+            self.payload: bytes | None = None
+            self.closed = False
+
+        def connect(self, address: str) -> None:
+            self.address = address
+
+        def send(self, payload: bytes) -> int:
+            self.payload = payload
+            return len(payload)
+
+        def close(self) -> None:
+            self.closed = True
+
+    notifier = FakeNotifier()
+    created_with: list[tuple[int, int]] = []
+
+    def make_socket(family: int, kind: int) -> FakeNotifier:
+        created_with.append((family, kind))
+        return notifier
+
+    monkeypatch.setenv("NOTIFY_SOCKET", "@bdencode-worker-test")
+    monkeypatch.setattr(worker_module.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(worker_module.socket, "socket", make_socket)
+
+    assert worker_module._sd_notify("READY=1\nSTATUS=Ready") is True
+    assert created_with == [(1, worker_module.socket.SOCK_DGRAM)]
+    assert notifier.address == "\0bdencode-worker-test"
+    assert notifier.payload == b"READY=1\nSTATUS=Ready"
+    assert notifier.closed is True
+    assert "NOTIFY_SOCKET" not in os.environ
+
+
+def test_worker_readiness_follows_database_initialization_and_instance_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A production install intentionally publishes its maintenance marker before
+    # running the candidate test suite.  Keep this unit test isolated from that
+    # host-level state so its one-shot worker can make progress during install.
+    monkeypatch.setattr(
+        worker_module,
+        "_MAINTENANCE_MARKERS",
+        (tmp_path / "no-active-maintenance",),
+    )
+    source_root = tmp_path / "storage"
+    source_root.mkdir()
+    settings = Settings(
+        data_root=tmp_path / "encode",
+        source_roots=(source_root,),
+        worker_poll_seconds=0,
+    )
+    database = Database(tmp_path / "state.sqlite3")
+    notifications: list[str] = []
+
+    def notify(message: str) -> bool:
+        # This query fails if Database.initialize() has not completed.
+        assert database.active_job() is None
+        assert settings.state_root.is_dir()
+        if os.name == "posix":
+            import fcntl
+
+            with (settings.state_root / "worker.lock").open("a+b") as contender:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(
+                        contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+        notifications.append(message)
+        return True
+
+    monkeypatch.setattr(worker_module, "_sd_notify", notify)
+
+    assert run_worker(database, settings, once=True, poll_interval=0) == 0
+    assert notifications == ["READY=1\nSTATUS=Ready; waiting for an encode job"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fcntl worker lock is POSIX-only")
+def test_second_worker_never_reports_ready(tmp_path: Path, monkeypatch) -> None:
+    import fcntl
+
+    source_root = tmp_path / "storage"
+    source_root.mkdir()
+    settings = Settings(
+        data_root=tmp_path / "encode",
+        source_roots=(source_root,),
+        worker_poll_seconds=0,
+    ).validate()
+    settings.create_directories()
+    database = Database(tmp_path / "state.sqlite3")
+    lock_path = settings.state_root / "worker.lock"
+
+    def unexpected_notify(_message: str) -> bool:
+        pytest.fail("a worker without the instance lock reported READY=1")
+
+    monkeypatch.setattr(worker_module, "_sd_notify", unexpected_notify)
+    with lock_path.open("a+b") as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert run_worker(database, settings, once=True, poll_interval=0) == 75
+
+
+def test_worker_systemd_unit_waits_for_notify_readiness() -> None:
+    unit = (
+        Path(__file__).parents[1]
+        / "deploy"
+        / "systemd"
+        / "bdencode-worker.service.in"
+    ).read_text(encoding="utf-8")
+
+    assert "Type=notify\n" in unit
+    assert "NotifyAccess=main\n" in unit
+    assert "TimeoutStartSec=120s\n" in unit
+    assert "Type=simple\n" not in unit
+
+
+def test_worker_maintenance_markers_are_fail_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    markers = (tmp_path / "install-active", tmp_path / "runtime-active")
+    monkeypatch.setattr(worker_module, "_MAINTENANCE_MARKERS", markers)
+    assert worker_module._maintenance_active() is False
+    markers[0].write_text("active\n", encoding="ascii")
+    assert worker_module._maintenance_active() is True
 
 
 def test_ffprobe_profile_names_match_debian_encoder_outputs() -> None:

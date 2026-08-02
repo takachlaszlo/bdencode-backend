@@ -1,0 +1,17 @@
+[Unit]
+Description=Recover an unfinished BDEncode media package transaction
+After=local-fs.target
+Before=bdencode-api.service bdencode-worker.service bdencode-update.service apt-daily.service apt-daily-upgrade.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+Environment=BDENCODE_USER=@USER@
+Environment=BDENCODE_DATA_ROOT=@DATA_ROOT@
+ExecStart=/usr/local/libexec/bdencode-update-recover --gate
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
