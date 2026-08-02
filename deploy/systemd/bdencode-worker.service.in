@@ -1,0 +1,41 @@
+[Unit]
+Description=BDEncode single-job worker
+After=network-online.target bdencode-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@DATA_ROOT@
+Environment=BDENCODE_CONFIG=/etc/bdencode/config.toml
+Environment=XDG_CACHE_HOME=@DATA_ROOT@/cache
+Environment=XDG_CONFIG_HOME=@APP_ROOT@/tools/current/config
+Environment=PATH=@APP_ROOT@/tools/current/bin:@APP_ROOT@/current/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@APP_ROOT@/current/venv/bin/bdencode worker
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=300s
+KillMode=control-group
+KillSignal=SIGINT
+UMask=0027
+Nice=10
+CPUAccounting=true
+CPUQuota=@CPU_QUOTA@
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=@DATA_ROOT@/state @DATA_ROOT@/jobs @DATA_ROOT@/completed @DATA_ROOT@/cache @DATA_ROOT@/updates
+ReadOnlyPaths=@SOURCE_ROOT@
+
+[Install]
+WantedBy=multi-user.target

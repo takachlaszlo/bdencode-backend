@@ -1,0 +1,20 @@
+[Unit]
+Description=Stage and validate BDEncode program updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=BDENCODE_CONFIG=/etc/bdencode/config.toml
+Environment=BDENCODE_USER=@USER@
+Environment=BDENCODE_DATA_ROOT=@DATA_ROOT@
+ExecStart=/usr/local/libexec/bdencode-daily-update
+TimeoutStartSec=2h
+TimeoutStopSec=5min
+Nice=15
+IOSchedulingClass=idle
+ProtectHome=read-only
+ReadWritePaths=@DATA_ROOT@
+PrivateTmp=true

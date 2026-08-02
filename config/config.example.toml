@@ -1,0 +1,10 @@
+[bdencode]
+data_root = "/home/accofil/encode"
+source_roots = ["/home/accofil/storage"]
+bind_host = "127.0.0.1"
+bind_port = 8796
+api_root_path = "/encoder"
+worker_poll_seconds = 2.0
+cpu_limit_percent = 80
+comparison_frames_per_type = 4
+log_level = "INFO"

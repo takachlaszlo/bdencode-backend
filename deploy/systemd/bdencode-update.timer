@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily BDEncode program update
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=45m
+Persistent=true
+Unit=bdencode-update.service
+
+[Install]
+WantedBy=timers.target

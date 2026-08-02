@@ -1,0 +1,25 @@
+location = /encoder {
+    return 301 /encoder/;
+}
+
+location /encoder/ {
+    auth_basic "BDEncode";
+    auth_basic_user_file /etc/htpasswd;
+
+    proxy_pass http://127.0.0.1:@PORT@/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Prefix /encoder;
+    proxy_set_header X-Remote-User $remote_user;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_buffering off;
+    client_max_body_size 1m;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy same-origin always;
+    add_header X-Frame-Options SAMEORIGIN always;
+}
