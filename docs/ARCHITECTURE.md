@@ -1,6 +1,8 @@
-# Backend architecture
+# Architecture
 
 Az API és a worker külön systemd folyamat. Közös állapotuk SQLite WAL adatbázis, az egyetlen aktív pipeline-t részleges egyedi index is védi, ezért két worker sem tud egyszerre jobot megszerezni.
+
+A React/Vite frontend nem külön szerverfolyamat: verziózott statikus release-ként kerül a `/var/www/bdencode/releases/<id>/encoder` könyvtárba. Nginx ugyanazon Basic Auth védelem alatt szolgálja ki a `/encoder/` SPA-t, és a `/encoder/api/` kéréseket a loopback FastAPI felé továbbítja. A `/var/www/bdencode/current` symlink cseréje atomikus, és az app/tool pointerekkel, nginx konfigurációval együtt az installer tartós rollback-snapshotjának része.
 
 ```text
 QUEUED → SCANNING → AWAITING_SELECTION → READY → ENCODING → MUXING

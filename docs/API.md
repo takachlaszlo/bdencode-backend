@@ -21,6 +21,8 @@ A `source_path` csak a konfigurált source root alatt lehet. `work_path` csak a 
 
 A worker scanje után a `POST /jobs/{id}/selection` payload `selection` objektuma határozza meg a playlistet, szűrést és minden sáv műveletét. A backend nem talál ki nyelvet vagy sávszerepet alacsony confidence esetén.
 
+A webes felület mentés előtt ugyanazt az objektumot a `POST /jobs/{id}/selection/validate` végpontra küldi. Ez a valódi plannerrel normalizálja az effektív x264/x265 profilt, cropot és filtert, visszaadja az FFmpeg videóargumentumokat és a figyelmeztetéseket, de nem módosítja a jobot, az eseménynaplót vagy a fájlrendszert. Sikeres ellenőrzés után a változatlan selection a `POST /jobs/{id}/selection` végponton hagyható jóvá; az `expected_version` mindkét kérésnél megakadályozza a stale felülírást.
+
 ```json
 {
   "selection": {

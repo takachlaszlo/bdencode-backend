@@ -10,6 +10,83 @@ def make_client(tmp_path) -> TestClient:
     return TestClient(create_app(Database(tmp_path / "api.sqlite3")))
 
 
+def scan_result(*, warnings: list[str] | None = None) -> dict[str, object]:
+    return {
+        "source": "/storage/Film",
+        "disc_kind": "bd",
+        "content_kind": "film",
+        "playlists": [
+            {
+                "playlist_id": "00001",
+                "duration_seconds": 7200.0,
+                "chapters": [],
+                "segments": [],
+                "streams": [
+                    {
+                        "id": "video:4113",
+                        "index": 0,
+                        "pid": 4113,
+                        "kind": "video",
+                        "codec": "h264",
+                        "roles": [],
+                        "video": {
+                            "codec": "avc",
+                            "width": 1920,
+                            "height": 1080,
+                            "frame_rate": "24000/1001",
+                            "field_order": "progressive",
+                            "bit_depth": 8,
+                            "pixel_format": "yuv420p",
+                            "color_primaries": "bt709",
+                            "color_transfer": "bt709",
+                            "color_matrix": "bt709",
+                            "color_range": "limited",
+                            "chroma_location": "left",
+                        },
+                    }
+                ],
+                "angle_count": 1,
+            }
+        ],
+        "capabilities": {},
+        "fingerprint": "scan-fingerprint",
+        "warnings": warnings or [],
+    }
+
+
+def awaiting_selection_job(client: TestClient, *, warnings: list[str] | None = None):
+    job = client.post(
+        "/api/v1/jobs", json={"source_path": "/storage/Film", "name": "Film"}
+    ).json()
+    client.post("/api/v1/jobs/claim-next")
+    scan = client.post("/api/v1/scans", json={"job_id": job["id"]}).json()
+    response = client.patch(
+        f"/api/v1/scans/{scan['id']}",
+        json={
+            "status": "AWAITING_SELECTION",
+            "result": scan_result(warnings=warnings),
+        },
+    )
+    assert response.status_code == 200
+    return client.get(f"/api/v1/jobs/{job['id']}").json()
+
+
+def valid_selection() -> dict[str, object]:
+    return {
+        "playlist_id": "1.mpls",
+        "angle": 1,
+        "output_name": "Film.1080p.BluRay.x264.mkv",
+        "video": {
+            "detail_level": "advanced",
+            "temporal_filter": "progressive",
+            "crop": {"left": "0", "top": "138", "right": "0", "bottom": "138"},
+            "settings": {"crf": 17.5, "preset": "slow"},
+        },
+        "tracks": [],
+        "upload_images": False,
+    }
+
+
 def test_health_capabilities_and_job_flow(tmp_path):
     with make_client(tmp_path) as client:
         capabilities = client.get("/api/v1/capabilities")
@@ -105,3 +182,112 @@ def test_unknown_resources_return_404(tmp_path):
     with make_client(tmp_path) as client:
         response = client.get("/api/v1/jobs/does-not-exist")
         assert response.status_code == 404
+
+
+def test_png_artifact_content_is_inline_for_comparison_viewer(tmp_path):
+    png = tmp_path / "comparison.png"
+    png.write_bytes(b"not-a-real-png-but-the-api-does-not-decode-artifacts")
+
+    with make_client(tmp_path) as client:
+        job = client.post(
+            "/api/v1/jobs", json={"source_path": "/storage/Film", "name": "Film"}
+        ).json()
+        artifact = client.post(
+            "/api/v1/artifacts",
+            json={
+                "job_id": job["id"],
+                "kind": "VIDEO_COMPARISON",
+                "name": png.name,
+                "path": str(png),
+                "mime_type": "image/png",
+            },
+        ).json()
+
+        response = client.get(f"/api/v1/artifacts/{artifact['id']}/content")
+
+        assert response.status_code == 200
+        assert response.content == png.read_bytes()
+        assert response.headers["content-disposition"].startswith("inline;")
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_selection_validation_returns_effective_plan_without_mutating_job(tmp_path):
+    with make_client(tmp_path) as client:
+        job = awaiting_selection_job(client, warnings=["scanner advisory"])
+        events_before = client.get(
+            "/api/v1/events", params={"job_id": job["id"]}
+        ).json()
+
+        response = client.post(
+            f"/api/v1/jobs/{job['id']}/selection/validate",
+            json={
+                "selection": valid_selection(),
+                "expected_version": job["version"],
+            },
+        )
+
+        assert response.status_code == 200
+        preview = response.json()
+        assert preview["valid"] is True
+        assert preview["playlist_id"] == "00001"
+        assert preview["encoder"] == "x264"
+        assert preview["settings"]["crf"] == 17.5
+        assert preview["settings"]["color"] == {
+            "primaries": "bt709",
+            "transfer": "bt709",
+            "matrix": "bt709",
+            "range": "limited",
+            "chroma_location": "left",
+        }
+        assert preview["crop"] == {"left": 0, "top": 138, "right": 0, "bottom": 138}
+        assert preview["temporal_filter"] == "progressive"
+        assert preview["ffmpeg_video_args"][:2] == ["-c:v", "libx264"]
+        assert preview["advisory_warnings"] == ["scanner advisory"]
+
+        unchanged = client.get(f"/api/v1/jobs/{job['id']}").json()
+        assert unchanged["state"] == "AWAITING_SELECTION"
+        assert unchanged["selection"] is None
+        assert unchanged["version"] == job["version"]
+        events_after = client.get("/api/v1/events", params={"job_id": job["id"]}).json()
+        assert events_after == events_before
+
+
+def test_selection_validation_rejects_invalid_selection_without_mutation(tmp_path):
+    with make_client(tmp_path) as client:
+        job = awaiting_selection_job(client)
+        selection = valid_selection()
+        selection["video"]["crop"]["top"] = 137
+
+        response = client.post(
+            f"/api/v1/jobs/{job['id']}/selection/validate",
+            json={"selection": selection},
+        )
+
+        assert response.status_code == 422
+        assert "crop" in response.json()["detail"]
+        unchanged = client.get(f"/api/v1/jobs/{job['id']}").json()
+        assert unchanged["state"] == "AWAITING_SELECTION"
+        assert unchanged["selection"] is None
+        assert unchanged["version"] == job["version"]
+
+
+def test_selection_validation_requires_successful_scan(tmp_path):
+    with make_client(tmp_path) as client:
+        job = client.post("/api/v1/jobs", json={"source_path": "/storage/Film"}).json()
+        claimed = client.post("/api/v1/jobs/claim-next").json()["job"]
+        client.post("/api/v1/scans", json={"job_id": job["id"]})
+        awaiting = client.post(
+            f"/api/v1/jobs/{job['id']}/transition",
+            json={"state": "AWAITING_SELECTION"},
+        )
+        assert claimed["state"] == "SCANNING"
+        assert awaiting.status_code == 200
+
+        response = client.post(
+            f"/api/v1/jobs/{job['id']}/selection/validate",
+            json={"selection": valid_selection()},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["current_state"] == "AWAITING_SELECTION"
+        assert "no successful scan" in response.json()["detail"]

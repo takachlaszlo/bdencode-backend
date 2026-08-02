@@ -68,6 +68,7 @@ SYSTEM_TARGETS = (
     Path("/etc/systemd/system/apt-daily-upgrade.service.d/bdencode-recovery.conf"),
     Path("/usr/local/libexec/bdencode-daily-update"),
     Path("/etc/nginx/apps/bdencode.conf"),
+    Path("/var/www/bdencode/current"),
 )
 
 

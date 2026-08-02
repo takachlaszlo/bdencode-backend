@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
@@ -42,7 +43,9 @@ from .models import (
     Scan,
     ScanCreate,
     ScanList,
+    ScanState,
     ScanUpdate,
+    SelectionValidationResponse,
     allowed_transitions,
 )
 from .queue import JobQueue
@@ -54,8 +57,16 @@ from .media.profiles import (
     profile_schema,
     recommended_profile,
 )
+from .media.planner import EncodePlanner, EncodeRequest
 from .analyzer import MkvAnalyzer
 from .utils import sha256_file
+from .worker import (
+    ReviewRequired,
+    _field_handling,
+    _planner_crop,
+    _scan_from_dict,
+    parse_selection,
+)
 
 
 API_PREFIX = "/api/v1"
@@ -297,6 +308,86 @@ def create_app(
             expected_version=request.expected_version,
         )
 
+    @application.post(
+        f"{API_PREFIX}/jobs/{{job_id}}/selection/validate",
+        response_model=SelectionValidationResponse,
+    )
+    def validate_job_selection(
+        job_id: str, request: JobSelectionRequest
+    ) -> SelectionValidationResponse:
+        job = db.get_job(job_id)
+        if job.state not in {JobState.AWAITING_SELECTION, JobState.NEEDS_REVIEW}:
+            raise StateConflictError(
+                "selection is only validated while awaiting selection or review",
+                current=job.state,
+            )
+        if (
+            request.expected_version is not None
+            and job.version != request.expected_version
+        ):
+            raise StateConflictError(
+                f"job version is {job.version}, expected {request.expected_version}",
+                current=job.state,
+            )
+
+        scans = db.list_scans(job_id=job_id, limit=500)
+        scan_row = next(
+            (
+                item
+                for item in scans
+                if item.status in {ScanState.AWAITING_SELECTION, ScanState.COMPLETED}
+            ),
+            None,
+        )
+        if scan_row is None:
+            raise StateConflictError(
+                "job has no successful scan to validate against", current=job.state
+            )
+
+        candidate = job.model_copy(update={"selection": request.selection})
+        try:
+            scan = _scan_from_dict(scan_row.result)
+            selection = parse_selection(candidate, scan)
+        except ReviewRequired as exc:
+            raise ConfigurationError(str(exc)) from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConfigurationError(f"stored scan result is invalid: {exc}") from exc
+
+        work_root = (
+            settings.data_root if settings is not None else Path.cwd()
+        ).resolve(strict=False)
+        preview_root = work_root / ".selection-validation" / job.id
+        try:
+            plan = EncodePlanner(work_root=work_root).build(
+                EncodeRequest(
+                    scan=scan,
+                    playlist_id=selection.playlist_id,
+                    settings=selection.settings,
+                    work_dir=preview_root / "work",
+                    output_path=preview_root / "output.mkv",
+                    track_selections=selection.tracks,
+                    field_handling=_field_handling(selection.temporal_filter),
+                    crop=_planner_crop(selection.crop),
+                    angle=selection.angle,
+                    overwrite=True,
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConfigurationError(
+                f"selection cannot be planned safely: {exc}"
+            ) from exc
+
+        return SelectionValidationResponse(
+            valid=True,
+            playlist_id=selection.playlist_id,
+            encoder=selection.settings.encoder.value,
+            settings=selection.settings.to_dict(),
+            ffmpeg_video_args=list(selection.settings.ffmpeg_video_args()),
+            crop=asdict(selection.crop),
+            temporal_filter=selection.temporal_filter.value,
+            advisory_warnings=list(plan.warnings),
+        )
+
     @application.post(f"{API_PREFIX}/jobs/{{job_id}}/progress", response_model=Job)
     def job_progress(job_id: str, request: JobProgressRequest) -> Job:
         return db.record_progress(
@@ -390,6 +481,12 @@ def create_app(
             target,
             media_type=artifact.mime_type or "application/octet-stream",
             filename=artifact.name,
+            # Comparison and spectrum PNGs are consumed directly by the
+            # authenticated web UI.  Keep every other artifact downloadable.
+            content_disposition_type=(
+                "inline" if artifact.mime_type == "image/png" else "attachment"
+            ),
+            headers={"X-Content-Type-Options": "nosniff"},
         )
 
     @application.post(

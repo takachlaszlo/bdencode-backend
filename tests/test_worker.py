@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import pytest
+from fastapi.testclient import TestClient
 
 import bdencode.worker as worker_module
+from bdencode.api import create_app
 from bdencode.config import Settings
 from bdencode.db import Database
 from bdencode.media.bluray import (
@@ -26,6 +28,7 @@ from bdencode.media.bluray import (
     VideoProperties,
 )
 from bdencode.models import (
+    ArtifactKind,
     ContentType,
     DiscType,
     JobCreate,
@@ -654,6 +657,156 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     tampered.write_bytes(tampered.read_bytes() + b"tampered")
     with pytest.raises(RuntimeError, match="hash differs"):
         _current_comparison_pngs(job_paths)
+
+
+def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
+    database, _settings, scan, scanner, runner, worker = context
+    audio = MediaStream(
+        id="audio:4352",
+        index=1,
+        pid=4352,
+        kind=StreamKind.AUDIO,
+        codec="ac3",
+        channels=2,
+        channel_layout="stereo",
+        sample_rate=48000,
+    )
+    scanner.result = replace(
+        scan,
+        playlists=(
+            replace(
+                scan.playlists[0],
+                streams=(*scan.playlists[0].streams, audio),
+            ),
+        ),
+    )
+
+    real_run = runner.run
+
+    def run_with_audio_reports(argv, **kwargs):
+        real_run(argv, **kwargs)
+        command = tuple(os.fspath(item) for item in argv)
+        stdout_path = kwargs.get("stdout_path")
+        if stdout_path is None:
+            return
+        if command[0] == "mkvmerge" and "--identify" in command:
+            runner._write(
+                stdout_path,
+                json.dumps(
+                    {
+                        "container": {"properties": {"title": "Movie.Encode"}},
+                        "tracks": [
+                            {"id": 0, "type": "video", "properties": {}},
+                            {
+                                "id": 1,
+                                "type": "audio",
+                                "properties": {
+                                    "language": "en",
+                                    "default_track": False,
+                                    "forced_track": False,
+                                },
+                            },
+                        ],
+                        "attachments": [
+                            {
+                                "file_name": "encode.log",
+                                "content_type": "text/plain; charset=utf-8",
+                            }
+                        ],
+                    }
+                ),
+            )
+        elif stdout_path.name == "ffprobe-streams.json":
+            runner._write(
+                stdout_path,
+                json.dumps(
+                    {
+                        "streams": [
+                            {
+                                "index": 0,
+                                "codec_name": "h264",
+                                "profile": "High",
+                                "codec_type": "video",
+                                "width": 1920,
+                                "height": 1080,
+                                "pix_fmt": "yuv420p",
+                                "color_range": "tv",
+                                "color_space": "bt709",
+                                "color_transfer": "bt709",
+                                "color_primaries": "bt709",
+                                "chroma_location": "left",
+                            },
+                            {"index": 1, "codec_name": "ac3", "codec_type": "audio"},
+                        ]
+                    }
+                ),
+            )
+        elif stdout_path.name.endswith("-probe.json"):
+            runner._write(
+                stdout_path,
+                json.dumps(
+                    {
+                        "streams": [
+                            {
+                                "codec_type": "audio",
+                                "codec_name": "ac3",
+                                "sample_rate": "48000",
+                                "channels": 2,
+                                "channel_layout": "stereo",
+                                "nb_samples": "480000",
+                                "start_time": "0",
+                                "duration": "10",
+                            }
+                        ]
+                    }
+                ),
+            )
+
+    runner.run = run_with_audio_reports
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(
+        job.id,
+        _selection(
+            tracks=[
+                {"stream_id": "audio:4352", "action": "copy", "language": "eng"}
+            ]
+        ),
+    )
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.COMPLETED, result.status_message
+    spectra = [
+        artifact
+        for artifact in database.list_artifacts(job_id=job.id, limit=1000)
+        if artifact.kind is ArtifactKind.SPECTROGRAM
+    ]
+    assert {artifact.name for artifact in spectra} == {
+        "audio-01-source-spectrum.png",
+        "audio-01-encode-spectrum.png",
+    }
+    assert all(artifact.mime_type == "image/png" for artifact in spectra)
+    assert all(artifact.sha256 and len(artifact.sha256) == 64 for artifact in spectra)
+    assert all(Path(artifact.path).is_file() for artifact in spectra)
+    with TestClient(create_app(database, settings=worker.settings)) as client:
+        listed = client.get("/api/v1/artifacts", params={"job_id": job.id})
+        assert listed.status_code == 200
+        api_spectra = [
+            artifact
+            for artifact in listed.json()["items"]
+            if artifact["kind"] == "SPECTROGRAM"
+        ]
+        assert {artifact["name"] for artifact in api_spectra} == {
+            artifact.name for artifact in spectra
+        }
+        for artifact in api_spectra:
+            content = client.get(f"/api/v1/artifacts/{artifact['id']}/content")
+            assert content.status_code == 200
+            assert content.headers["content-type"] == "image/png"
+            assert content.content.startswith(b"\x89PNG\r\n\x1a\n")
 
 
 def test_missing_imgbb_credential_becomes_retryable_upload_failure(context):

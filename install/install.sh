@@ -18,9 +18,12 @@ installer_apt_lock=/run/lock/bdencode-installer-apt.lock
 data_root="${BDENCODE_DATA_ROOT:-$task_home/encode}"
 source_root="${BDENCODE_SOURCE_ROOT:-$task_home/storage}"
 app_root="$data_root/app"
+frontend_dist="$repo_root/frontend/dist"
+frontend_root=/var/www/bdencode
 release_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 release_root="$app_root/releases/$release_id"
 tool_release="$app_root/tools/releases/$release_id"
+frontend_release="$frontend_root/releases/$release_id"
 tool_config="$tool_release/config"
 logical_cpus="$(getconf _NPROCESSORS_ONLN)"
 cpu_percent="${BDENCODE_CPU_PERCENT:-80}"
@@ -113,6 +116,26 @@ if [[ -z "$task_home" || "$task_home" == "/" || "$data_root" == "/" ]]; then
 fi
 if [[ ! -d "$source_root" ]]; then
     echo "Source root does not exist: $source_root" >&2
+    exit 2
+fi
+if [[ ! -d "$frontend_dist" || ! -s "$frontend_dist/index.html" ]]; then
+    echo "Missing prebuilt frontend release: $frontend_dist/index.html" >&2
+    echo "Build and commit frontend/dist before running the server installer." >&2
+    exit 2
+fi
+frontend_invalid=""
+if ! frontend_invalid="$(
+    find "$frontend_dist" -mindepth 1 ! -type d ! -type f -print -quit
+)"; then
+    echo "Could not validate frontend dist" >&2
+    exit 2
+fi
+if [[ -n "$frontend_invalid" ]]; then
+    echo "Frontend dist may contain only regular files and directories" >&2
+    exit 2
+fi
+if ! grep -Fq '/encoder/' "$frontend_dist/index.html"; then
+    echo "Frontend dist was not built for the required /encoder/ base path" >&2
     exit 2
 fi
 
@@ -404,10 +427,43 @@ ninja -C "$vmaf_source/libvmaf/build" install
 ln -s "$tool_release/vmaf/bin/vmaf" "$tool_release/bin/vmaf"
 "$tool_release/bin/vmaf" --version
 
+# Publish immutable, root-owned static assets outside the private encode tree.
+# The current web pointer is part of the durable installer snapshot, so a crash
+# after activation restores the frontend together with backend/tool pointers.
+sudo install -d -m 0755 "$frontend_root" "$frontend_root/releases"
+if sudo test -e "$frontend_release" || sudo test -L "$frontend_release"; then
+    echo "Frontend release already exists: $frontend_release" >&2
+    exit 1
+fi
+sudo install -d -m 0755 "$frontend_release" "$frontend_release/encoder"
+sudo cp -a "$frontend_dist/." "$frontend_release/encoder/"
+frontend_invalid=""
+if ! frontend_invalid="$(
+    sudo find "$frontend_release" -mindepth 1 ! -type d ! -type f -print -quit
+)"; then
+    echo "Could not validate published frontend" >&2
+    exit 1
+fi
+if [[ -n "$frontend_invalid" ]]; then
+    echo "Published frontend contains an unsafe filesystem object" >&2
+    exit 1
+fi
+sudo chown -R root:root "$frontend_release"
+sudo find "$frontend_release" -type d -exec chmod 0755 {} +
+sudo find "$frontend_release" -type f -exec chmod 0644 {} +
+sudo test ! -L "$frontend_release/encoder/index.html"
+sudo test -s "$frontend_release/encoder/index.html"
+sudo diff -qr "$frontend_dist" "$frontend_release/encoder"
+sudo sync -f "$frontend_release"
+
 ln -sfn "$release_root" "$app_root/.current-new"
 mv -Tf "$app_root/.current-new" "$app_root/current"
 ln -sfn "$tool_release" "$app_root/tools/.current-new"
 mv -Tf "$app_root/tools/.current-new" "$app_root/tools/current"
+frontend_new="$frontend_root/.current-new-$release_id"
+sudo ln -s "$frontend_release" "$frontend_new"
+sudo mv -Tf "$frontend_new" "$frontend_root/current"
+sudo sync -f "$frontend_root"
 
 sudo install -d -m 0755 /etc/bdencode /usr/local/libexec /var/lib/bdencode
 sudo install -d -m 0711 /var/lib/bdencode/apt-transactions
@@ -465,7 +521,10 @@ if [[ -d /etc/nginx/apps && -f /etc/htpasswd ]]; then
     nginx_target=/etc/nginx/apps/bdencode.conf
     nginx_new=/etc/nginx/apps/.bdencode.conf.new
     nginx_backup=/etc/nginx/apps/.bdencode.conf.rollback
-    sudo sed -e 's|@PORT@|8796|g' "$repo_root/deploy/nginx/bdencode.conf.in" \
+    sudo sed \
+        -e 's|@PORT@|8796|g' \
+        -e "s|@FRONTEND_ROOT@|$frontend_root/current|g" \
+        "$repo_root/deploy/nginx/bdencode.conf.in" \
         | sudo tee "$nginx_new" >/dev/null
     if sudo test -e "$nginx_target"; then
         sudo cp -a "$nginx_target" "$nginx_backup"

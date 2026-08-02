@@ -196,6 +196,24 @@ class JobSelectionRequest(StrictModel):
     expected_version: int | None = Field(default=None, ge=1)
 
 
+class NormalizedCrop(StrictModel):
+    left: int = Field(ge=0)
+    top: int = Field(ge=0)
+    right: int = Field(ge=0)
+    bottom: int = Field(ge=0)
+
+
+class SelectionValidationResponse(StrictModel):
+    valid: bool
+    playlist_id: str
+    encoder: str
+    settings: JsonObject
+    ffmpeg_video_args: list[str]
+    crop: NormalizedCrop
+    temporal_filter: str
+    advisory_warnings: list[str]
+
+
 class JobProgressRequest(StrictModel):
     progress: float = Field(ge=0, le=1)
     message: str | None = Field(default=None, max_length=4000)

@@ -1720,6 +1720,7 @@ class PipelineWorker:
         audio_manifest_path = paths.analysis / "audio-comparison.json"
         audio_outputs: list[Path] = [audio_manifest_path]
         audio_results: list[dict[str, Any]] = []
+        spectrograms: list[Path] = []
         audio_ordinals = {
             item.id: index for index, item in enumerate(playlist.audio_streams)
         }
@@ -1743,6 +1744,7 @@ class PipelineWorker:
             encode_analysis = prefix.with_name(prefix.name + "-encode-analysis.log")
             source_spectrum = prefix.with_name(prefix.name + "-source-spectrum.png")
             encode_spectrum = prefix.with_name(prefix.name + "-encode-spectrum.png")
+            spectrograms.extend((source_spectrum, encode_spectrum))
             commands: list[tuple[list[str], Path, bool]] = [
                 (
                     audio_probe_command(paths.reference, source_audio_ordinal),
@@ -1895,6 +1897,14 @@ class PipelineWorker:
             audio_manifest_path.name,
             mime_type="application/json",
         )
+        for spectrum in spectrograms:
+            self._register_artifact(
+                job.id,
+                spectrum,
+                DatabaseArtifactKind.SPECTROGRAM,
+                spectrum.name,
+                mime_type="image/png",
+            )
         self.queue.advance(
             job.id, JobState.COMPARISON, message="container and audio QC passed"
         )

@@ -31,6 +31,7 @@ def test_system_target_allowlist_covers_apt_recovery_dropins() -> None:
         "/etc/systemd/system/apt-daily-upgrade.service.d/bdencode-recovery.conf"
         in targets
     )
+    assert "/var/www/bdencode/current" in targets
 
 
 def test_stable_recovery_bootstrap_is_outside_rollback_allowlist() -> None:
@@ -211,6 +212,63 @@ def test_recovery_restores_release_symlinks(
     assert os.readlink(app_pointer) == str(old_app)
     assert tools_pointer.is_symlink()
     assert os.readlink(tools_pointer) == str(old_tools)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX symlinks")
+def test_recovery_restores_frontend_release_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BDENCODE_INSTALL_TESTING", "1")
+    state_root = tmp_path / "journal"
+    state_root.mkdir(mode=0o700)
+    app_root = tmp_path / "data" / "app"
+    (app_root / "tools").mkdir(parents=True)
+    web_releases = tmp_path / "var" / "www" / "bdencode" / "releases"
+    old_web = web_releases / "old"
+    new_web = web_releases / "new"
+    old_web.mkdir(parents=True)
+    new_web.mkdir()
+    web_pointer = web_releases.parent / "current"
+    web_pointer.symlink_to(old_web)
+    transaction = install_transaction.InstallTransaction(
+        state_root, fixed_targets=(web_pointer,)
+    )
+    transaction.initialize()
+
+    transaction.begin(TRANSACTION_ID, app_root)
+    transaction.prepare_mutation()
+    web_pointer.unlink()
+    web_pointer.symlink_to(new_web)
+
+    transaction.recover()
+    assert web_pointer.is_symlink()
+    assert os.readlink(web_pointer) == str(old_web)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX symlinks")
+def test_first_install_recovery_removes_frontend_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BDENCODE_INSTALL_TESTING", "1")
+    state_root = tmp_path / "journal"
+    state_root.mkdir(mode=0o700)
+    app_root = tmp_path / "data" / "app"
+    (app_root / "tools").mkdir(parents=True)
+    web_release = tmp_path / "var" / "www" / "bdencode" / "releases" / "new"
+    web_release.mkdir(parents=True)
+    web_pointer = web_release.parents[1] / "current"
+    transaction = install_transaction.InstallTransaction(
+        state_root, fixed_targets=(web_pointer,)
+    )
+    transaction.initialize()
+
+    transaction.begin(TRANSACTION_ID, app_root)
+    transaction.prepare_mutation()
+    web_pointer.symlink_to(web_release)
+
+    transaction.recover()
+    assert not web_pointer.exists()
+    assert not web_pointer.is_symlink()
 
 
 def test_commit_keeps_new_files_and_clears_marker(

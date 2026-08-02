@@ -1,6 +1,6 @@
-# BDEncode Backend
+# BDEncode
 
-Headless, tartós Blu-ray/UHD Blu-ray kódoló backend x264/x265 kimenethez. A projekt ebben a fázisban csak a backend, a webes frontend később erre az API-ra épül.
+Tartós Blu-ray/UHD Blu-ray kódoló rendszer x264/x265 kimenethez, headless backenddel és a Swizzin nginx mögött futó, reszponzív webes kezelőfelülettel.
 
 ## Fő tulajdonságok
 
@@ -22,6 +22,8 @@ Headless, tartós Blu-ray/UHD Blu-ray kódoló backend x264/x265 kimenethez. A p
 - raw és kitisztított log; az MKV csak a kitisztított encode logot kapja meg, comparison fájlokat soha;
 - MPLS/CLPI/PMT nyelv-provenance, ismeretlen audiónál CPU-only faster-whisper mintavétel, bizonytalanságnál review;
 - systemd API/worker/update szolgáltatások és Swizzin nginx `/encoder/` konfiguráció.
+- csempés webes kezelőfelület forrásböngészővel, várólistával, kezdő/haladó/profi beállításokkal, szerveroldali tervellenőrzéssel, log- és artifact-nézettel;
+- interaktív I/P/B PNG comparison (csúszka, A/B, villogó és difference nézet), audio-spektrum párok és BBCode-másolás.
 
 ## Szervertelepítés
 
@@ -38,8 +40,9 @@ A telepítő:
 3. külön Python 3.12 környezetbe telepíti a VapourSynth/BestSource/Bwdif/VIVTC toolchaint;
 4. lefordítja a verziórögzített hivatalos VMAF CLI-t;
 5. telepíti a natív libbluray JSON scannert;
-6. létrehozza és elindítja a systemd egységeket;
-7. a Swizzin `/etc/htpasswd` védelmét újrahasználva beköti az nginx `/encoder/` útvonalat.
+6. a repóban lévő, előre buildelt `frontend/dist` csomagot root-owned, verziózott web release-be telepíti;
+7. létrehozza és elindítja a systemd egységeket;
+8. a Swizzin `/etc/htpasswd` védelmét újrahasználva beköti az nginx `/encoder/` UI- és API-útvonalat.
 
 Alapértelmezett útvonalak:
 
@@ -52,9 +55,26 @@ Alapértelmezett útvonalak:
   completed/                 kész release-ek
   cache/                     indexek/modellek/build cache
   updates/                   napi update riportok
+/var/www/bdencode/
+  releases/<release-id>/     változatlan frontend release-ek
+  current -> releases/...    atomikusan cserélt web pointer
 ```
 
-Az API csak `127.0.0.1:8796` címen figyel. Nginx mögött az OpenAPI dokumentáció: `/encoder/api/v1/docs`.
+Az API csak `127.0.0.1:8796` címen figyel. A kezelőfelület nginx mögött a `/encoder/`, az OpenAPI dokumentáció a `/encoder/api/v1/docs` útvonalon érhető el. Mindkettő a meglévő Swizzin Basic Auth védelmét használja.
+
+## Frontend fejlesztése
+
+Node.js 22.22+ és pnpm 11 szükséges:
+
+```bash
+cd frontend
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+A Vite build rögzített base pathja `/encoder/`. A szerver nem futtat Node.js-t: a telepítő kizárólag a tesztelt, repóban lévő `frontend/dist` tartalmát publikálja.
 
 ## ImgBB credential
 
@@ -86,6 +106,7 @@ Fontos API-k:
 - `GET /api/v1/sources`
 - `GET /api/v1/profiles/{x264|x265}/schema`
 - `POST /api/v1/jobs`
+- `POST /api/v1/jobs/{id}/selection/validate`
 - `POST /api/v1/jobs/{id}/selection`
 - `GET /api/v1/scans?job_id=...`
 - `GET /api/v1/events?job_id=...`
@@ -111,6 +132,7 @@ A telepítő külön, fix célpontlistás rollback-snapshotot tart a változó h
 ```bash
 python -m pip install -e '.[test]'
 python -m pytest
+cd frontend && pnpm install --frozen-lockfile && pnpm typecheck && pnpm test && pnpm build
 ```
 
 Részletes API/selection leírás: [docs/API.md](docs/API.md). Pipeline és artifact szabályok: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
