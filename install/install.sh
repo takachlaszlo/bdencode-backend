@@ -420,7 +420,27 @@ sudo flock -x "$installer_apt_lock" apt-get \
 python3 -m venv "$release_root/venv"
 "$release_root/venv/bin/python" -m pip install --disable-pip-version-check --upgrade pip wheel
 "$release_root/venv/bin/python" -m pip install --disable-pip-version-check "$repo_root[test,language]"
-"$release_root/venv/bin/python" -m pytest -q "$repo_root/tests"
+# The installer itself accepts BDENCODE_DATA_ROOT and related runtime
+# overrides.  The test suite creates isolated temporary configurations, so
+# allowing those values to leak into pytest would make CLI tests open the live
+# deployment database instead of their temporary database.
+env \
+    -u BDENCODE_CONFIG \
+    -u BDENCODE_CONFIG_PATH \
+    -u BDENCODE_DATA_ROOT \
+    -u BDENCODE_DATABASE_PATH \
+    -u BDENCODE_DB_PATH \
+    -u BDENCODE_SOURCE_ROOT \
+    -u BDENCODE_SOURCE_ROOTS \
+    -u BDENCODE_CPU_PERCENT \
+    -u BDENCODE_CPU_LIMIT_PERCENT \
+    -u BDENCODE_BIND_HOST \
+    -u BDENCODE_BIND_PORT \
+    -u BDENCODE_API_ROOT_PATH \
+    -u BDENCODE_WORKER_POLL_SECONDS \
+    -u BDENCODE_COMPARISON_FRAMES_PER_TYPE \
+    -u BDENCODE_LOG_LEVEL \
+    "$release_root/venv/bin/python" -m pytest -q "$repo_root/tests"
 
 # Current VapourSynth and BestSource require Python >=3.12. uv installs a
 # dedicated managed interpreter without replacing Debian's system Python.

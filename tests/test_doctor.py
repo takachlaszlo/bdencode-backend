@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -119,6 +120,28 @@ def test_installer_uses_narrow_review_pause_gate() -> None:
     assert "queue_args+=(--allow-review)" in gate
     assert "AWAITING_SELECTION$" in gate
     assert "NEEDS_REVIEW" not in gate
+
+
+def test_installer_isolates_tests_from_live_runtime_configuration() -> None:
+    installer = (ROOT / "install" / "install.sh").read_text(encoding="utf-8")
+    start = installer.index("# The installer itself accepts BDENCODE_DATA_ROOT")
+    end = installer.index("# Current VapourSynth", start)
+    test_command = installer[start:end]
+
+    runtime_variables = {
+        f"BDENCODE_{field.name.upper()}" for field in fields(Settings)
+    }
+    runtime_variables.update(
+        {
+            "BDENCODE_CONFIG",
+            "BDENCODE_DB_PATH",
+            "BDENCODE_SOURCE_ROOT",
+            "BDENCODE_CPU_PERCENT",
+        }
+    )
+    for variable in runtime_variables:
+        assert f"-u {variable}" in test_command
+    assert '"$release_root/venv/bin/python" -m pytest' in test_command
 
 
 def test_settings_cpu_quota_is_total_machine_fraction(tmp_path: Path) -> None:

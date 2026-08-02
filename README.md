@@ -44,6 +44,37 @@ A telepítő:
 7. létrehozza és elindítja a systemd egységeket;
 8. a Swizzin `/etc/htpasswd` védelmét újrahasználva beköti az nginx `/encoder/` UI- és API-útvonalat.
 
+## Eltávolítás
+
+A program, a systemd/nginx integráció és a verziózott alkalmazáskód eltávolítása,
+a queue, a munkák és a kész kimenetek megőrzésével:
+
+```bash
+bash install/uninstall.sh
+```
+
+Ha egy félbemaradt telepítés visszaállította a configot, a pontos gyökereket
+kötelező megadni. A teljes, még használatlan munkakönyvtár törlése:
+
+```bash
+bash install/uninstall.sh \
+  --data-root "$HOME/encode" \
+  --source-root /storage \
+  --purge-data \
+  --confirm-data-root "$HOME/encode"
+```
+
+A source gyökér soha nem törlési célpont. A teljes adattörlés az átfedő
+source/data útvonalat, symlinket, mountpointot, idegen tulajdonost és túl tág
+rendszerútvonalat elutasítja. Aktív queue vagy helyreállítási tranzakció mellett
+az eltávolítás nem indul el. Az ImgBB credential csak a külön
+`--purge-credential` kapcsolóval törlődik.
+
+Az APT-csomagokat az általános eltávolító szándékosan megőrzi: a régi
+telepítések nem rögzítették, mely csomagok voltak már korábban a szerveren,
+ezért azok automatikus eltávolítása más programokat is érinthetne. A Git checkoutot
+szintén külön kell törölni.
+
 Alapértelmezett útvonalak:
 
 ```text
