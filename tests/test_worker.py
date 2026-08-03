@@ -6,6 +6,7 @@ import re
 import shutil
 import struct
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -953,10 +954,15 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
     )
 
     real_run = runner.run
+    spectrum_invocations: list[tuple[tuple[str, ...], Path | None]] = []
 
     def run_with_audio_reports(argv, **kwargs):
-        real_run(argv, **kwargs)
         command = tuple(os.fspath(item) for item in argv)
+        if command[0] == "ffmpeg" and any(
+            "showspectrumpic" in item for item in command
+        ):
+            spectrum_invocations.append((command, kwargs.get("stderr_path")))
+        real_run(argv, **kwargs)
         stdout_path = kwargs.get("stdout_path")
         if stdout_path is None:
             return
@@ -1024,9 +1030,9 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
                                 "sample_rate": "48000",
                                 "channels": 2,
                                 "channel_layout": "stereo",
-                                "nb_samples": "480000",
+                                "nb_samples": "28848000",
                                 "start_time": "0",
-                                "duration": "10",
+                                "duration": "601",
                             }
                         ]
                     }
@@ -1062,6 +1068,20 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
     assert all(artifact.mime_type == "image/png" for artifact in spectra)
     assert all(artifact.sha256 and len(artifact.sha256) == 64 for artifact in spectra)
     assert all(Path(artifact.path).is_file() for artifact in spectra)
+    assert len(spectrum_invocations) == 6
+    for command, stderr_path in spectrum_invocations:
+        output_path = Path(command[-1])
+        assert Decimal(command[command.index("-t") + 1]) <= Decimal("300")
+        assert stderr_path is not None
+        assert stderr_path != output_path
+        assert stderr_path.parent.name == "logs"
+        assert stderr_path.name == f"{output_path.stem}.stderr"
+    stitch_commands = [
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg" and any("vstack=inputs=3" in item for item in command)
+    ]
+    assert len(stitch_commands) == 2
     with TestClient(create_app(database, settings=worker.settings)) as client:
         listed = client.get("/api/v1/artifacts", params={"job_id": job.id})
         assert listed.status_code == 200

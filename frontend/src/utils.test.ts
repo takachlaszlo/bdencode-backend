@@ -32,6 +32,13 @@ describe("formatEventMessage", () => {
       .toMatch(/fejezetlista létrehozása/i);
   });
 
+  it("explains an audio spectrum failure as a safe QC continuation", () => {
+    const failure = "ProcessFailure: ffmpeg -filter_complex showspectrumpic ... audio-01-source-spectrum.png";
+    expect(formatWorkerError(failure)).toMatch(/spektrumképének elkészítése/i);
+    expect(formatStatusMessage(failure, "Állapotfrissítésre vár"))
+      .toMatch(/QC szakasztól biztonságosan folytatható/i);
+  });
+
   it("uses backend pipeline baselines for legacy jobs without progress", () => {
     expect(stageProgress(makeJob({ state: "MUXING", progress: null }))).toBe(0.78);
     expect(stageProgress(makeJob({ state: "FAILED", resume_state: "MUXING", progress: null }))).toBe(0.78);

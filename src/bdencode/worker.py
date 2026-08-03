@@ -20,7 +20,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Protocol, Sequence
 
 from .chapters import render_matroska_chapters
 from .config import Settings
@@ -105,7 +105,9 @@ from .qc.audio import (
     compare_audio_probes,
     parse_audio_probe,
     pcm_hash_command,
+    plan_spectrum_windows,
     spectrum_command,
+    spectrum_stitch_command,
 )
 from .qc.imgbb import ImageUploadError, ImgBBClient
 from .qc.video import (
@@ -2008,71 +2010,134 @@ class PipelineWorker:
             source_spectrum = prefix.with_name(prefix.name + "-source-spectrum.png")
             encode_spectrum = prefix.with_name(prefix.name + "-encode-spectrum.png")
             spectrograms.extend((source_spectrum, encode_spectrum))
-            commands: list[tuple[list[str], Path, bool]] = [
+            intermediate_sha256 = sha256_file(intermediate)
+            track_command_inputs = {
+                "reference": audio_inputs["reference_sha256"],
+                "final_output": audio_inputs["output_sha256"],
+                "intermediate": intermediate_sha256,
+            }
+            commands: list[
+                tuple[list[str], Path, Literal["stdout", "stderr"]]
+            ] = [
                 (
                     audio_probe_command(paths.reference, source_audio_ordinal),
                     source_probe,
-                    True,
+                    "stdout",
                 ),
-                (audio_probe_command(output, final_audio_ordinal), encode_probe, True),
+                (
+                    audio_probe_command(output, final_audio_ordinal),
+                    encode_probe,
+                    "stdout",
+                ),
                 (
                     pcm_hash_command(paths.reference, source_audio_ordinal),
                     source_pcm,
-                    True,
+                    "stdout",
                 ),
-                (pcm_hash_command(output, final_audio_ordinal), encode_pcm, True),
+                (pcm_hash_command(output, final_audio_ordinal), encode_pcm, "stdout"),
                 (
                     analysis_command(
                         paths.reference, source_audio_ordinal, source_analysis
                     ),
                     source_analysis,
-                    False,
+                    "stderr",
                 ),
                 (
                     analysis_command(output, final_audio_ordinal, encode_analysis),
                     encode_analysis,
-                    False,
-                ),
-                (
-                    spectrum_command(
-                        paths.reference, source_audio_ordinal, source_spectrum
-                    ),
-                    source_spectrum,
-                    False,
-                ),
-                (
-                    spectrum_command(output, final_audio_ordinal, encode_spectrum),
-                    encode_spectrum,
-                    False,
+                    "stderr",
                 ),
             ]
-            for command, result_path, stdout_result in commands:
+            for command, result_path, result_mode in commands:
                 command_inputs = {
                     "argv": command,
-                    "reference": sha256_file(paths.reference),
-                    "final_output": sha256_file(output),
-                    "intermediate": sha256_file(intermediate),
+                    **track_command_inputs,
                 }
                 marker = paths.stages / f"qc-{result_path.stem}.json"
                 if not _valid_stage(marker, command_inputs, [result_path]):
-                    if stdout_result:
+                    if result_mode == "stdout":
                         self._runner(paths).run(
                             command,
                             cwd=paths.work,
                             stdout_path=result_path,
                             stderr_path=paths.logs / f"{result_path.stem}.stderr",
                         )
-                    else:
+                    elif result_mode == "stderr":
                         self._runner(paths).run(
                             command,
                             cwd=paths.work,
                             stderr_path=result_path,
                         )
+                    else:
+                        raise AssertionError(f"unsupported QC result mode: {result_mode}")
                     _write_stage(marker, command_inputs, [result_path])
-            inspect_png(source_spectrum)
-            inspect_png(encode_spectrum)
             source_value = parse_audio_probe(source_probe.read_text(encoding="utf-8"))
             encode_value = parse_audio_probe(encode_probe.read_text(encoding="utf-8"))
+            measured_durations = tuple(
+                value.duration
+                for value in (source_value, encode_value)
+                if value.duration is not None
+            )
+            if not measured_durations:
+                raise ReviewRequired(
+                    f"audio duration is unavailable for spectral analysis: {stream.id}"
+                )
+            spectrum_duration = max(measured_durations)
+            spectrum_windows = plan_spectrum_windows(spectrum_duration)
+            spectrum_work = paths.work / "spectrum" / f"audio-{number:02d}"
+            spectrum_work.mkdir(mode=0o750, parents=True, exist_ok=True)
+
+            for media_path, ordinal, final_spectrum in (
+                (paths.reference, source_audio_ordinal, source_spectrum),
+                (output, final_audio_ordinal, encode_spectrum),
+            ):
+                window_outputs: list[Path] = []
+                for window in spectrum_windows:
+                    window_output = spectrum_work / (
+                        f"{final_spectrum.stem}-window-{window.index + 1:03d}.png"
+                    )
+                    window_outputs.append(window_output)
+                    command = spectrum_command(
+                        media_path,
+                        ordinal,
+                        window_output,
+                        start_seconds=window.start_seconds,
+                        duration_seconds=window.duration_seconds,
+                        height=window.height,
+                    )
+                    command_inputs = {"argv": command, **track_command_inputs}
+                    marker = paths.stages / f"qc-{window_output.stem}.json"
+                    if not _valid_stage(marker, command_inputs, [window_output]):
+                        self._runner(paths).run(
+                            command,
+                            cwd=paths.work,
+                            stderr_path=paths.logs / f"{window_output.stem}.stderr",
+                        )
+                        inspect_png(window_output, require_high_bit_depth=True)
+                        _write_stage(marker, command_inputs, [window_output])
+                    else:
+                        inspect_png(window_output, require_high_bit_depth=True)
+
+                stitch_command = spectrum_stitch_command(
+                    tuple(window_outputs), final_spectrum
+                )
+                stitch_inputs = {
+                    "argv": stitch_command,
+                    **track_command_inputs,
+                    "window_sha256": [sha256_file(path) for path in window_outputs],
+                }
+                marker = paths.stages / f"qc-{final_spectrum.stem}.json"
+                if not _valid_stage(marker, stitch_inputs, [final_spectrum]):
+                    self._runner(paths).run(
+                        stitch_command,
+                        cwd=paths.work,
+                        stderr_path=paths.logs / f"{final_spectrum.stem}.stderr",
+                    )
+                    inspect_png(final_spectrum, require_high_bit_depth=True)
+                    _write_stage(marker, stitch_inputs, [final_spectrum])
+                else:
+                    inspect_png(final_spectrum, require_high_bit_depth=True)
+
             comparison = compare_audio_probes(source_value, encode_value)
             pcm_match = sha256_file(source_pcm) == sha256_file(encode_pcm)
             delay_tolerance = Decimal(1) / Decimal(source_value.sample_rate)
@@ -2114,6 +2179,9 @@ class PipelineWorker:
                     "encode_spectrum": encode_spectrum.name,
                     "source_spectrum_sha256": sha256_file(source_spectrum),
                     "encode_spectrum_sha256": sha256_file(encode_spectrum),
+                    "spectrum_coverage_seconds": str(spectrum_duration),
+                    "spectrum_window_count": len(spectrum_windows),
+                    "spectrum_max_window_seconds": "300",
                 }
             )
             audio_outputs.extend(
@@ -2132,7 +2200,7 @@ class PipelineWorker:
                 {
                     "stream": stream.id,
                     "action": item.action.value,
-                    "sha256": sha256_file(intermediate),
+                    "sha256": intermediate_sha256,
                 }
             )
         audio_marker = paths.stages / "qc-audio.json"

@@ -10,9 +10,13 @@ import pytest
 from bdencode.qc.artifacts import inspect_png
 from bdencode.qc.audio import (
     AudioProbe,
+    audio_probe_command,
     compare_audio_probes,
+    parse_audio_probe,
     pcm_hash_command,
+    plan_spectrum_windows,
     spectrum_command,
+    spectrum_stitch_command,
 )
 from bdencode.qc.video import (
     FrameRecord,
@@ -70,9 +74,94 @@ def test_audio_structure_comparison() -> None:
     )
     result = compare_audio_probes(source, encoded)
     assert result.structurally_lossless
-    command = spectrum_command(Path("input.flac"), 0, Path("spectrum.png"))
-    assert "showspectrumpic" in " ".join(command)
+    command = spectrum_command(
+        Path("input.flac"),
+        0,
+        Path("spectrum.png"),
+        start_seconds=Decimal("300"),
+        duration_seconds=Decimal("287.882"),
+        height=94,
+    )
+    filter_value = command[command.index("-filter_complex") + 1]
+    assert filter_value.startswith("[0:a:0]showspectrumpic=")
+    assert filter_value.endswith(",format=rgb48be[spectrum]")
+    assert "s=3840x94" in filter_value
+    assert "legend=0" in filter_value
+    assert "orientation=horizontal" in filter_value
+    assert command[command.index("-map") + 1] == "[spectrum]"
+    assert command[command.index("-c:v") + 1] == "png"
+    assert command[command.index("-pix_fmt") + 1] == "rgb48be"
+    assert command[command.index("-ss") + 1] == "300"
+    assert command[command.index("-t") + 1] == "287.882"
+    assert "-an" in command
+    assert "-lavfi" not in command
     assert command[-1] == "spectrum.png"
+
+
+def test_audio_probe_falls_back_to_container_duration() -> None:
+    probe = parse_audio_probe(
+        {
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "codec_name": "dts",
+                    "sample_rate": "48000",
+                    "channels": 6,
+                    "channel_layout": "5.1(side)",
+                    "start_time": "0.040000",
+                }
+            ],
+            "format": {"duration": "6621.288000"},
+        }
+    )
+    assert probe.duration == Decimal("6621.288000")
+    assert probe.sample_count is None
+    command = audio_probe_command(Path("input.mkv"))
+    assert ":format=duration" in command[command.index("-show_entries") + 1]
+
+
+def test_spectrum_windows_cover_long_tracks_without_unbounded_buffers() -> None:
+    duration = Decimal("6621.288")
+    windows = plan_spectrum_windows(duration)
+    assert len(windows) == 23
+    assert windows[0].start_seconds == 0
+    assert windows[-1].start_seconds + windows[-1].duration_seconds == duration
+    assert all(window.duration_seconds <= 300 for window in windows)
+    assert all(
+        left.start_seconds + left.duration_seconds == right.start_seconds
+        for left, right in zip(windows, windows[1:])
+    )
+    assert sum(window.height for window in windows) == 2160
+    assert max(window.height for window in windows) - min(
+        window.height for window in windows
+    ) <= 1
+    seconds_per_pixel = duration / Decimal(2160)
+    assert all(
+        abs((window.duration_seconds / Decimal(window.height)) - seconds_per_pixel)
+        < Decimal("1e-20")
+        for window in windows
+    )
+
+
+def test_spectrum_stitch_maps_only_the_composed_png() -> None:
+    inputs = tuple(Path(f"window-{index:02d}.png") for index in range(3))
+    command = spectrum_stitch_command(inputs, Path("spectrum.png"))
+    filter_value = command[command.index("-filter_complex") + 1]
+    assert filter_value.startswith("[0:v:0][1:v:0][2:v:0]vstack=inputs=3")
+    assert command[command.index("-map") + 1] == "[spectrum]"
+    assert command[command.index("-c:v") + 1] == "png"
+    assert command[-1] == "spectrum.png"
+
+
+def test_spectrum_command_refuses_an_unbounded_full_track() -> None:
+    with pytest.raises(ValueError, match="between 0 and 300"):
+        spectrum_command(
+            Path("input.flac"),
+            0,
+            Path("spectrum.png"),
+            start_seconds=Decimal(0),
+            duration_seconds=Decimal("301"),
+        )
 
 
 def test_pcm_integrity_uses_payload_hash_not_frame_packetization() -> None:

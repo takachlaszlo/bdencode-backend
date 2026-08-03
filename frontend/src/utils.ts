@@ -141,6 +141,9 @@ export function formatStatusMessage(message: string | null, fallback: string): s
 }
 
 export function formatWorkerError(error: string): string {
+  if (error.includes("showspectrumpic") || error.includes("-spectrum.png")) {
+    return "A hang spektrumképének elkészítése sikertelen volt. A kész kódolás és az ellenőrzési eredmények megmaradtak; a javítás után a QC szakasztól biztonságosan folytatható.";
+  }
   if (error.includes("chapters.xml")) {
     return "A fejezetlista létrehozása sikertelen volt. A kész videó- és hangsávok megmaradtak; a javítás után biztonságosan folytatható.";
   }

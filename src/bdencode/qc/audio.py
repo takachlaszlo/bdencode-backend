@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -48,6 +48,67 @@ class AudioComparison:
         return result
 
 
+MAX_SPECTRUM_WINDOW_SECONDS = Decimal("300")
+
+
+@dataclass(frozen=True, slots=True)
+class SpectrumWindow:
+    index: int
+    start_seconds: Decimal
+    duration_seconds: Decimal
+    height: int
+
+
+def plan_spectrum_windows(
+    duration_seconds: Decimal,
+    *,
+    height: int = 2160,
+    max_window_seconds: Decimal = MAX_SPECTRUM_WINDOW_SECONDS,
+) -> tuple[SpectrumWindow, ...]:
+    """Split a whole track into equally sized, bounded-memory spectrum windows."""
+    if duration_seconds <= 0:
+        raise ValueError("spectrum duration must be positive")
+    if height < 1:
+        raise ValueError("spectrum height must be positive")
+    if max_window_seconds <= 0:
+        raise ValueError("maximum spectrum window must be positive")
+    count = int(
+        (duration_seconds / max_window_seconds).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
+    while True:
+        if count > height:
+            raise ValueError("spectrum has more windows than vertical pixels")
+        base_height, extra_pixels = divmod(height, count)
+        tallest_window = base_height + (1 if extra_pixels else 0)
+        tallest_duration = (
+            duration_seconds * Decimal(tallest_window) / Decimal(height)
+        )
+        if tallest_duration <= max_window_seconds:
+            break
+        count += 1
+    windows: list[SpectrumWindow] = []
+    start = Decimal(0)
+    for index in range(count):
+        window_height = base_height + (1 if index < extra_pixels else 0)
+        window_duration = (
+            duration_seconds - start
+            if index == count - 1
+            else duration_seconds * Decimal(window_height) / Decimal(height)
+        )
+        windows.append(
+            SpectrumWindow(
+                index=index,
+                start_seconds=start,
+                duration_seconds=window_duration,
+                height=window_height,
+            )
+        )
+        start += window_duration
+    return tuple(windows)
+
+
 def parse_audio_probe(document: str | bytes | Mapping[str, Any]) -> AudioProbe:
     raw = json.loads(document) if isinstance(document, (str, bytes)) else document
     streams = [
@@ -59,10 +120,15 @@ def parse_audio_probe(document: str | bytes | Mapping[str, Any]) -> AudioProbe:
         raise ValueError("audio probe must contain exactly one selected stream")
     item = streams[0]
     sample_rate = int(item["sample_rate"])
-    duration = _decimal_or_none(item.get("duration"))
+    stream_duration = _decimal_or_none(item.get("duration"))
+    duration = stream_duration
+    if duration is None:
+        format_details = raw.get("format", {})
+        if isinstance(format_details, Mapping):
+            duration = _decimal_or_none(format_details.get("duration"))
     sample_count = _optional_int(item.get("nb_samples"))
-    if sample_count is None and duration is not None:
-        sample_count = int((duration * sample_rate).to_integral_value())
+    if sample_count is None and stream_duration is not None:
+        sample_count = int((stream_duration * sample_rate).to_integral_value())
     return AudioProbe(
         codec=str(item.get("codec_name", "unknown")),
         sample_rate=sample_rate,
@@ -113,7 +179,7 @@ def audio_probe_command(
         "-select_streams",
         f"a:{stream}",
         "-show_entries",
-        "stream=codec_type,codec_name,sample_rate,channels,channel_layout,nb_samples,start_time,duration,bits_per_raw_sample",
+        "stream=codec_type,codec_name,sample_rate,channels,channel_layout,nb_samples,start_time,duration,bits_per_raw_sample:format=duration",
         "-of",
         "json",
         str(path),
@@ -178,16 +244,23 @@ def spectrum_command(
     stream: int,
     output_path: Path,
     *,
+    start_seconds: Decimal,
+    duration_seconds: Decimal,
     width: int = 3840,
     height: int = 2160,
     ffmpeg: str = "ffmpeg",
 ) -> list[str]:
-    if width < 320 or height < 240:
+    if width < 320 or height < 1:
         raise ValueError("spectrum image is too small")
+    if start_seconds < 0:
+        raise ValueError("spectrum start must not be negative")
+    if not 0 < duration_seconds <= MAX_SPECTRUM_WINDOW_SECONDS:
+        raise ValueError("spectrum window must be between 0 and 300 seconds")
     # Fixed scale/legend settings are shared by source and encode for visual parity.
     filter_value = (
-        f"showspectrumpic=s={width}x{height}:legend=1:color=intensity:scale=log:"
-        "fscale=log:win_func=blackman:orientation=horizontal,format=rgb48be"
+        f"[0:a:{stream}]showspectrumpic=s={width}x{height}:legend=0:"
+        "color=intensity:scale=log:fscale=log:win_func=blackman:"
+        "orientation=horizontal,format=rgb48be[spectrum]"
     )
     return [
         ffmpeg,
@@ -195,19 +268,72 @@ def spectrum_command(
         "-nostdin",
         "-v",
         "warning",
+        "-ss",
+        str(start_seconds),
+        "-t",
+        str(duration_seconds),
         "-i",
         str(path),
-        "-map",
-        f"0:a:{stream}",
-        "-lavfi",
+        "-filter_complex",
         filter_value,
+        "-map",
+        "[spectrum]",
+        "-an",
         "-frames:v",
         "1",
+        "-c:v",
+        "png",
+        "-pix_fmt",
+        "rgb48be",
         "-compression_level",
         "6",
+        "-update",
+        "1",
         "-y",
         str(output_path),
     ]
+
+
+def spectrum_stitch_command(
+    inputs: tuple[Path, ...],
+    output_path: Path,
+    *,
+    ffmpeg: str = "ffmpeg",
+) -> list[str]:
+    if not inputs:
+        raise ValueError("at least one spectrum window is required")
+    command = [ffmpeg, "-hide_banner", "-nostdin", "-v", "warning"]
+    for path in inputs:
+        command.extend(("-i", str(path)))
+    if len(inputs) == 1:
+        filter_value = "[0:v:0]format=rgb48be[spectrum]"
+    else:
+        labels = "".join(f"[{index}:v:0]" for index in range(len(inputs)))
+        filter_value = (
+            f"{labels}vstack=inputs={len(inputs)},format=rgb48be[spectrum]"
+        )
+    command.extend(
+        (
+            "-filter_complex",
+            filter_value,
+            "-map",
+            "[spectrum]",
+            "-an",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "png",
+            "-pix_fmt",
+            "rgb48be",
+            "-compression_level",
+            "6",
+            "-update",
+            "1",
+            "-y",
+            str(output_path),
+        )
+    )
+    return command
 
 
 def flac_encode_args(*, compression_level: int = 8) -> list[str]:
