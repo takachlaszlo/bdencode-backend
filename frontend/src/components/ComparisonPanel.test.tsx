@@ -16,10 +16,20 @@ function jsonResponse(payload: unknown): Response {
 
 describe("ComparisonPanel", () => {
   const videoManifest: VideoComparisonManifest = {
-    schema_version: 1,
+    schema_version: 2,
     categorization: "dual-decoder",
     alignment: "presentation-index-and-pts",
     counts: { I: 1, P: 0, B: 0 },
+    metrics: {
+      backend: "ffmpeg-sampled-ssim-psnr",
+      scope: "selected_ipb_native_png_pairs",
+      sample_count: 5,
+      full_title_measurement: false,
+      aggregate: {
+        ssim_all_mean: 0.9987654,
+        psnr_average_db_mean: 42.345,
+      },
+    },
     pairs: [
       {
         category: "I",
@@ -77,6 +87,9 @@ describe("ComparisonPanel", () => {
     renderApp(<ComparisonPanel artifacts={artifacts} />);
 
     expect(await screen.findByText("I-frame")).toBeInTheDocument();
+    expect(screen.getByText("Mintavételezett képmetrikák")).toBeInTheDocument();
+    expect(screen.getByText("SSIM: 0.998765")).toBeInTheDocument();
+    expect(screen.getByText("PSNR: 42.34 dB")).toBeInTheDocument();
     expect(await screen.findByText("PCM egyezik")).toBeInTheDocument();
     expect(screen.getByText("Időzítés rendben")).toBeInTheDocument();
     expect(screen.getByAltText("audio:4352 source spektrum")).toHaveAttribute(
@@ -112,5 +125,30 @@ describe("ComparisonPanel", () => {
     expect(
       await screen.findByText(/I-frame egyik PNG melléklete hiányzik/),
     ).toBeInTheDocument();
+  });
+
+  it("shows a neutral same-frame label when source picture type is not applicable", async () => {
+    const transformedManifest: VideoComparisonManifest = {
+      ...videoManifest,
+      pairs: [{
+        ...videoManifest.pairs[0],
+        source_pict_type: null,
+        dual_type_match: false,
+      }],
+    };
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse(transformedManifest))));
+
+    renderApp(
+      <ComparisonPanel
+        artifacts={[
+          makeArtifact({ id: "video-manifest", kind: "VIDEO_COMPARISON", name: "video-comparison.json", mime_type: "application/json" }),
+          makeArtifact({ id: "i-source", kind: "VIDEO_COMPARISON", name: "i-source.png", mime_type: "image/png" }),
+          makeArtifact({ id: "i-encode", kind: "VIDEO_COMPARISON", name: "i-encode.png", mime_type: "image/png" }),
+        ]}
+      />,
+    );
+
+    expect(await screen.findByText("Source képtípus nem értelmezhető · azonos frame")).toBeInTheDocument();
+    expect(screen.queryByText(/eltérő típus/)).not.toBeInTheDocument();
   });
 });

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -24,12 +24,25 @@ class FrameRecord:
     pict_type: str | None
     key_frame: bool = False
     coded_picture_number: int | None = None
+    # A bounded ffprobe sample can begin at a non-zero container timestamp.
+    # ``pts_seconds`` remains normalized to the VapourSynth timeline so the
+    # existing alignment/selection code keeps its meaning; this field retains
+    # the real timestamp needed for an accurate input seek.
+    container_pts_seconds: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.presentation_index < 0:
             raise ValueError("presentation_index cannot be negative")
         if self.pict_type is not None and self.pict_type not in FRAME_TYPES:
             raise ValueError(f"unsupported frame type: {self.pict_type}")
+
+    @property
+    def seek_pts_seconds(self) -> Decimal:
+        return (
+            self.pts_seconds
+            if self.container_pts_seconds is None
+            else self.container_pts_seconds
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +83,41 @@ class VapourSynthInfo:
             / Decimal(self.fps_numerator)
         )
 
+    @property
+    def duration_seconds(self) -> Decimal:
+        return (
+            Decimal(self.frames)
+            * Decimal(self.fps_denominator)
+            / Decimal(self.fps_numerator)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FrameProbeInterval:
+    """One bounded ffprobe interval on the normalized clip timeline."""
+
+    start_seconds: Decimal
+    duration_seconds: Decimal
+
+    def __post_init__(self) -> None:
+        if self.start_seconds < 0:
+            raise ValueError("sample interval start cannot be negative")
+        if self.duration_seconds <= 0:
+            raise ValueError("sample interval duration must be positive")
+
+    @property
+    def end_seconds(self) -> Decimal:
+        return self.start_seconds + self.duration_seconds
+
+    def ffprobe_value(self, pts_origin: Decimal) -> str:
+        """Render an absolute interval on one input's container timeline."""
+
+        if not pts_origin.is_finite():
+            raise ValueError("sample PTS origin must be finite")
+        start = pts_origin + self.start_seconds
+        end = pts_origin + self.end_seconds
+        return f"{_format_decimal(start)}%{_format_decimal(end)}"
+
 
 def parse_vspipe_info(text: str) -> VapourSynthInfo:
     """Parse the stable ``vspipe --info`` frame-count/FPS fields."""
@@ -83,6 +131,114 @@ def parse_vspipe_info(text: str) -> VapourSynthInfo:
 
 def vspipe_info_command(script: Path, *, vspipe: str = "vspipe") -> list[str]:
     return [vspipe, "--info", str(script), "-"]
+
+
+def ffprobe_frame_origin_command(path: Path, *, ffprobe: str = "ffprobe") -> list[str]:
+    """Decode only the opening second to establish the real video PTS origin."""
+
+    return [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        "%+1",
+        "-show_frames",
+        "-show_entries",
+        "frame=media_type,best_effort_timestamp_time,pts_time",
+        "-of",
+        "json",
+        str(path),
+    ]
+
+
+def parse_ffprobe_frame_origin(
+    document: str | bytes | Mapping[str, Any],
+) -> Decimal:
+    """Return the first decoded video PTS from a bounded opening probe."""
+
+    if isinstance(document, (str, bytes)):
+        raw = json.loads(document)
+    else:
+        raw = document
+    origins: list[Decimal] = []
+    for item in raw.get("frames", []):
+        if not isinstance(item, Mapping) or item.get("media_type") not in (
+            None,
+            "video",
+        ):
+            continue
+        value = item.get("best_effort_timestamp_time", item.get("pts_time"))
+        if value is None:
+            continue
+        try:
+            parsed = Decimal(str(value))
+        except InvalidOperation as exc:
+            raise FrameSelectionError(f"invalid opening frame PTS: {value}") from exc
+        if parsed.is_finite():
+            origins.append(parsed)
+    if not origins:
+        raise FrameSelectionError("opening ffprobe sample contains no video frame")
+    return min(origins)
+
+
+def _format_decimal(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def plan_sample_intervals(
+    info: VapourSynthInfo,
+    *,
+    distributed_windows: int = 10,
+    window_seconds: Decimal = Decimal("3"),
+    opening_seconds: Decimal = Decimal("6"),
+) -> tuple[FrameProbeInterval, ...]:
+    """Plan a short opening sample plus bounded samples across the title.
+
+    The union of returned intervals is never longer than
+    ``opening_seconds + distributed_windows * window_seconds``. Overlapping
+    windows on short clips are merged, so they do not decode the same region
+    twice. The opening sample is important: it gives sampled frame parsing a
+    real PTS origin instead of guessing an index from a mid-title seek.
+    """
+
+    if distributed_windows < 0:
+        raise ValueError("distributed_windows cannot be negative")
+    if window_seconds <= 0:
+        raise ValueError("window_seconds must be positive")
+    if opening_seconds <= 0:
+        raise ValueError("opening_seconds must be positive")
+
+    clip_duration = info.duration_seconds
+    raw: list[FrameProbeInterval] = [
+        FrameProbeInterval(Decimal(0), min(opening_seconds, clip_duration))
+    ]
+    if clip_duration > opening_seconds and distributed_windows:
+        effective_window = min(window_seconds, clip_duration)
+        half_window = effective_window / 2
+        latest_start = clip_duration - effective_window
+        for position in range(1, distributed_windows + 1):
+            center = (
+                clip_duration * Decimal(position) / Decimal(distributed_windows + 1)
+            )
+            start = max(Decimal(0), min(center - half_window, latest_start))
+            raw.append(FrameProbeInterval(start, effective_window))
+
+    merged: list[FrameProbeInterval] = []
+    for interval in sorted(raw, key=lambda item: item.start_seconds):
+        if not merged or interval.start_seconds > merged[-1].end_seconds:
+            merged.append(interval)
+            continue
+        prior = merged[-1]
+        end = max(prior.end_seconds, interval.end_seconds)
+        merged[-1] = FrameProbeInterval(
+            prior.start_seconds, min(end, clip_duration) - prior.start_seconds
+        )
+    return tuple(merged)
 
 
 def parse_ffprobe_frames(
@@ -118,6 +274,114 @@ def parse_ffprobe_frames(
     return frames
 
 
+def parse_sampled_ffprobe_frames(
+    document: str | bytes | Mapping[str, Any],
+    info: VapourSynthInfo,
+    *,
+    pts_origin: Decimal,
+    pts_tolerance: Decimal = Decimal("0.001"),
+) -> list[FrameRecord]:
+    """Map disjoint ffprobe samples back to global presentation indexes.
+
+    ``pts_origin`` comes from a separate bounded opening probe, preventing a
+    missing opening interval from silently rebasing a mid-title frame to index
+    zero. Matroska commonly rounds CFR timestamps to milliseconds;
+    ``pts_tolerance`` permits that rounding while refusing shifted frames.
+    Samples can contain duplicate frames due to keyframe seeking, which are
+    deduplicated by the recovered global index.
+    """
+
+    if not pts_origin.is_finite():
+        raise ValueError("sample PTS origin must be finite")
+    if pts_tolerance < 0:
+        raise ValueError("PTS tolerance cannot be negative")
+    if isinstance(document, (str, bytes)):
+        raw = json.loads(document)
+    else:
+        raw = document
+
+    values: list[tuple[Decimal, Mapping[str, Any]]] = []
+    for item in raw.get("frames", []):
+        if not isinstance(item, Mapping) or item.get("media_type") not in (
+            None,
+            "video",
+        ):
+            continue
+        value = item.get("best_effort_timestamp_time", item.get("pts_time"))
+        if value is None:
+            continue
+        try:
+            pts = Decimal(str(value))
+        except InvalidOperation as exc:
+            raise FrameSelectionError(f"invalid sampled frame PTS: {value}") from exc
+        if not pts.is_finite():
+            raise FrameSelectionError(f"invalid sampled frame PTS: {value}")
+        values.append((pts, item))
+    if not values:
+        raise FrameSelectionError("sampled ffprobe document contains no video frames")
+
+    by_index: dict[int, tuple[FrameRecord, Decimal]] = {}
+    for container_pts, item in values:
+        frame_position = (
+            (container_pts - pts_origin)
+            * Decimal(info.fps_numerator)
+            / Decimal(info.fps_denominator)
+        )
+        presentation_index = int(
+            frame_position.to_integral_value(rounding=ROUND_HALF_UP)
+        )
+        if not 0 <= presentation_index < info.frames:
+            raise FrameSelectionError(
+                "sampled frame maps outside the VapourSynth timeline: "
+                f"{presentation_index}"
+            )
+        normalized_pts = info.pts_for_frame(presentation_index)
+        expected_container_pts = pts_origin + normalized_pts
+        alignment_error = abs(container_pts - expected_container_pts)
+        if alignment_error > pts_tolerance:
+            raise FrameSelectionError(
+                "sampled frame PTS does not align with the VapourSynth timeline: "
+                f"index={presentation_index}, error={alignment_error}"
+            )
+        pict_type = item.get("pict_type")
+        candidate = FrameRecord(
+            presentation_index=presentation_index,
+            pts_seconds=normalized_pts,
+            pict_type=pict_type if pict_type in FRAME_TYPES else None,
+            key_frame=bool(int(item.get("key_frame", 0))),
+            coded_picture_number=_optional_int(item.get("coded_picture_number")),
+            container_pts_seconds=container_pts,
+        )
+        prior = by_index.get(presentation_index)
+        if prior is None:
+            by_index[presentation_index] = (candidate, alignment_error)
+            continue
+        prior_frame, prior_error = prior
+        if (
+            prior_frame.pict_type is not None
+            and candidate.pict_type is not None
+            and prior_frame.pict_type != candidate.pict_type
+        ):
+            raise FrameSelectionError(
+                "duplicate sampled frame has conflicting picture types: "
+                f"index={presentation_index}"
+            )
+        # Retain the timestamp closest to the ideal CFR position. If both are
+        # equally close, prefer the record that contains a known picture type.
+        if alignment_error < prior_error or (
+            alignment_error == prior_error
+            and prior_frame.pict_type is None
+            and candidate.pict_type is not None
+        ):
+            by_index[presentation_index] = (candidate, alignment_error)
+
+    if 0 not in by_index:
+        raise FrameSelectionError(
+            "sampled ffprobe document does not contain the opening video frame"
+        )
+    return [by_index[index][0] for index in sorted(by_index)]
+
+
 def _optional_int(value: Any) -> int | None:
     try:
         return None if value is None else int(value)
@@ -138,6 +402,39 @@ def _evenly_spaced(items: Sequence[FrameRecord], count: int) -> list[FrameRecord
     return [items[index] for index in indexes]
 
 
+def _evenly_spaced_on_timeline(
+    items: Sequence[FrameRecord], count: int, timeline_frames: int
+) -> list[FrameRecord]:
+    if len(items) < count:
+        raise FrameSelectionError(
+            f"need {count} frames but only {len(items)} are available"
+        )
+    if timeline_frames < 1:
+        raise ValueError("timeline_frames must be positive")
+    if count == 1:
+        targets = [(timeline_frames - 1) / 2]
+    else:
+        # Avoid choosing only the opening/credits while keeping samples spread
+        # across the useful interior of the title.
+        targets = [
+            (position + 1) * (timeline_frames - 1) / (count + 1)
+            for position in range(count)
+        ]
+    remaining = list(items)
+    selected: list[FrameRecord] = []
+    for target in targets:
+        chosen = min(
+            remaining,
+            key=lambda item: (
+                abs(item.presentation_index - target),
+                item.presentation_index,
+            ),
+        )
+        selected.append(chosen)
+        remaining.remove(chosen)
+    return sorted(selected, key=lambda item: item.presentation_index)
+
+
 def select_frame_pairs(
     encoded: Sequence[FrameRecord],
     reference: Sequence[FrameRecord],
@@ -145,6 +442,8 @@ def select_frame_pairs(
     per_type: int = 4,
     pts_tolerance: Decimal = Decimal("0.001"),
     dual_type_match: bool = False,
+    total_pairs: int | None = None,
+    timeline_frames: int | None = None,
 ) -> list[FramePair]:
     """Select identical presentation frames, categorized by final encode type.
 
@@ -154,6 +453,10 @@ def select_frame_pairs(
     """
     if per_type < 1:
         raise ValueError("per_type must be positive")
+    if total_pairs is not None and total_pairs < len(FRAME_TYPES):
+        raise ValueError("total_pairs must leave room for mandatory I/P/B frames")
+    if timeline_frames is not None and timeline_frames < 1:
+        raise ValueError("timeline_frames must be positive")
     reference_by_index = {frame.presentation_index: frame for frame in reference}
     if len(reference_by_index) != len(reference):
         raise FrameSelectionError("reference presentation indexes are not unique")
@@ -171,10 +474,27 @@ def select_frame_pairs(
             continue
         candidates[frame.pict_type].append(frame)
 
+    if total_pairs is None:
+        requested = {name: per_type for name in FRAME_TYPES}
+    else:
+        requested = {name: 1 for name in FRAME_TYPES}
+        # Extra visual evidence is more useful for predicted/bidirectional
+        # frames than for additional I-frames. For five total pairs this yields
+        # exactly 1 I + 2 P + 2 B.
+        for offset in range(total_pairs - len(FRAME_TYPES)):
+            requested["P" if offset % 2 == 0 else "B"] += 1
+
     pairs: list[FramePair] = []
     for category in FRAME_TYPES:
         try:
-            selected = _evenly_spaced(candidates[category], per_type)
+            count = requested[category]
+            selected = (
+                _evenly_spaced(candidates[category], count)
+                if timeline_frames is None
+                else _evenly_spaced_on_timeline(
+                    candidates[category], count, timeline_frames
+                )
+            )
         except FrameSelectionError as exc:
             qualifier = " aligned dual-type" if dual_type_match else " aligned"
             raise FrameSelectionError(
@@ -203,6 +523,38 @@ def ffprobe_frame_command(path: Path, *, ffprobe: str = "ffprobe") -> list[str]:
         "error",
         "-select_streams",
         "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=media_type,best_effort_timestamp_time,pts_time,pict_type,key_frame,coded_picture_number",
+        "-of",
+        "json",
+        str(path),
+    ]
+
+
+def ffprobe_sampled_frame_command(
+    path: Path,
+    intervals: Sequence[FrameProbeInterval],
+    *,
+    pts_origin: Decimal,
+    ffprobe: str = "ffprobe",
+) -> list[str]:
+    """Probe decoded frame metadata only inside explicitly bounded intervals."""
+
+    if not intervals:
+        raise ValueError("at least one frame probe interval is required")
+    ordered = sorted(intervals, key=lambda item: item.start_seconds)
+    for left, right in zip(ordered, ordered[1:]):
+        if left.end_seconds > right.start_seconds:
+            raise ValueError("frame probe intervals must not overlap")
+    return [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        ",".join(item.ffprobe_value(pts_origin) for item in ordered),
         "-show_frames",
         "-show_entries",
         "frame=media_type,best_effort_timestamp_time,pts_time,pict_type,key_frame,coded_picture_number",
@@ -280,6 +632,71 @@ def extract_png_command(
         str(input_path),
         "-map",
         "0:v:0",
+        "-vf",
+        ",".join(filters),
+        "-vsync",
+        "0",
+        "-frames:v",
+        "1",
+        "-compression_level",
+        "6",
+        "-y",
+        str(output_path),
+    ]
+
+
+def extract_png_at_timestamp_command(
+    input_path: Path,
+    pts_seconds: Decimal,
+    output_path: Path,
+    *,
+    hdr_native: bool,
+    source_hdr10: bool = False,
+    color_primaries: str | None = None,
+    color_transfer: str | None = None,
+    color_matrix: str | None = None,
+    color_range: str = "limited",
+    ffmpeg: str = "ffmpeg",
+) -> list[str]:
+    """Seek to and decode one known sampled presentation timestamp.
+
+    FFmpeg's default accurate input seek decodes from the preceding keyframe and
+    discards frames before the requested timestamp. This avoids the old
+    ``select=n`` behavior, which decoded from frame zero for every comparison
+    image.
+    """
+
+    if not pts_seconds.is_finite():
+        raise ValueError("PNG seek timestamp must be finite")
+    color_primaries = color_primaries or ("bt2020" if source_hdr10 else "bt709")
+    color_transfer = color_transfer or ("smpte2084" if source_hdr10 else "bt709")
+    color_matrix = color_matrix or ("bt2020nc" if source_hdr10 else "bt709")
+    filters = png_filter_chain(
+        hdr_native=hdr_native,
+        source_hdr10=source_hdr10,
+        color_primaries=color_primaries,
+        color_transfer=color_transfer,
+        color_matrix=color_matrix,
+        color_range=color_range,
+    )
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "warning",
+        "-seek_timestamp",
+        "1",
+        "-ss",
+        _format_decimal(pts_seconds),
+        "-accurate_seek",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
         "-vf",
         ",".join(filters),
         "-vsync",

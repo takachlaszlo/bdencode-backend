@@ -130,12 +130,39 @@ const EVENT_MESSAGE_LABELS: Record<string, string> = {
   "image upload failed; retry is safe": "A képfeltöltés sikertelen; biztonságosan újrapróbálható",
 };
 
+export function isFastComparisonTimeoutReview(message: string | null): boolean {
+  if (!message) return false;
+  return message === "fast comparison exceeded its five-minute time budget"
+    || message === "fast comparison exceeded its bounded command/time budget";
+}
+
 export function formatStatusMessage(message: string | null, fallback: string): string {
   if (!message) return fallback;
   const retry = /^retrying failed ([A-Z_]+) stage$/.exec(message);
   if (retry) {
     const state = retry[1] as JobState;
     return `${STATE_LABELS[state] ?? retry[1]}: biztonságos folytatás`;
+  }
+  if (isFastComparisonTimeoutReview(message)) {
+    return "A gyors videó-comparison elérte az ötperces időkorlátot. Az elkészült minták megmaradtak, a folyamat biztonságosan folytatható.";
+  }
+  const selected = /^fast comparison: (\d+) I\/P\/B pairs selected$/.exec(message);
+  if (selected) return `Gyors comparison: ${selected[1]} I/P/B képpár kiválasztva`;
+  const pair = /^fast comparison: pair (\d+)\/(\d+) complete$/.exec(message);
+  if (pair) return `Gyors comparison: ${pair[1]}/${pair[2]} képpár elkészült`;
+  const complete = /^(\d+) sampled I\/P\/B comparison pairs complete$/.exec(message);
+  if (complete) return `A gyors comparison ${complete[1]} I/P/B képpárja elkészült`;
+  if (message === "fast comparison: preparing bounded samples") {
+    return "Gyors comparison: a rövid videóminták előkészítése";
+  }
+  if (message.startsWith("bounded comparison sampling could not find")) {
+    return "A rövid mintákban nem található elegendő, azonos típusú I/P/B képpár. Operátori ellenőrzés szükséges.";
+  }
+  if (message.startsWith("encoded comparison sample is invalid")) {
+    return "A kész videó mintájának időzítése nem ellenőrizhető biztonságosan.";
+  }
+  if (message.startsWith("source comparison sample is invalid")) {
+    return "A source videóminta időzítése nem ellenőrizhető biztonságosan.";
   }
   return EVENT_MESSAGE_LABELS[message] ?? formatWorkerError(message);
 }

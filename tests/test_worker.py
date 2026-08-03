@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -129,9 +130,7 @@ def test_worker_readiness_follows_database_initialization_and_instance_lock(
 
             with (settings.state_root / "worker.lock").open("a+b") as contender:
                 with pytest.raises(BlockingIOError):
-                    fcntl.flock(
-                        contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                    )
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         notifications.append(message)
         return True
 
@@ -167,10 +166,7 @@ def test_second_worker_never_reports_ready(tmp_path: Path, monkeypatch) -> None:
 
 def test_worker_systemd_unit_waits_for_notify_readiness() -> None:
     unit = (
-        Path(__file__).parents[1]
-        / "deploy"
-        / "systemd"
-        / "bdencode-worker.service.in"
+        Path(__file__).parents[1] / "deploy" / "systemd" / "bdencode-worker.service.in"
     ).read_text(encoding="utf-8")
 
     assert "Type=notify\n" in unit
@@ -193,6 +189,24 @@ def test_ffprobe_profile_names_match_debian_encoder_outputs() -> None:
     assert _FFPROBE_PROFILE_NAMES["high"] == "High"
     assert _FFPROBE_PROFILE_NAMES["main10"] == "Main 10"
     assert _FFPROBE_PROFILE_NAMES["main12"] == "Rext"
+
+
+def test_recorded_output_digest_rejects_same_size_in_place_change(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "large-output.mkv"
+    marker = tmp_path / "stage.json"
+    output.write_bytes(b"first")
+    worker_module._write_stage(marker, {}, [output])
+    recorded = worker_module._recorded_output_sha256(marker, output)
+    assert recorded == worker_module.sha256_file(output)
+
+    output.write_bytes(b"other")
+    completed_at = json.loads(marker.read_text(encoding="utf-8"))["completed_at_epoch"]
+    changed_ns = int((completed_at + 1) * 1_000_000_000)
+    os.utime(output, ns=(changed_ns, changed_ns))
+    assert output.stat().st_size == 5
+    assert worker_module._recorded_output_sha256(marker, output) is None
 
 
 def _png() -> bytes:
@@ -233,27 +247,17 @@ class FakeRunner:
 
     @staticmethod
     def _frames() -> str:
+        types = "IBPBPBPBIPBB"
         return json.dumps(
             {
                 "frames": [
                     {
                         "media_type": "video",
-                        "best_effort_timestamp_time": "0.000",
-                        "pict_type": "I",
-                        "key_frame": 1,
-                    },
-                    {
-                        "media_type": "video",
-                        "best_effort_timestamp_time": "0.040",
-                        "pict_type": "P",
-                        "key_frame": 0,
-                    },
-                    {
-                        "media_type": "video",
-                        "best_effort_timestamp_time": "0.080",
-                        "pict_type": "B",
-                        "key_frame": 0,
-                    },
+                        "best_effort_timestamp_time": f"{index / 25:.3f}",
+                        "pict_type": pict_type,
+                        "key_frame": int(pict_type == "I"),
+                    }
+                    for index, pict_type in enumerate(types)
                 ]
             }
         )
@@ -276,7 +280,7 @@ class FakeRunner:
             self._write(stderr_path, "")
         if stdout_path is not None:
             if command[0] == "vspipe" and "--info" in command:
-                self._write(stdout_path, "Frames: 3\nFPS: 25/1 (25.000 fps)\n")
+                self._write(stdout_path, "Frames: 12\nFPS: 25/1 (25.000 fps)\n")
             elif (
                 command[0] == "ffprobe"
                 and "-show_frames" in command
@@ -523,9 +527,7 @@ def test_scan_failure_atomically_fails_job_instead_of_looping(context):
     assert (settings.job_root(job.id) / "work").is_dir()
 
 
-def test_completed_job_stays_completed_when_work_cleanup_fails(
-    context, monkeypatch
-):
+def test_completed_job_stays_completed_when_work_cleanup_fails(context, monkeypatch):
     database, settings, scan, _scanner, _runner, worker = context
 
     def fail_cleanup(_path):
@@ -700,9 +702,7 @@ def test_service_stop_interrupts_encode_and_leaves_stage_resumable(context):
     assert not (paths.stages / "video-encode.json").exists()
 
 
-def test_service_stop_after_video_checkpoint_pauses_before_mux(
-    context, monkeypatch
-):
+def test_service_stop_after_video_checkpoint_pauses_before_mux(context, monkeypatch):
     database, settings, _scan, _scanner, runner, worker = context
     job, encoding = _prepare_encoding(context)
     stopping = [False]
@@ -833,14 +833,26 @@ def test_invalid_selection_pauses_in_needs_review(context):
 
 
 def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
-    database, settings, scan, _scanner, _runner, worker = context
+    database, settings, scan, _scanner, runner, worker = context
     job = _enqueue(database, scan.source)
     claimed = JobQueue(database).claim_next()
     assert claimed is not None
     worker.process_one_stage(claimed)
     ready = database.set_selection(job.id, _selection())
-    stale = settings.job_root(job.id) / "comparison" / "stale-old-encode.png"
+    job_paths = JobPaths.create(settings, job.id)
+    stale = job_paths.comparison / "stale-old-encode.png"
     stale.write_bytes(_png())
+    stale_metric = job_paths.comparison / "video-metrics.ssim.log"
+    stale_metric.write_text("legacy full-title metric\n", encoding="utf-8")
+    legacy_markers = (
+        job_paths.stages / "comparison-frame-probe.json",
+        job_paths.stages / "comparison-source-frame-probe.json",
+        job_paths.stages / "comparison-metrics.json",
+        job_paths.stages / "comparison-old-I-native.json",
+        job_paths.stages / "comparison-old-I-sdr.json",
+    )
+    for marker in legacy_markers:
+        marker.write_text("{}\n", encoding="utf-8")
 
     result = worker.process_job(ready)
 
@@ -854,8 +866,26 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     comparison = json.loads(
         (completed / "comparison" / "video-comparison.json").read_text(encoding="utf-8")
     )
-    assert comparison["counts"] == {"B": 1, "I": 1, "P": 1}
+    assert comparison["counts"] == {"B": 2, "I": 1, "P": 2}
+    assert comparison["sampling"]["full_title_scan"] is False
+    assert comparison["sampling"]["selected_pair_count"] == 5
+    assert comparison["metrics"]["backend"] == "ffmpeg-sampled-ssim-psnr"
+    assert comparison["metrics"]["sample_count"] == 5
+    assert set(comparison["metrics"]["aggregate"]) == {
+        "psnr_average_db_mean",
+        "ssim_all_mean",
+    }
     assert all("reference_sha256" in pair for pair in comparison["pairs"])
+    metrics = json.loads(
+        (completed / "comparison" / "video-metrics.json").read_text(encoding="utf-8")
+    )
+    assert metrics["backend"] == "ffmpeg-sampled-ssim-psnr"
+    assert metrics["full_title_measurement"] is False
+    assert metrics["sample_count"] == 5
+    assert set(metrics["aggregate"]) == {
+        "psnr_average_db_mean",
+        "ssim_all_mean",
+    }
     audio_comparison = json.loads(
         (completed / "analysis" / "audio-comparison.json").read_text(encoding="utf-8")
     )
@@ -863,8 +893,38 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
         "source_spectrum_sha256" in track and "encode_spectrum_sha256" in track
         for track in audio_comparison["tracks"]
     )
-    assert len(list((completed / "comparison").glob("*-reference.png"))) == 3
-    assert len(list((completed / "comparison").glob("*-encode.png"))) == 3
+    assert len(list((completed / "comparison").glob("*-reference.png"))) == 5
+    assert len(list((completed / "comparison").glob("*-encode.png"))) == 5
+    assert not (completed / "comparison" / "encoded-frames.json").exists()
+    assert not (completed / "comparison" / "source-frames.json").exists()
+    assert not (completed / "comparison" / "sampled-encoded-frames.json").exists()
+    assert not (completed / "comparison" / "sampled-source-frames.json").exists()
+    assert not (completed / "comparison" / "sampled-encoded-origin.json").exists()
+    assert not (completed / "comparison" / "sampled-source-origin.json").exists()
+    assert not (completed / "comparison" / stale_metric.name).exists()
+    assert all(not marker.exists() for marker in legacy_markers)
+    assert not any(command[0] == "bdencode-vmaf" for command in runner.commands)
+    sampled_probes = [
+        command
+        for command in runner.commands
+        if command[0] == "ffprobe"
+        and "-show_frames" in command
+        and str(settings.job_root(job.id) / "work") in " ".join(command)
+    ]
+    assert sampled_probes
+    assert all("-read_intervals" in command for command in sampled_probes)
+    encoded_png_commands = [
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg" and command[-1].endswith("-encode.png")
+    ]
+    assert len(encoded_png_commands) == 5
+    assert all(
+        command.index("-ss") < command.index("-i") for command in encoded_png_commands
+    )
+    assert all(
+        "select=eq(n" not in " ".join(command) for command in encoded_png_commands
+    )
     assert not (completed / "comparison" / stale.name).exists()
     assert not (settings.job_root(job.id) / "work").exists()
     cleanup = [
@@ -879,11 +939,38 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
         for artifact in database.list_artifacts(job_id=job.id, limit=1000)
     )
 
-    job_paths = JobPaths.create(settings, job.id)
     tampered = next(job_paths.comparison.glob("*-reference.png"))
     tampered.write_bytes(tampered.read_bytes() + b"tampered")
     with pytest.raises(RuntimeError, match="hash differs"):
         _current_comparison_pngs(job_paths)
+
+
+def test_fast_comparison_timeout_requests_review_without_losing_resume_stage(context):
+    database, _settings, scan, _scanner, runner, worker = context
+    real_run = runner.run
+
+    def timeout_sample_probe(argv, **kwargs):
+        command = tuple(os.fspath(item) for item in argv)
+        if (
+            command[0] == "ffprobe"
+            and kwargs.get("stdout_path") is not None
+            and kwargs["stdout_path"].name == "sampled-encoded-frames.json"
+        ):
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 1))
+        return real_run(argv, **kwargs)
+
+    runner.run = timeout_sample_probe
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.COMPARISON
+    assert "bounded" in (result.status_message or "")
 
 
 def test_mux_chapters_come_from_reviewed_playlist(context):
@@ -1047,9 +1134,7 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
     ready = database.set_selection(
         job.id,
         _selection(
-            tracks=[
-                {"stream_id": "audio:4352", "action": "copy", "language": "eng"}
-            ]
+            tracks=[{"stream_id": "audio:4352", "action": "copy", "language": "eng"}]
         ),
     )
 

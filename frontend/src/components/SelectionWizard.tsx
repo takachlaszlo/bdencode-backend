@@ -218,7 +218,6 @@ export function SelectionWizard({
   const [uploadImages, setUploadImages] = useState(
     initial?.uploadImages ?? Boolean(job.settings.upload_images ?? true),
   );
-  const [dualTypeMatch, setDualTypeMatch] = useState(initial?.dualTypeMatch ?? true);
   const [settings, setSettings] = useState<Record<string, unknown>>(initial?.settings ?? {});
   const [settingsSearch, setSettingsSearch] = useState("");
   const [validation, setValidation] = useState<SelectionValidation | null>(null);
@@ -265,8 +264,8 @@ export function SelectionWizard({
     },
     tracks,
     upload_images: uploadImages,
-    dual_type_match: dualTypeMatch,
-  }), [angle, crop, detailLevel, dualTypeMatch, outputName, playlistId, settings, temporalFilter, tracks, uploadImages]);
+    dual_type_match: true,
+  }), [angle, crop, detailLevel, outputName, playlistId, settings, temporalFilter, tracks, uploadImages]);
 
   const validate = useMutation({
     mutationFn: () => api.validateSelection(job.id, payload, job.version),
@@ -578,8 +577,8 @@ export function SelectionWizard({
                 <input type="checkbox" checked={uploadImages} onChange={(event) => { setUploadImages(event.target.checked); setValidation(null); }} /><span className="toggle" aria-hidden="true" />
               </label>
               <label className="toggle-row">
-                <span><strong>Szigorú I/P/B típusazonosság</strong><small>Progresszív forrásnál mindkét oldalon azonos képtípus szükséges.</small></span>
-                <input type="checkbox" checked={dualTypeMatch} onChange={(event) => { setDualTypeMatch(event.target.checked); setValidation(null); }} /><span className="toggle" aria-hidden="true" />
+                <span><strong>Szigorú I/P/B típusazonosság · kötelező</strong><small>Progresszív forrásnál a source és az encode képtípusa mindig azonos; ez nem kapcsolható ki.</small></span>
+                <input type="checkbox" checked disabled aria-label="Szigorú I/P/B típusazonosság kötelező" /><span className="toggle" aria-hidden="true" />
               </label>
             </div>
 

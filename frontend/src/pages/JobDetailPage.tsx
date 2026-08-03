@@ -33,7 +33,7 @@ import { PipelineSteps } from "../components/JobCard";
 import { SelectionWizard } from "../components/SelectionWizard";
 import { Badge, Button, Card, EmptyState, LoadingPanel, Modal, Notice, PageHeader, ProgressBar } from "../components/ui";
 import { normalizeStoredSelection } from "../selection";
-import { CONTENT_LABELS, formatBytes, formatDate, formatEventMessage, formatStatusMessage, formatWorkerError, stageProgress, STATE_LABELS, stateTone } from "../utils";
+import { CONTENT_LABELS, formatBytes, formatDate, formatEventMessage, formatStatusMessage, formatWorkerError, isFastComparisonTimeoutReview, stageProgress, STATE_LABELS, stateTone } from "../utils";
 
 type Tab = "overview" | "settings" | "comparison" | "events" | "files";
 type JobDetailLocationState = {
@@ -97,6 +97,21 @@ export function JobDetailPage() {
       });
     },
   });
+  const resumeComparison = useMutation({
+    mutationFn: () => api.resumeJob(jobId),
+    onSuccess: (resumedJob) => {
+      queryClient.setQueryData(["job", jobId], resumedJob);
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["job", jobId] }),
+        queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+        queryClient.invalidateQueries({ queryKey: ["events", jobId] }),
+      ]);
+      navigate(`/jobs/${encodeURIComponent(jobId)}`, {
+        replace: true,
+        state: { retryStarted: true } satisfies JobDetailLocationState,
+      });
+    },
+  });
 
   function openRetryConfirmation() {
     retryJob.reset();
@@ -124,7 +139,12 @@ export function JobDetailPage() {
   const retryableFailure = job.state === "FAILED"
     && job.resume_state !== null
     && RETRYABLE_FAILED_STATES.has(job.resume_state);
-  const configurable = ["AWAITING_SELECTION", "NEEDS_REVIEW"].includes(job.state) && scan;
+  const comparisonTimeoutReview = job.state === "NEEDS_REVIEW"
+    && job.resume_state === "COMPARISON"
+    && isFastComparisonTimeoutReview(job.status_message);
+  const configurable = ["AWAITING_SELECTION", "NEEDS_REVIEW"].includes(job.state)
+    && !comparisonTimeoutReview
+    && scan;
   const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(job.state);
 
   return (
@@ -166,7 +186,15 @@ export function JobDetailPage() {
           A végleges MKV biztonságban van. A munkaterület takarítása nem sikerült; a részletek az eseménynaplóban találhatók.
         </Notice>
       )}
-      {job.state === "NEEDS_REVIEW" && <Notice tone="warning" title="Operátori ellenőrzés szükséges">{formatStatusMessage(job.status_message, "A munkafolyamat csak a beállítások felülvizsgálata után folytatható.")}</Notice>}
+      {comparisonTimeoutReview && (
+        <Notice tone="warning" title="A gyors comparison időkorlátja lejárt">
+          <p>{formatStatusMessage(job.status_message, "A comparison biztonságosan folytatható.")}</p>
+          <p>A már elkészült képpárok és ellenőrzött checkpointok megmaradtak; a kódolást és a muxot nem kell újrafuttatni.</p>
+          <Button icon={<RefreshCw size={17} />} loading={resumeComparison.isPending} onClick={() => resumeComparison.mutate()}>Folytatás a comparisontól</Button>
+          {resumeComparison.isError && <p>{resumeComparison.error instanceof ApiError ? resumeComparison.error.detail : resumeComparison.error.message}</p>}
+        </Notice>
+      )}
+      {job.state === "NEEDS_REVIEW" && !comparisonTimeoutReview && <Notice tone="warning" title="Operátori ellenőrzés szükséges">{formatStatusMessage(job.status_message, "A munkafolyamat csak a beállítások felülvizsgálata után folytatható.")}</Notice>}
 
       <Card className="job-progress-card">
         <div className="job-progress-card__top">
@@ -234,7 +262,7 @@ function Overview({ job, scan, events, artifacts, onConfigure }: { job: Job; sca
   return (
     <div className="overview-grid">
       <div className="overview-main">
-        {["AWAITING_SELECTION", "NEEDS_REVIEW"].includes(job.state) && scan && (
+        {["AWAITING_SELECTION", "NEEDS_REVIEW"].includes(job.state) && !isFastComparisonTimeoutReview(job.status_message) && scan && (
           <Card className="action-callout">
             <span className="action-callout__icon"><ListChecks size={25} /></span>
             <div><span className="eyebrow">Te következel</span><h2>{job.state === "AWAITING_SELECTION" ? "Válaszd ki a filmet és a sávokat" : "Vizsgáld felül a beállításokat"}</h2><p>{scan.playlists.length} playlistet találtam. A kódolás addig nem indul el, amíg a tervet jóvá nem hagyod.</p></div>
@@ -271,10 +299,10 @@ function SavedSelection({ job, scan }: { job: Job; scan: DiscScanResult | null }
   const settings = selection.settings;
   return (
     <div className="saved-selection">
-      <Notice tone="success" title="A terv jóváhagyva">Nincs külön indítógomb: a worker automatikusan folytatja az előkészítést és a kódolást. A comparison adatok külön mellékletek maradnak.</Notice>
+      <Notice tone={isFastComparisonTimeoutReview(job.status_message) ? "info" : "success"} title={isFastComparisonTimeoutReview(job.status_message) ? "A jóváhagyott terv változatlan" : "A terv jóváhagyva"}>{isFastComparisonTimeoutReview(job.status_message) ? "A selection módosítása nem szükséges. A comparison az áttekintő lapon folytatható az érvényes checkpointoktól." : "Nincs külön indítógomb: a worker automatikusan folytatja az előkészítést és a kódolást. A comparison adatok külön mellékletek maradnak."}</Notice>
       <div className="saved-selection-grid">
         <Card><span className="eyebrow">Kép és kódoló</span><dl className="summary-list summary-list--stacked"><div><dt>Playlist</dt><dd>{selection.playlistId ?? "—"}</dd></div><div><dt>Kódoló</dt><dd>{scan?.disc_kind === "uhd" ? "x265" : "x264"}</dd></div><div><dt>Részletesség</dt><dd>{selection.detailLevel ?? "—"}</dd></div><div><dt>CRF</dt><dd>{String(settings.crf ?? "ajánlott")}</dd></div><div><dt>Preset</dt><dd>{String(settings.preset ?? "ajánlott")}</dd></div><div><dt>Filter</dt><dd>{selection.temporalFilter ?? "—"}</dd></div></dl></Card>
-        <Card><span className="eyebrow">Kimenet</span><dl className="summary-list summary-list--stacked"><div><dt>Fájlnév</dt><dd>{selection.outputName ? `${selection.outputName}.mkv` : "—"}</dd></div><div><dt>Sávok</dt><dd>{selection.tracks.filter((track) => track.action !== "omit").length} megtartva</dd></div><div><dt>ImgBB</dt><dd>{selection.uploadImages === null ? "—" : selection.uploadImages ? "Bekapcsolva" : "Kikapcsolva"}</dd></div><div><dt>I/P/B egyezés</dt><dd>{selection.dualTypeMatch === null ? "—" : selection.dualTypeMatch ? "Szigorú" : "Encode kategória"}</dd></div></dl></Card>
+        <Card><span className="eyebrow">Kimenet</span><dl className="summary-list summary-list--stacked"><div><dt>Fájlnév</dt><dd>{selection.outputName ? `${selection.outputName}.mkv` : "—"}</dd></div><div><dt>Sávok</dt><dd>{selection.tracks.filter((track) => track.action !== "omit").length} megtartva</dd></div><div><dt>ImgBB</dt><dd>{selection.uploadImages === null ? "—" : selection.uploadImages ? "Bekapcsolva" : "Kikapcsolva"}</dd></div><div><dt>I/P/B egyezés</dt><dd>{selection.dualTypeMatch === false ? "Kötelező · régi mentés felülbírálva" : "Kötelező"}</dd></div></dl></Card>
         <Card className="saved-json"><details><summary><Code2 size={17} /> Teljes selection JSON</summary><pre>{JSON.stringify(job.selection, null, 2)}</pre></details></Card>
       </div>
     </div>

@@ -19,10 +19,18 @@ from bdencode.qc.audio import (
     spectrum_stitch_command,
 )
 from bdencode.qc.video import (
+    FrameProbeInterval,
     FrameRecord,
     FrameSelectionError,
+    VapourSynthInfo,
     extract_png_command,
+    extract_png_at_timestamp_command,
+    ffprobe_frame_origin_command,
+    ffprobe_sampled_frame_command,
+    parse_ffprobe_frame_origin,
+    parse_sampled_ffprobe_frames,
     parse_vspipe_info,
+    plan_sample_intervals,
     select_frame_pairs,
     standalone_vmaf_command,
 )
@@ -57,6 +65,140 @@ def test_missing_b_frames_is_hard_failure() -> None:
     frames = _frames("IPPPIPPP")
     with pytest.raises(FrameSelectionError, match="mandatory B"):
         select_frame_pairs(frames, frames, per_type=1)
+
+
+def test_total_pair_selection_keeps_mandatory_ipb_and_spends_extras_on_pb() -> None:
+    encoded = _frames("IPBBPBBIPBBPBBIPBBPBBIPBBPBB")
+    pairs = select_frame_pairs(
+        encoded,
+        encoded,
+        total_pairs=5,
+        timeline_frames=len(encoded),
+        dual_type_match=True,
+    )
+    assert len(pairs) == 5
+    assert {
+        category: sum(pair.category == category for pair in pairs) for category in "IPB"
+    } == {
+        "I": 1,
+        "P": 2,
+        "B": 2,
+    }
+    assert all(pair.dual_type_match for pair in pairs)
+    assert len({pair.presentation_index for pair in pairs}) == 5
+
+
+def test_sample_interval_plan_is_distributed_and_hard_bounded() -> None:
+    info = VapourSynthInfo(frames=158_750, fps_numerator=24_000, fps_denominator=1001)
+    intervals = plan_sample_intervals(info)
+    assert intervals[0].start_seconds == 0
+    assert sum(item.duration_seconds for item in intervals) <= Decimal("36")
+    assert all(item.end_seconds <= info.duration_seconds for item in intervals)
+    assert any(
+        item.start_seconds > info.duration_seconds * Decimal("0.8")
+        for item in intervals
+    )
+    assert all(
+        left.end_seconds <= right.start_seconds
+        for left, right in zip(intervals, intervals[1:])
+    )
+
+
+def test_short_sample_interval_plan_merges_overlaps_without_exceeding_clip() -> None:
+    info = VapourSynthInfo(frames=200, fps_numerator=25, fps_denominator=1)
+    intervals = plan_sample_intervals(info)
+    assert intervals == (FrameProbeInterval(Decimal(0), Decimal(8)),)
+
+
+def test_sampled_ffprobe_command_never_requests_an_unbounded_scan() -> None:
+    intervals = (
+        FrameProbeInterval(Decimal(0), Decimal(6)),
+        FrameProbeInterval(Decimal("120.5"), Decimal(3)),
+    )
+    command = ffprobe_sampled_frame_command(
+        Path("encode.mkv"), intervals, pts_origin=Decimal("7")
+    )
+    assert command[command.index("-read_intervals") + 1] == "7%13,127.5%130.5"
+    assert "-show_frames" in command
+    assert command[-1] == "encode.mkv"
+
+
+def test_opening_origin_probe_is_bounded_and_accepts_nonzero_or_negative_pts() -> None:
+    command = ffprobe_frame_origin_command(Path("encode.mkv"))
+    assert command[command.index("-read_intervals") + 1] == "%+1"
+    assert parse_ffprobe_frame_origin(
+        {
+            "frames": [
+                {"media_type": "audio", "best_effort_timestamp_time": "-1"},
+                {"media_type": "video", "best_effort_timestamp_time": "0.040"},
+                {"media_type": "video", "best_effort_timestamp_time": "0.082"},
+            ]
+        }
+    ) == Decimal("0.040")
+    assert parse_ffprobe_frame_origin(
+        {"frames": [{"media_type": "video", "pts_time": "-0.250"}]}
+    ) == Decimal("-0.250")
+
+
+def test_sampled_frame_parser_recovers_global_indexes_and_deduplicates() -> None:
+    info = VapourSynthInfo(frames=1000, fps_numerator=25, fps_denominator=1)
+    document = {
+        "frames": [
+            {
+                "media_type": "video",
+                "best_effort_timestamp_time": "7.000",
+                "pict_type": "I",
+                "key_frame": 1,
+            },
+            {
+                "media_type": "video",
+                "best_effort_timestamp_time": "7.040",
+                "pict_type": "P",
+            },
+            {
+                "media_type": "video",
+                "best_effort_timestamp_time": "11.000",
+                "pict_type": "B",
+            },
+            # Seeking adjacent intervals may report the same decoded frame.
+            {
+                "media_type": "video",
+                "pts_time": "11.000",
+                "pict_type": "B",
+            },
+        ]
+    }
+    frames = parse_sampled_ffprobe_frames(document, info, pts_origin=Decimal("7.000"))
+    assert [item.presentation_index for item in frames] == [0, 1, 100]
+    assert [item.pts_seconds for item in frames] == [
+        Decimal(0),
+        Decimal("0.04"),
+        Decimal(4),
+    ]
+    assert frames[-1].seek_pts_seconds == Decimal("11.000")
+
+
+def test_sampled_frame_parser_rejects_non_cfr_alignment() -> None:
+    info = VapourSynthInfo(frames=1000, fps_numerator=25, fps_denominator=1)
+    document = {
+        "frames": [
+            {"best_effort_timestamp_time": "7.000", "pict_type": "I"},
+            {"best_effort_timestamp_time": "11.015", "pict_type": "P"},
+        ]
+    }
+    with pytest.raises(FrameSelectionError, match="does not align"):
+        parse_sampled_ffprobe_frames(document, info, pts_origin=Decimal("7.000"))
+
+
+def test_sampled_frame_parser_refuses_to_rebase_a_missing_opening_sample() -> None:
+    info = VapourSynthInfo(frames=1000, fps_numerator=25, fps_denominator=1)
+    document = {
+        "frames": [
+            {"best_effort_timestamp_time": "11.000", "pict_type": "P"},
+        ]
+    }
+    with pytest.raises(FrameSelectionError, match="opening video frame"):
+        parse_sampled_ffprobe_frames(document, info, pts_origin=Decimal("7.000"))
 
 
 def test_vapoursynth_reference_pts_comes_from_real_clip_info() -> None:
@@ -132,9 +274,11 @@ def test_spectrum_windows_cover_long_tracks_without_unbounded_buffers() -> None:
         for left, right in zip(windows, windows[1:])
     )
     assert sum(window.height for window in windows) == 2160
-    assert max(window.height for window in windows) - min(
-        window.height for window in windows
-    ) <= 1
+    assert (
+        max(window.height for window in windows)
+        - min(window.height for window in windows)
+        <= 1
+    )
     seconds_per_pixel = duration / Decimal(2160)
     assert all(
         abs((window.duration_seconds / Decimal(window.height)) - seconds_per_pixel)
@@ -210,6 +354,27 @@ def test_native_png_conversion_keeps_yuv_matrix_until_rgb_format(
     assert expected_matrix in filters
     assert "m=gbr" not in filters
     assert "format=gbrp16le" in filters
+
+
+def test_timestamp_png_extraction_seeks_before_input_without_global_frame_scan() -> (
+    None
+):
+    command = extract_png_at_timestamp_command(
+        Path("encode.mkv"),
+        Decimal("3301.256"),
+        Path("frame.png"),
+        hdr_native=True,
+    )
+    assert command.index("-ss") < command.index("-i")
+    assert command.index("-seek_timestamp") < command.index("-ss")
+    assert command[command.index("-seek_timestamp") + 1] == "1"
+    assert command[command.index("-ss") + 1] == "3301.256"
+    assert "-accurate_seek" in command
+    filters = command[command.index("-vf") + 1]
+    assert "select=" not in filters
+    assert "format=gbrp16le" in filters
+    assert command[command.index("-frames:v") + 1] == "1"
+    assert command[-1] == "frame.png"
 
 
 def test_official_vmaf_cli_plan_uses_y4m_sidecars() -> None:

@@ -20,6 +20,7 @@ vi.mock("../api/client", async (importOriginal) => {
       cancelJob: vi.fn(),
       retryJob: vi.fn(),
       retryUpload: vi.fn(),
+      resumeJob: vi.fn(),
     },
   };
 });
@@ -121,5 +122,53 @@ describe("JobDetailPage failed-job retry", () => {
     expect(await screen.findByRole("link", { name: /Vissza az archívumhoz/ })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Folytatás a hibától" })).not.toBeInTheDocument();
     expect(screen.queryByText("A munkafájlok a biztonságos folytatáshoz megmaradtak")).not.toBeInTheDocument();
+  });
+
+  it("offers a dedicated comparison continuation instead of the selection wizard", async () => {
+    const user = userEvent.setup();
+    const paused = makeJob({
+      state: "NEEDS_REVIEW",
+      resume_state: "COMPARISON",
+      progress: 0.95,
+      status_message: "fast comparison exceeded its bounded command/time budget",
+      selection: {
+        playlist_id: "00001",
+        angle: 1,
+        output_name: "Mintafilm.BluRay.x264",
+        video: {
+          detail_level: "beginner",
+          temporal_filter: "progressive",
+          crop: { left: 0, top: 0, right: 0, bottom: 0 },
+          settings: {},
+        },
+        tracks: [],
+        upload_images: false,
+        dual_type_match: false,
+      },
+    });
+    const resumed = makeJob({
+      state: "COMPARISON",
+      progress: 0.95,
+      status_message: "fast comparison: preparing bounded samples",
+      selection: paused.selection,
+      version: 2,
+    });
+    vi.mocked(api.job).mockResolvedValue(paused);
+    vi.mocked(api.resumeJob).mockResolvedValue(resumed);
+    renderFailedJob();
+
+    expect(await screen.findByText("A gyors comparison időkorlátja lejárt")).toBeInTheDocument();
+    expect(screen.queryByText("Vizsgáld felül a beállításokat")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Beállítások" }));
+    expect(screen.getByText("A jóváhagyott terv változatlan")).toBeInTheDocument();
+    expect(screen.getByText("Kötelező · régi mentés felülbírálva")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Terv ellenőrzése" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Áttekintés" }));
+    await user.click(screen.getByRole("button", { name: "Folytatás a comparisontól" }));
+
+    await waitFor(() => expect(api.resumeJob).toHaveBeenCalledWith("job-1"));
+    expect(await screen.findByText("A munka folytatása elindult")).toBeInTheDocument();
   });
 });

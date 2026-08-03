@@ -34,6 +34,10 @@ class Settings:
     api_root_path: str = "/encoder"
     worker_poll_seconds: float = 2.0
     cpu_limit_percent: int = 80
+    comparison_pair_count: int = 5
+    # Deprecated compatibility key. New comparison code uses
+    # ``comparison_pair_count``; retaining this field lets older TOML files and
+    # environment overrides load without becoming unknown configuration.
     comparison_frames_per_type: int = 4
     log_level: str = "INFO"
     config_path: Path | None = None
@@ -71,6 +75,8 @@ class Settings:
             raise ConfigurationError("the backend must bind to loopback")
         if not self.source_roots:
             raise ConfigurationError("at least one source root is required")
+        if not 3 <= self.comparison_pair_count <= 5:
+            raise ConfigurationError("comparison_pair_count must be between 3 and 5")
         if self.comparison_frames_per_type < 1:
             raise ConfigurationError("comparison_frames_per_type must be positive")
         data = self.data_root.expanduser().resolve(strict=False)
@@ -124,7 +130,12 @@ def _coerce(name: str, value: Any) -> Any:
         if isinstance(value, str):
             value = [part for part in value.split(os.pathsep) if part]
         return tuple(Path(part) for part in value)
-    if name in {"bind_port", "cpu_limit_percent", "comparison_frames_per_type"}:
+    if name in {
+        "bind_port",
+        "cpu_limit_percent",
+        "comparison_pair_count",
+        "comparison_frames_per_type",
+    }:
         return int(value)
     if name == "worker_poll_seconds":
         return float(value)

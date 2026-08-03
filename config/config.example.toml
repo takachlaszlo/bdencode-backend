@@ -6,5 +6,7 @@ bind_port = 8796
 api_root_path = "/encoder"
 worker_poll_seconds = 2.0
 cpu_limit_percent = 80
-comparison_frames_per_type = 4
+comparison_pair_count = 5
+# A korábbi comparison_frames_per_type kulcs kompatibilitási okból még betölthető,
+# de az új, mintavételezett comparison nem használja.
 log_level = "INFO"

@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import socket
+import subprocess
 import time
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
@@ -96,7 +97,7 @@ from .mux import (
     validate_hdr10_side_data,
     validate_mkvmerge_identification,
 )
-from .process import CommandRunner, ProcessFailure, ProcessInterrupted
+from .process import CommandRunner, ProcessInterrupted, redact_argv
 from .progress import EncodeProgressReporter
 from .qc.artifacts import inspect_png
 from .qc.audio import (
@@ -114,17 +115,19 @@ from .qc.video import (
     FrameRecord,
     FrameSelectionError,
     comparison_manifest,
-    extract_png_command,
-    ffprobe_frame_command,
-    parse_ffprobe_frames,
+    extract_png_at_timestamp_command,
+    ffprobe_frame_origin_command,
+    ffprobe_sampled_frame_command,
+    parse_ffprobe_frame_origin,
+    parse_sampled_ffprobe_frames,
     parse_vspipe_info,
+    plan_sample_intervals,
     png_filter_chain,
     select_frame_pairs,
     vspipe_info_command,
 )
 from .queue import JobQueue
 from .utils import atomic_write_json, sha256_file as _uncached_sha256_file
-from .vmaf_runner import streamed_vmaf_command
 from .vapoursynth import (
     Crop as VapourSynthCrop,
     ReferenceScriptPlan,
@@ -474,6 +477,41 @@ def _output_records(outputs: Iterable[Path]) -> list[dict[str, Any]]:
             }
         )
     return records
+
+
+def _recorded_output_sha256(marker: Path, output: Path) -> str | None:
+    """Reuse a durable upstream stage digest without re-reading a huge MKV.
+
+    The producer stage wrote this digest after creating the immutable output.
+    A size/path check prevents accidentally borrowing a digest for another
+    file; callers fall back to a fresh SHA-256 when the record is unavailable.
+    """
+
+    try:
+        document = json.loads(marker.read_text(encoding="utf-8"))
+        if document.get("schema_version") != 1 or not output.is_file():
+            return None
+        expected_path = str(output.resolve(strict=True))
+        output_stat = output.stat()
+        expected_size = output_stat.st_size
+        completed_at = float(document["completed_at_epoch"])
+        # A normal producer writes its checkpoint only after the output digest
+        # has been calculated.  A later mtime therefore means the file changed
+        # in place and the recorded SHA-256 can no longer describe it, even if
+        # its path and byte size remained identical.
+        if output_stat.st_mtime > completed_at:
+            return None
+        for item in document.get("outputs", []):
+            if (
+                item.get("path") == expected_path
+                and item.get("size_bytes") == expected_size
+                and isinstance(item.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+            ):
+                return item["sha256"]
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return None
 
 
 def _valid_stage(
@@ -1170,7 +1208,9 @@ class PipelineWorker:
             except ProcessInterrupted:
                 current = self.database.get_job(job.id)
                 if current.state is JobState.CANCELLED:
-                    LOG.info("job %s encode stopped after operator cancellation", job.id)
+                    LOG.info(
+                        "job %s encode stopped after operator cancellation", job.id
+                    )
                 elif self.stop_requested():
                     LOG.info("job %s encode stopped for worker shutdown", job.id)
                 else:
@@ -1183,6 +1223,28 @@ class PipelineWorker:
                 # replay the stage or reuse a marker completed at the boundary;
                 # an API cancellation has already committed CANCELLED itself.
                 return current
+            except subprocess.TimeoutExpired as exc:
+                current = self.database.get_job(job.id)
+                if self.stop_requested():
+                    LOG.info(
+                        "job %s stopped during %s without a failure transition",
+                        job.id,
+                        current.state.value,
+                    )
+                    return current
+                if current.state is JobState.COMPARISON:
+                    return self.queue.needs_review(
+                        job.id,
+                        message=(
+                            "fast comparison exceeded its bounded command/time budget"
+                        ),
+                        details={
+                            "timeout_seconds": exc.timeout,
+                            "command": redact_argv(exc.cmd or ()),
+                        },
+                    )
+                self._fail(current, exc)
+                return self.database.get_job(job.id)
             except (ImageUploadError, OSError) as exc:
                 current = self.database.get_job(job.id)
                 if self.stop_requested():
@@ -2016,9 +2078,7 @@ class PipelineWorker:
                 "final_output": audio_inputs["output_sha256"],
                 "intermediate": intermediate_sha256,
             }
-            commands: list[
-                tuple[list[str], Path, Literal["stdout", "stderr"]]
-            ] = [
+            commands: list[tuple[list[str], Path, Literal["stdout", "stderr"]]] = [
                 (
                     audio_probe_command(paths.reference, source_audio_ordinal),
                     source_probe,
@@ -2069,7 +2129,9 @@ class PipelineWorker:
                             stderr_path=result_path,
                         )
                     else:
-                        raise AssertionError(f"unsupported QC result mode: {result_mode}")
+                        raise AssertionError(
+                            f"unsupported QC result mode: {result_mode}"
+                        )
                     _write_stage(marker, command_inputs, [result_path])
             source_value = parse_audio_probe(source_probe.read_text(encoding="utf-8"))
             encode_value = parse_audio_probe(encode_probe.read_text(encoding="utf-8"))
@@ -2292,63 +2354,101 @@ class PipelineWorker:
         ]
 
     @staticmethod
-    def _metric_pipeline(script: Path, encoded: Path, result: Path) -> list[list[str]]:
-        ssim_stats = (
-            str(result.with_suffix(".ssim.log")).replace("\\", "/").replace(":", "\\:")
-        )
-        psnr_stats = (
-            str(result.with_suffix(".psnr.log")).replace("\\", "/").replace(":", "\\:")
-        )
+    def _sample_metric_pipeline(
+        reference_png: Path,
+        encoded_png: Path,
+        ssim_output: Path,
+        psnr_output: Path,
+    ) -> list[list[str]]:
+        """Measure only one selected proof pair, never the complete title."""
+
+        ssim_stats = str(ssim_output).replace("\\", "/").replace(":", "\\:")
+        psnr_stats = str(psnr_output).replace("\\", "/").replace(":", "\\:")
         filter_value = (
-            "[0:v]settb=AVTB,setpts=PTS-STARTPTS,split=2[r1][r2];"
-            "[1:v]settb=AVTB,setpts=PTS-STARTPTS,split=2[e1][e2];"
+            "[0:v]format=gbrp16le,split=2[r1][r2];"
+            "[1:v]format=gbrp16le,split=2[e1][e2];"
             f"[e1][r1]ssim=stats_file={ssim_stats}[ssimout];"
-            "[ssimout]nullsink;"
-            f"[e2][r2]psnr=stats_file={psnr_stats}[metrics]"
+            f"[e2][r2]psnr=stats_file={psnr_stats}[psnrout]"
         )
         return [
-            ["vspipe", "--container", "y4m", str(script), "-"],
             [
                 "ffmpeg",
                 "-hide_banner",
                 "-nostdin",
                 "-v",
                 "info",
-                "-f",
-                "yuv4mpegpipe",
                 "-i",
-                "pipe:0",
+                str(reference_png),
                 "-i",
-                str(encoded),
+                str(encoded_png),
                 "-filter_complex",
                 filter_value,
                 "-map",
-                "[metrics]",
+                "[ssimout]",
+                "-map",
+                "[psnrout]",
                 "-f",
                 "null",
                 "-",
             ],
         ]
 
+    @staticmethod
+    def _metric_stat(path: Path, name: str) -> float | str | None:
+        """Read one FFmpeg key without making metrics-log wording an invariant."""
+
+        try:
+            value = re.search(
+                rf"(?:^|\s){re.escape(name)}:([^\s]+)",
+                path.read_text(encoding="utf-8", errors="replace"),
+            )
+        except OSError:
+            return None
+        if value is None:
+            return None
+        raw = value.group(1)
+        if raw.casefold() in {"inf", "+inf", "-inf", "nan"}:
+            return raw
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
     def _comparison(self, job: Job, paths: JobPaths) -> None:
         scan, selection = self._load_scan_and_selection(job, paths)
         encoded_input = paths.muxed_output
         if not encoded_input.is_file():
             raise RuntimeError("final Matroska output is missing before comparison")
-        encoded_probe = paths.comparison / "encoded-frames.json"
-        probe_inputs = {"final_mkv_sha256": sha256_file(encoded_input)}
-        probe_marker = paths.stages / "comparison-frame-probe.json"
-        if not _valid_stage(probe_marker, probe_inputs, [encoded_probe]):
-            self._runner(paths).run(
-                ffprobe_frame_command(encoded_input),
-                cwd=paths.work,
-                stdout_path=encoded_probe,
-                stderr_path=paths.logs / "comparison-frame-probe.stderr",
-            )
-            _write_stage(probe_marker, probe_inputs, [encoded_probe])
-        encoded = parse_ffprobe_frames(encoded_probe.read_text(encoding="utf-8"))
+
+        # This stage is intentionally a bounded visual sample, not a title-wide
+        # analysis. No individual subprocess may extend the complete stage past
+        # its five-minute operator-facing budget.
+        comparison_deadline = time.monotonic() + 300
+
+        def remaining_timeout(per_command_limit: float) -> float:
+            remaining = comparison_deadline - time.monotonic()
+            if remaining <= 1:
+                raise ReviewRequired(
+                    "fast comparison exceeded its five-minute time budget"
+                )
+            return max(1.0, min(per_command_limit, remaining))
+
+        script_sha256 = sha256_file(paths.script)
+        encoded_sha256 = _recorded_output_sha256(
+            paths.stages / "mux.json", encoded_input
+        )
+        if encoded_sha256 is None:
+            raise RuntimeError("final MKV mux checkpoint digest is missing")
+        self.database.record_progress(
+            job.id,
+            0.925,
+            message="fast comparison: preparing bounded samples",
+            expected_state=JobState.COMPARISON,
+            emit_event=False,
+        )
+
         reference_info_path = paths.comparison / "reference-vapoursynth-info.txt"
-        reference_info_inputs = {"script_sha256": sha256_file(paths.script)}
+        reference_info_inputs = {"script_sha256": script_sha256}
         reference_info_marker = paths.stages / "comparison-reference-info.json"
         if not _valid_stage(
             reference_info_marker, reference_info_inputs, [reference_info_path]
@@ -2358,6 +2458,7 @@ class PipelineWorker:
                 cwd=paths.work,
                 stdout_path=reference_info_path,
                 stderr_path=paths.logs / "comparison-reference-info.stderr",
+                timeout=remaining_timeout(60),
             )
             _write_stage(
                 reference_info_marker, reference_info_inputs, [reference_info_path]
@@ -2365,75 +2466,195 @@ class PipelineWorker:
         reference_info = parse_vspipe_info(
             reference_info_path.read_text(encoding="utf-8", errors="replace")
         )
-        if len(encoded) != reference_info.frames:
-            raise ReviewRequired(
-                "encoded frame count differs from the VapourSynth reference",
-                details={
-                    "reference_frames": reference_info.frames,
-                    "encoded_frames": len(encoded),
-                },
-            )
-        shifted = [
-            item.presentation_index
-            for item in encoded
-            if abs(
-                item.pts_seconds - reference_info.pts_for_frame(item.presentation_index)
-            )
-            > Decimal("0.001")
+
+        intervals = plan_sample_intervals(reference_info)
+        interval_manifest = [
+            {
+                "start_seconds": str(item.start_seconds),
+                "duration_seconds": str(item.duration_seconds),
+            }
+            for item in intervals
         ]
-        if shifted:
-            raise ReviewRequired(
-                "encoded presentation timestamps diverge from the reference timeline",
-                details={
-                    "first_mismatched_frame": shifted[0],
-                    "mismatch_count": len(shifted),
-                },
+        sample_plan = {
+            "schema_version": 2,
+            "strategy": "bounded_distributed_read_intervals",
+            "intervals": interval_manifest,
+            "planned_interval_seconds_per_input": str(
+                sum((item.duration_seconds for item in intervals), Decimal(0))
+            ),
+            "full_title_scan": False,
+        }
+
+        encoded_origin_path = paths.comparison / "sampled-encoded-origin.json"
+        encoded_origin_inputs = {"final_mkv_sha256": encoded_sha256}
+        encoded_origin_marker = (
+            paths.stages / "comparison-sampled-encoded-origin-v2.json"
+        )
+        if not _valid_stage(
+            encoded_origin_marker, encoded_origin_inputs, [encoded_origin_path]
+        ):
+            self._runner(paths).run(
+                ffprobe_frame_origin_command(encoded_input),
+                cwd=paths.work,
+                stdout_path=encoded_origin_path,
+                stderr_path=paths.logs / "comparison-sampled-encoded-origin.stderr",
+                timeout=remaining_timeout(30),
             )
-        # The reference is the exact VapourSynth output frame used to create each
-        # encoded presentation frame. A decoded reference has no independent GOP
-        # category; optional source bitstream types are recorded only when the
-        # source timeline is unchanged.
-        source_types: dict[int, str | None] = {}
-        if selection.temporal_filter is TemporalFilter.PROGRESSIVE:
-            source_probe = paths.comparison / "source-frames.json"
-            source_inputs = {"reference_sha256": sha256_file(paths.reference)}
-            source_marker = paths.stages / "comparison-source-frame-probe.json"
-            if not _valid_stage(source_marker, source_inputs, [source_probe]):
+            _write_stage(
+                encoded_origin_marker, encoded_origin_inputs, [encoded_origin_path]
+            )
+        try:
+            encoded_pts_origin = parse_ffprobe_frame_origin(
+                encoded_origin_path.read_text(encoding="utf-8")
+            )
+        except FrameSelectionError as exc:
+            raise ReviewRequired(
+                f"encoded comparison PTS origin is invalid: {exc}"
+            ) from exc
+
+        encoded_probe = paths.comparison / "sampled-encoded-frames.json"
+        encoded_probe_inputs = {
+            "final_mkv_sha256": encoded_sha256,
+            "sample_plan": sample_plan,
+            "pts_origin": str(encoded_pts_origin),
+        }
+        encoded_probe_marker = (
+            paths.stages / "comparison-sampled-encoded-frame-probe-v2.json"
+        )
+        if not _valid_stage(
+            encoded_probe_marker, encoded_probe_inputs, [encoded_probe]
+        ):
+            self._runner(paths).run(
+                ffprobe_sampled_frame_command(
+                    encoded_input, intervals, pts_origin=encoded_pts_origin
+                ),
+                cwd=paths.work,
+                stdout_path=encoded_probe,
+                stderr_path=paths.logs / "comparison-sampled-encoded-probe.stderr",
+                timeout=remaining_timeout(90),
+            )
+            _write_stage(encoded_probe_marker, encoded_probe_inputs, [encoded_probe])
+        try:
+            encoded = parse_sampled_ffprobe_frames(
+                encoded_probe.read_text(encoding="utf-8"),
+                reference_info,
+                pts_origin=encoded_pts_origin,
+            )
+        except FrameSelectionError as exc:
+            raise ReviewRequired(
+                f"encoded comparison sample is invalid: {exc}"
+            ) from exc
+
+        source_type_available = selection.temporal_filter is TemporalFilter.PROGRESSIVE
+        # On an unchanged progressive timeline, the user's strict source/encode
+        # I/P/B requirement is mandatory. A temporal transform has no meaningful
+        # one-to-one source bitstream frame type, so it remains index/PTS aligned.
+        require_source_type_match = source_type_available
+        source_by_index: dict[int, FrameRecord] = {}
+        source_pts_origin: Decimal | None = None
+        if source_type_available:
+            reference_sha256 = _recorded_output_sha256(
+                paths.stages / "reference-remux.json", paths.reference
+            )
+            if reference_sha256 is None:
+                raise RuntimeError("reference remux checkpoint digest is missing")
+            source_origin_path = paths.comparison / "sampled-source-origin.json"
+            source_origin_inputs = {"reference_sha256": reference_sha256}
+            source_origin_marker = (
+                paths.stages / "comparison-sampled-source-origin-v2.json"
+            )
+            if not _valid_stage(
+                source_origin_marker, source_origin_inputs, [source_origin_path]
+            ):
                 self._runner(paths).run(
-                    ffprobe_frame_command(paths.reference),
+                    ffprobe_frame_origin_command(paths.reference),
+                    cwd=paths.work,
+                    stdout_path=source_origin_path,
+                    stderr_path=paths.logs / "comparison-sampled-source-origin.stderr",
+                    timeout=remaining_timeout(30),
+                )
+                _write_stage(
+                    source_origin_marker,
+                    source_origin_inputs,
+                    [source_origin_path],
+                )
+            try:
+                source_pts_origin = parse_ffprobe_frame_origin(
+                    source_origin_path.read_text(encoding="utf-8")
+                )
+            except FrameSelectionError as exc:
+                raise ReviewRequired(
+                    f"source comparison PTS origin is invalid: {exc}"
+                ) from exc
+            source_probe = paths.comparison / "sampled-source-frames.json"
+            source_probe_inputs = {
+                "reference_sha256": reference_sha256,
+                "sample_plan": sample_plan,
+                "pts_origin": str(source_pts_origin),
+            }
+            source_probe_marker = (
+                paths.stages / "comparison-sampled-source-frame-probe-v2.json"
+            )
+            if not _valid_stage(
+                source_probe_marker, source_probe_inputs, [source_probe]
+            ):
+                self._runner(paths).run(
+                    ffprobe_sampled_frame_command(
+                        paths.reference, intervals, pts_origin=source_pts_origin
+                    ),
                     cwd=paths.work,
                     stdout_path=source_probe,
-                    stderr_path=paths.logs / "comparison-source-frame-probe.stderr",
+                    stderr_path=paths.logs / "comparison-sampled-source-probe.stderr",
+                    timeout=remaining_timeout(90),
                 )
-                _write_stage(source_marker, source_inputs, [source_probe])
-            source_types = {
-                item.presentation_index: item.pict_type
-                for item in parse_ffprobe_frames(
-                    source_probe.read_text(encoding="utf-8")
+                _write_stage(source_probe_marker, source_probe_inputs, [source_probe])
+            try:
+                source_frames = parse_sampled_ffprobe_frames(
+                    source_probe.read_text(encoding="utf-8"),
+                    reference_info,
+                    pts_origin=source_pts_origin,
                 )
-            }
-        reference = [
-            FrameRecord(
-                presentation_index=item.presentation_index,
-                pts_seconds=reference_info.pts_for_frame(item.presentation_index),
-                pict_type=source_types.get(item.presentation_index),
-            )
-            for item in encoded
-            if item.presentation_index < reference_info.frames
-        ]
-        require_source_type_match = (
-            selection.dual_type_match
-            and selection.temporal_filter is TemporalFilter.PROGRESSIVE
-        )
+            except FrameSelectionError as exc:
+                raise ReviewRequired(
+                    f"source comparison sample is invalid: {exc}"
+                ) from exc
+            source_by_index = {item.presentation_index: item for item in source_frames}
+            reference = source_frames
+        else:
+            reference = [
+                FrameRecord(
+                    presentation_index=item.presentation_index,
+                    pts_seconds=item.pts_seconds,
+                    pict_type=None,
+                )
+                for item in encoded
+            ]
+
         try:
             pairs = select_frame_pairs(
                 encoded,
                 reference,
-                per_type=self.settings.comparison_frames_per_type,
+                total_pairs=self.settings.comparison_pair_count,
+                timeline_frames=reference_info.frames,
                 dual_type_match=require_source_type_match,
             )
         except FrameSelectionError as exc:
-            raise ReviewRequired(str(exc)) from exc
+            raise ReviewRequired(
+                "bounded comparison sampling could not find the required "
+                f"same-frame I/P/B pairs: {exc}",
+                details={
+                    "sample_plan": sample_plan,
+                    "requested_pairs": self.settings.comparison_pair_count,
+                },
+            ) from exc
+
+        self.database.record_progress(
+            job.id,
+            0.94,
+            message=f"fast comparison: {len(pairs)} I/P/B pairs selected",
+            expected_state=JobState.COMPARISON,
+            emit_event=True,
+        )
 
         playlist = scan.playlist(selection.playlist_id)
         video = playlist.video_streams[0].video
@@ -2441,16 +2662,26 @@ class PipelineWorker:
         hdr = selection.settings.hdr10.enabled
         comparison_color = selection.settings.color
         pngs: list[Path] = []
+        metric_sidecars: list[Path] = []
+        metric_samples: list[dict[str, Any]] = []
         manifest = comparison_manifest(pairs)
+        manifest["schema_version"] = 2
         manifest["reference_alignment"] = "same_vapoursynth_output_frame_index"
+        manifest["sampling"] = {
+            **sample_plan,
+            "requested_pair_count": self.settings.comparison_pair_count,
+            "selected_pair_count": len(pairs),
+            "encoded_pts_origin": str(encoded_pts_origin),
+            "source_pts_origin": (
+                str(source_pts_origin) if source_pts_origin is not None else None
+            ),
+        }
         manifest["distorted_input"] = {
             "role": "final_matroska_video_track_0",
             "path": encoded_input.name,
-            "sha256": sha256_file(encoded_input),
+            "sha256": encoded_sha256,
         }
-        manifest["source_bitstream_type_available"] = (
-            selection.temporal_filter is TemporalFilter.PROGRESSIVE
-        )
+        manifest["source_bitstream_type_available"] = source_type_available
         manifest["source_bitstream_type_match_required"] = require_source_type_match
         manifest["reference_clip"] = {
             "frames": reference_info.frames,
@@ -2461,13 +2692,21 @@ class PipelineWorker:
             label = f"{number:02d}-{pair.category}-f{pair.presentation_index:09d}"
             reference_png = paths.comparison / f"{label}-reference.png"
             encoded_png = paths.comparison / f"{label}-encode.png"
+            encoded_record = next(
+                item
+                for item in encoded
+                if item.presentation_index == pair.presentation_index
+            )
             image_inputs = {
-                "script_sha256": sha256_file(paths.script),
-                "final_mkv_sha256": sha256_file(encoded_input),
+                "schema_version": 2,
+                "script_sha256": script_sha256,
+                "final_mkv_sha256": encoded_sha256,
                 "frame": pair.presentation_index,
+                "encoded_seek_pts_seconds": str(encoded_record.seek_pts_seconds),
+                "extraction": "accurate_timestamp_seek",
                 "hdr_native": True,
             }
-            image_marker = paths.stages / f"comparison-{label}-native.json"
+            image_marker = paths.stages / f"comparison-{label}-native-v2.json"
             if not _valid_stage(
                 image_marker, image_inputs, [reference_png, encoded_png]
             ):
@@ -2485,11 +2724,12 @@ class PipelineWorker:
                         paths.logs / f"{label}-reference-vs.log",
                         paths.logs / f"{label}-reference-png.log",
                     ],
+                    timeout=remaining_timeout(90),
                 )
                 self._runner(paths).run(
-                    extract_png_command(
+                    extract_png_at_timestamp_command(
                         encoded_input,
-                        pair.presentation_index,
+                        encoded_record.seek_pts_seconds,
                         encoded_png,
                         hdr_native=True,
                         source_hdr10=hdr,
@@ -2500,6 +2740,7 @@ class PipelineWorker:
                     ),
                     cwd=paths.work,
                     stderr_path=paths.logs / f"{label}-encode-png.log",
+                    timeout=remaining_timeout(60),
                 )
                 _write_stage(image_marker, image_inputs, [reference_png, encoded_png])
             inspect_png(reference_png, require_high_bit_depth=hdr)
@@ -2508,13 +2749,20 @@ class PipelineWorker:
             pair_value = manifest["pairs"][number - 1]
             pair_value["reference_png"] = reference_png.name
             pair_value["encode_png"] = encoded_png.name
+            pair_value["encoded_seek_pts_seconds"] = str(
+                encoded_record.seek_pts_seconds
+            )
+            if pair.presentation_index in source_by_index:
+                pair_value["source_container_pts_seconds"] = str(
+                    source_by_index[pair.presentation_index].seek_pts_seconds
+                )
             pair_value["reference_sha256"] = sha256_file(reference_png)
             pair_value["encode_sha256"] = sha256_file(encoded_png)
             if hdr:
                 reference_sdr = paths.comparison / f"{label}-reference-sdr.png"
                 encoded_sdr = paths.comparison / f"{label}-encode-sdr.png"
                 sdr_inputs = dict(image_inputs, hdr_native=False)
-                sdr_marker = paths.stages / f"comparison-{label}-sdr.json"
+                sdr_marker = paths.stages / f"comparison-{label}-sdr-v2.json"
                 if not _valid_stage(
                     sdr_marker, sdr_inputs, [reference_sdr, encoded_sdr]
                 ):
@@ -2532,11 +2780,12 @@ class PipelineWorker:
                             paths.logs / f"{label}-reference-sdr-vs.log",
                             paths.logs / f"{label}-reference-sdr-png.log",
                         ],
+                        timeout=remaining_timeout(90),
                     )
                     self._runner(paths).run(
-                        extract_png_command(
+                        extract_png_at_timestamp_command(
                             encoded_input,
-                            pair.presentation_index,
+                            encoded_record.seek_pts_seconds,
                             encoded_sdr,
                             hdr_native=False,
                             source_hdr10=True,
@@ -2547,6 +2796,7 @@ class PipelineWorker:
                         ),
                         cwd=paths.work,
                         stderr_path=paths.logs / f"{label}-encode-sdr-png.log",
+                        timeout=remaining_timeout(60),
                     )
                     _write_stage(sdr_marker, sdr_inputs, [reference_sdr, encoded_sdr])
                 inspect_png(reference_sdr)
@@ -2557,90 +2807,133 @@ class PipelineWorker:
                 pair_value["reference_sdr_sha256"] = sha256_file(reference_sdr)
                 pair_value["encode_sdr_sha256"] = sha256_file(encoded_sdr)
 
-        metrics = paths.comparison / "video-metrics.json"
-        metrics_inputs = {
-            "script_sha256": sha256_file(paths.script),
-            "final_mkv_sha256": sha256_file(encoded_input),
-        }
-        metrics_marker = paths.stages / "comparison-metrics.json"
-        metric_sidecars: list[Path] = []
-        if metrics.is_file():
-            try:
-                metric_document = json.loads(metrics.read_text(encoding="utf-8"))
-                if metric_document.get("backend") == "ffmpeg-ssim-psnr":
-                    metric_sidecars = [
-                        paths.comparison / metric_document["ssim_stats"]["path"],
-                        paths.comparison / metric_document["psnr_stats"]["path"],
-                    ]
-            except (OSError, KeyError, TypeError, json.JSONDecodeError):
-                metric_sidecars = []
-        if not _valid_stage(
-            metrics_marker, metrics_inputs, [metrics, *metric_sidecars]
-        ):
-            metric_sidecars = []
-            vmaf_available = bool(
-                shutil.which("bdencode-vmaf") and shutil.which("vmaf")
-            )
-            if vmaf_available:
-                try:
-                    self._runner(paths).run(
-                        streamed_vmaf_command(
-                            paths.script,
-                            encoded_input,
-                            metrics,
-                            hdr10=hdr,
-                            model_4k=bool((video.width or 0) >= 3000),
-                        ),
-                        cwd=paths.work,
-                        stderr_path=paths.logs / "metrics-vmaf.log",
-                    )
-                except (OSError, ProcessFailure) as exc:
-                    raise ReviewRequired(
-                        "official VMAF analysis failed; decode/alignment errors cannot be hidden by fallback",
-                        details={"error_type": type(exc).__name__},
-                    ) from exc
-            else:
-                fallback = paths.comparison / "video-metrics.ssim.log"
-                psnr_fallback = paths.comparison / "video-metrics.psnr.log"
+            ssim_stats = paths.comparison / f"{label}.ssim.log"
+            psnr_stats = paths.comparison / f"{label}.psnr.log"
+            sample_metric_inputs = {
+                "schema_version": 2,
+                "reference_png_sha256": sha256_file(reference_png),
+                "encode_png_sha256": sha256_file(encoded_png),
+                "scope": "single_selected_native_png_pair",
+            }
+            sample_metric_marker = paths.stages / f"comparison-{label}-metrics-v2.json"
+            if not _valid_stage(
+                sample_metric_marker,
+                sample_metric_inputs,
+                [ssim_stats, psnr_stats],
+            ):
                 self._runner(paths).run_pipeline(
-                    self._metric_pipeline(paths.script, encoded_input, metrics),
+                    self._sample_metric_pipeline(
+                        reference_png,
+                        encoded_png,
+                        ssim_stats,
+                        psnr_stats,
+                    ),
                     cwd=paths.work,
-                    stderr_paths=[
-                        paths.logs / "metrics-vapoursynth-fallback.log",
-                        paths.logs / "metrics-ssim-psnr.log",
-                    ],
+                    stderr_paths=[paths.logs / f"{label}-metrics.log"],
+                    timeout=remaining_timeout(30),
+                    interrupt_requested=self.stop_requested,
                 )
-                if not fallback.is_file() or not psnr_fallback.is_file():
+                if not ssim_stats.is_file() or not psnr_stats.is_file():
                     raise RuntimeError(
-                        "SSIM/PSNR fallback produced incomplete metric output"
+                        f"sampled SSIM/PSNR output is incomplete for {label}"
                     )
-                atomic_write_json(
-                    metrics,
-                    {
-                        "schema_version": 1,
-                        "backend": "ffmpeg-ssim-psnr",
-                        "ssim_stats": {
-                            "path": fallback.name,
-                            "sha256": sha256_file(fallback),
-                        },
-                        "psnr_stats": {
-                            "path": psnr_fallback.name,
-                            "sha256": sha256_file(psnr_fallback),
-                        },
-                    },
+                _write_stage(
+                    sample_metric_marker,
+                    sample_metric_inputs,
+                    [ssim_stats, psnr_stats],
                 )
-                metric_sidecars = [fallback, psnr_fallback]
-            _write_stage(metrics_marker, metrics_inputs, [metrics, *metric_sidecars])
-        manifest["metrics"] = {"path": metrics.name, "sha256": sha256_file(metrics)}
+            metric_sidecars.extend((ssim_stats, psnr_stats))
+            metric_samples.append(
+                {
+                    "category": pair.category,
+                    "presentation_index": pair.presentation_index,
+                    "reference_png": reference_png.name,
+                    "encode_png": encoded_png.name,
+                    "ssim_all": self._metric_stat(ssim_stats, "All"),
+                    "psnr_average_db": self._metric_stat(psnr_stats, "psnr_avg"),
+                    "ssim_stats": {
+                        "path": ssim_stats.name,
+                        "sha256": sha256_file(ssim_stats),
+                    },
+                    "psnr_stats": {
+                        "path": psnr_stats.name,
+                        "sha256": sha256_file(psnr_stats),
+                    },
+                }
+            )
+            self.database.record_progress(
+                job.id,
+                0.94 + (0.035 * number / len(pairs)),
+                message=f"fast comparison: pair {number}/{len(pairs)} complete",
+                expected_state=JobState.COMPARISON,
+                emit_event=number == len(pairs),
+            )
+
+        # Include Python-side validation, hashing and manifest finalization in
+        # the same operator-visible wall-clock budget as the subprocesses.
+        remaining_timeout(300)
+        finite_ssim = [
+            item["ssim_all"]
+            for item in metric_samples
+            if isinstance(item["ssim_all"], float)
+        ]
+        finite_psnr = [
+            item["psnr_average_db"]
+            for item in metric_samples
+            if isinstance(item["psnr_average_db"], float)
+        ]
+        metrics = paths.comparison / "video-metrics.json"
+        metric_document = {
+            "schema_version": 2,
+            "backend": "ffmpeg-sampled-ssim-psnr",
+            "scope": "selected_ipb_native_png_pairs",
+            "full_title_measurement": False,
+            "sample_count": len(metric_samples),
+            "aggregate": {
+                "ssim_all_mean": (
+                    sum(finite_ssim) / len(finite_ssim) if finite_ssim else None
+                ),
+                "psnr_average_db_mean": (
+                    sum(finite_psnr) / len(finite_psnr) if finite_psnr else None
+                ),
+            },
+            "samples": metric_samples,
+        }
+        atomic_write_json(metrics, metric_document)
+        _write_stage(
+            paths.stages / "comparison-sampled-metrics-v2.json",
+            {
+                "pairs": [item.to_dict() for item in pairs],
+                "backend": metric_document["backend"],
+            },
+            [metrics, *metric_sidecars],
+        )
+        manifest["metrics"] = {
+            "path": metrics.name,
+            "sha256": sha256_file(metrics),
+            "backend": metric_document["backend"],
+            "scope": metric_document["scope"],
+            "sample_count": metric_document["sample_count"],
+            "full_title_measurement": metric_document["full_title_measurement"],
+            "aggregate": metric_document["aggregate"],
+        }
         manifest_path = paths.comparison / "video-comparison.json"
         atomic_write_json(manifest_path, manifest)
         _current_comparison_pngs(paths, prune=True)
+        allowed_metric_names = {path.name for path in metric_sidecars}
+        for stale_metric in (
+            *paths.comparison.glob("*.ssim.log"),
+            *paths.comparison.glob("*.psnr.log"),
+        ):
+            if stale_metric.name not in allowed_metric_names:
+                stale_metric.unlink(missing_ok=True)
         comparison_outputs = [manifest_path, metrics, *metric_sidecars, *pngs]
         _write_stage(
             paths.stages / "comparison.json",
             {
                 "pairs": [item.to_dict() for item in pairs],
-                "per_type": self.settings.comparison_frames_per_type,
+                "pair_count": self.settings.comparison_pair_count,
+                "sampling_schema_version": 2,
                 "hdr": hdr,
             },
             comparison_outputs,
@@ -2660,8 +2953,33 @@ class PipelineWorker:
                 png.name,
                 mime_type="image/png",
             )
+
+        # Scratch from the former full-title implementation must never be
+        # copied into the completed comparison sidecars. New bounded probe JSON
+        # is also disposable once the durable manifest/checkpoint exists.
+        for scratch in (
+            paths.comparison / "encoded-frames.json",
+            paths.comparison / "source-frames.json",
+            encoded_origin_path,
+            encoded_probe,
+            paths.comparison / "sampled-source-origin.json",
+            paths.comparison / "sampled-source-frames.json",
+        ):
+            scratch.unlink(missing_ok=True)
+        legacy_stage_markers = [
+            paths.stages / "comparison-frame-probe.json",
+            paths.stages / "comparison-source-frame-probe.json",
+            paths.stages / "comparison-metrics.json",
+            *paths.stages.glob("comparison-*-native.json"),
+            *paths.stages.glob("comparison-*-sdr.json"),
+        ]
+        for legacy_marker in legacy_stage_markers:
+            legacy_marker.unlink(missing_ok=True)
+        remaining_timeout(300)
         self.queue.advance(
-            job.id, JobState.UPLOADING, message="I/P/B comparison complete"
+            job.id,
+            JobState.UPLOADING,
+            message=f"{len(pairs)} sampled I/P/B comparison pairs complete",
         )
 
     def _upload_and_finalize(self, job: Job, paths: JobPaths) -> None:

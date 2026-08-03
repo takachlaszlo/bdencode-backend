@@ -74,6 +74,17 @@ export function ComparisonPanel({ artifacts }: { artifacts: Artifact[] }) {
           <div><span className="section-heading__icon"><Images size={19} /></span><div><h2>Videó-összehasonlítás</h2><p>Azonos presentation index, külön source/encode PTS, veszteségmentes PNG</p></div></div>
           {video.data && <div className="frame-counts">{["I", "P", "B"].map((type) => <Badge key={type}>{type}: {video.data?.counts[type] ?? 0}</Badge>)}</div>}
         </div>
+        {video.data?.metrics?.aggregate && (
+          <Card className="video-metrics-card">
+            <div className="section-heading">
+              <div><span className="section-heading__icon"><Eye size={18} /></span><div><h3>Mintavételezett képmetrikák</h3><p>{video.data.metrics.sample_count ?? video.data.pairs.length} lossless PNG-pár átlaga · nem teljes filmes mérés</p></div></div>
+              <div className="frame-counts">
+                <Badge tone="info">SSIM: {formatMetric(video.data.metrics.aggregate.ssim_all_mean, 6)}</Badge>
+                <Badge tone="info">PSNR: {formatMetric(video.data.metrics.aggregate.psnr_average_db_mean, 2, " dB")}</Badge>
+              </div>
+            </div>
+          </Card>
+        )}
         {video.isLoading ? <LoadingPanel label="Videó comparison betöltése…" /> : video.isError ? <Notice tone="danger">A videó comparison manifestje nem olvasható.</Notice> : (
           <div className="frame-pair-grid">
             {video.data?.pairs.map((pair, index) => (
@@ -124,9 +135,13 @@ function FramePairCard({ pair, images }: { pair: VideoComparisonPair; images: Ma
         <div>
           <Badge tone={pair.category === "I" ? "success" : pair.category === "P" ? "info" : "warning"}>{pair.category}-frame</Badge>
           <span>#{pair.presentation_index} · Source PTS {String(pair.reference_pts_seconds)} · Encode PTS {String(pair.encoded_pts_seconds)}</span>
-          <Badge tone={pair.dual_type_match ? "success" : "danger"}>
-            {pair.source_pict_type ?? "?"} ↔ {pair.encoded_pict_type}{pair.dual_type_match ? " · azonos típus" : " · eltérő típus"}
-          </Badge>
+          {pair.source_pict_type === null ? (
+            <Badge tone="neutral">Source képtípus nem értelmezhető · azonos frame</Badge>
+          ) : (
+            <Badge tone={pair.dual_type_match ? "success" : "danger"}>
+              {pair.source_pict_type} ↔ {pair.encoded_pict_type}{pair.dual_type_match ? " · azonos típus" : " · eltérő típus"}
+            </Badge>
+          )}
         </div>
         <div className="compare-mode" role="group" aria-label="Összehasonlítási mód">
           {(["slider", "side", "blink", "difference"] as CompareMode[]).map((value) => (
@@ -159,6 +174,12 @@ function FramePairCard({ pair, images }: { pair: VideoComparisonPair; images: Ma
       </div>
     </Card>
   );
+}
+
+function formatMetric(value: number | null | undefined, digits: number, suffix = ""): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value.toFixed(digits)}${suffix}`
+    : "—";
 }
 
 function AudioTrackComparison({ track, images }: { track: AudioComparisonTrack; images: Map<string, Artifact> }) {

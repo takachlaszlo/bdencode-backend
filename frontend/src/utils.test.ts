@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { makeJob } from "./test/fixtures";
-import { formatEventMessage, formatStatusMessage, formatWorkerError, stageProgress } from "./utils";
+import { formatEventMessage, formatStatusMessage, formatWorkerError, isFastComparisonTimeoutReview, stageProgress } from "./utils";
 
 describe("formatEventMessage", () => {
   it("localizes historical worker messages", () => {
@@ -37,6 +37,16 @@ describe("formatEventMessage", () => {
     expect(formatWorkerError(failure)).toMatch(/spektrumképének elkészítése/i);
     expect(formatStatusMessage(failure, "Állapotfrissítésre vár"))
       .toMatch(/QC szakasztól biztonságosan folytatható/i);
+  });
+
+  it("localizes fast comparison progress and recognizes its resumable timeout", () => {
+    expect(formatStatusMessage("fast comparison: preparing bounded samples", ""))
+      .toBe("Gyors comparison: a rövid videóminták előkészítése");
+    expect(formatStatusMessage("fast comparison: pair 3/5 complete", ""))
+      .toBe("Gyors comparison: 3/5 képpár elkészült");
+    const timeout = "fast comparison exceeded its bounded command/time budget";
+    expect(isFastComparisonTimeoutReview(timeout)).toBe(true);
+    expect(formatStatusMessage(timeout, "")).toMatch(/ötperces időkorlátot/i);
   });
 
   it("uses backend pipeline baselines for legacy jobs without progress", () => {

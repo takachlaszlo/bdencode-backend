@@ -438,6 +438,7 @@ env \
     -u BDENCODE_BIND_PORT \
     -u BDENCODE_API_ROOT_PATH \
     -u BDENCODE_WORKER_POLL_SECONDS \
+    -u BDENCODE_COMPARISON_PAIR_COUNT \
     -u BDENCODE_COMPARISON_FRAMES_PER_TYPE \
     -u BDENCODE_LOG_LEVEL \
     "$release_root/venv/bin/python" -m pytest -q "$repo_root/tests"

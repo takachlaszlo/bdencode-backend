@@ -14,8 +14,8 @@ Tartós Blu-ray/UHD Blu-ray kódoló rendszer x264/x265 kimenethez, headless bac
 - egyszerre pontosan egy teljes pipeline, SQLite WAL állapottal és reboot utáni folytatással;
 - frame-pontos VapourSynth + BestSource referencia, FFmpeg/x264/x265 encode;
 - kötelező I/P/B videopárok ugyanazon presentation index/PTS alapján;
-- progresszív forrásnál alapból az eredeti és a kész bitstream I/P/B típusa is egyezik;
-- hivatalos standalone VMAF + PSNR/SSIM, privát FIFO-kon keresztül, nagy nyers köztes fájlok nélkül;
+- progresszív forrásnál az eredeti és a kész bitstream I/P/B típusa kötelezően egyezik;
+- gyors, rövid időablakokra korlátozott I/P/B mintavétel, alapból öt lossless PNG-párral és a kiválasztott képeken számolt SSIM/PSNR metrikával; teljes filmes VMAF-menet nélkül;
 - lossless PNG, HDR-native 16 bites és determinisztikus SDR proof;
 - teljes dekódolási QC, MediaInfo/MKVInfo, végső MKV codec/profile/szín/HDR10 hard gate, audio PCM/sample/delay/layout/loudness/phase/spektrum;
 - ImgBB feltöltés byteazonos visszaellenőrzéssel és BBCode-generálással;
@@ -145,6 +145,12 @@ Fontos API-k:
 - `GET /api/v1/analyze-mkv?path=...`
 
 A job először lemezscanre kerül. Több playlist/edition vagy bizonytalan sáv esetén `AWAITING_SELECTION` / `NEEDS_REVIEW` állapotban blokkolja a sort; a javított selection ugyanazon endpointon újraküldhető, és biztonsági okból a pipeline `READY` állapottól újraellenőriz mindent. A következő encode csak a teljes QC, comparison és feltöltés lezárása után indulhat.
+
+## Gyors videó-comparison
+
+A comparison nem pásztázza végig képkockánként a teljes source-ot és a kész MKV-t. Rövid, korlátozott probe-ablakokból választ időben elosztott I-, P- és B-frame-eket, majd az azonos presentation indexű reference/encode képeket veszteségmentes PNG-ként menti. Alapértelmezésben összesen öt képpár készül; a `comparison_pair_count` értéke 3 és 5 között állítható. Mindhárom képtípusból legalább egy pár kötelező.
+
+Az SSIM és PSNR kizárólag ezeken a kiválasztott PNG-párokon fut, ezért nincs többórás teljes filmes VMAF vagy teljes fájlos SSIM/PSNR menet. A videó-comparison teljes szerveroldali időkerete öt perc; túllépéskor kontrollált ellenőrzést kér, nem folytat korlátlan háttérmunkát. A régi `comparison_frames_per_type` konfigurációs kulcsot a betöltő visszafelé kompatibilitásból továbbra is elfogadja, de az új comparison már nem használja.
 
 ## CPU-korlát
 

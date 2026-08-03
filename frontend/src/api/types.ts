@@ -422,6 +422,25 @@ export interface VideoComparisonManifest {
   alignment: string;
   pairs: VideoComparisonPair[];
   counts: Record<string, number>;
+  source_bitstream_type_available?: boolean;
+  sampling?: {
+    requested_pair_count?: number;
+    selected_pair_count?: number;
+    full_title_scan?: boolean;
+    [key: string]: unknown;
+  };
+  metrics?: {
+    path?: string;
+    sha256?: string;
+    backend?: string;
+    scope?: string;
+    sample_count?: number;
+    full_title_measurement?: boolean;
+    aggregate?: {
+      ssim_all_mean?: number | null;
+      psnr_average_db_mean?: number | null;
+    };
+  };
 }
 
 export interface AudioComparisonTrack {
