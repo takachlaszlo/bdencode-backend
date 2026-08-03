@@ -26,6 +26,7 @@ import type {
   DetailLevel,
   DiscScanResult,
   FieldSpec,
+  ImageUploadProvider,
   Job,
   MediaStream,
   Playlist,
@@ -61,6 +62,19 @@ const GROUP_LABELS: Record<string, string> = {
   bitstream: "Bitstream",
   x265: "x265-specifikus",
 };
+
+const IMAGE_UPLOAD_PROVIDER_LABELS: Record<ImageUploadProvider, string> = {
+  auto: "Automatikus: ImgBB → Catbox → Freeimage",
+  imgbb: "Csak ImgBB",
+  catbox: "Csak Catbox",
+  freeimage: "Csak Freeimage",
+};
+
+function imageUploadProvider(value: unknown): ImageUploadProvider {
+  return value === "imgbb" || value === "catbox" || value === "freeimage"
+    ? value
+    : "auto";
+}
 
 const FIELD_LABELS: Record<string, string> = {
   encoder: "Kódoló",
@@ -218,6 +232,9 @@ export function SelectionWizard({
   const [uploadImages, setUploadImages] = useState(
     initial?.uploadImages ?? Boolean(job.settings.upload_images ?? true),
   );
+  const [selectedImageProvider, setSelectedImageProvider] = useState<ImageUploadProvider>(
+    initial?.imageUploadProvider ?? imageUploadProvider(job.settings.image_upload_provider),
+  );
   const [settings, setSettings] = useState<Record<string, unknown>>(initial?.settings ?? {});
   const [settingsSearch, setSettingsSearch] = useState("");
   const [validation, setValidation] = useState<SelectionValidation | null>(null);
@@ -264,8 +281,9 @@ export function SelectionWizard({
     },
     tracks,
     upload_images: uploadImages,
+    image_upload_provider: selectedImageProvider,
     dual_type_match: true,
-  }), [angle, crop, detailLevel, outputName, playlistId, settings, temporalFilter, tracks, uploadImages]);
+  }), [angle, crop, detailLevel, outputName, playlistId, selectedImageProvider, settings, temporalFilter, tracks, uploadImages]);
 
   const validate = useMutation({
     mutationFn: () => api.validateSelection(job.id, payload, job.version),
@@ -573,8 +591,15 @@ export function SelectionWizard({
 
             <div className="review-options">
               <label className="toggle-row">
-                <span><strong>ImgBB és BBCode</strong><small>Comparison PNG-k feltöltése a titkosított szerverkulccsal.</small></span>
+                <span><strong>Képfeltöltés és BBCode</strong><small>Automatikus módban a sorrend: ImgBB, Catbox, majd Freeimage; a sikeres szolgáltató az egész csomagra rögzül.</small></span>
                 <input type="checkbox" checked={uploadImages} onChange={(event) => { setUploadImages(event.target.checked); setValidation(null); }} /><span className="toggle" aria-hidden="true" />
+              </label>
+              <label className="field">
+                <span>Képtárhely</span>
+                <select aria-label="Képtárhely" value={selectedImageProvider} disabled={!uploadImages} onChange={(event) => { setSelectedImageProvider(event.target.value as ImageUploadProvider); setValidation(null); }}>
+                  {Object.entries(IMAGE_UPLOAD_PROVIDER_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+                <small>Automatikus módban csak az első sikeres kép előtt válthat szolgáltatót; kézi módban nincs failover.</small>
               </label>
               <label className="toggle-row">
                 <span><strong>Szigorú I/P/B típusazonosság · kötelező</strong><small>Progresszív forrásnál a source és az encode képtípusa mindig azonos; ez nem kapcsolható ki.</small></span>

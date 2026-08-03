@@ -55,6 +55,13 @@ function latestSuccessfulScan(scans: Scan[]): Scan | undefined {
   return scans.find((scan) => ["AWAITING_SELECTION", "COMPLETED"].includes(scan.status));
 }
 
+function imageUploadLabel(value: string | null): string {
+  if (value === "imgbb") return "Csak ImgBB";
+  if (value === "catbox") return "Csak Catbox";
+  if (value === "freeimage") return "Csak Freeimage";
+  return "Automatikus tartalékkal";
+}
+
 export function JobDetailPage() {
   const { jobId = "" } = useParams();
   const location = useLocation();
@@ -302,7 +309,7 @@ function SavedSelection({ job, scan }: { job: Job; scan: DiscScanResult | null }
       <Notice tone={isFastComparisonTimeoutReview(job.status_message) ? "info" : "success"} title={isFastComparisonTimeoutReview(job.status_message) ? "A jóváhagyott terv változatlan" : "A terv jóváhagyva"}>{isFastComparisonTimeoutReview(job.status_message) ? "A selection módosítása nem szükséges. A comparison az áttekintő lapon folytatható az érvényes checkpointoktól." : "Nincs külön indítógomb: a worker automatikusan folytatja az előkészítést és a kódolást. A comparison adatok külön mellékletek maradnak."}</Notice>
       <div className="saved-selection-grid">
         <Card><span className="eyebrow">Kép és kódoló</span><dl className="summary-list summary-list--stacked"><div><dt>Playlist</dt><dd>{selection.playlistId ?? "—"}</dd></div><div><dt>Kódoló</dt><dd>{scan?.disc_kind === "uhd" ? "x265" : "x264"}</dd></div><div><dt>Részletesség</dt><dd>{selection.detailLevel ?? "—"}</dd></div><div><dt>CRF</dt><dd>{String(settings.crf ?? "ajánlott")}</dd></div><div><dt>Preset</dt><dd>{String(settings.preset ?? "ajánlott")}</dd></div><div><dt>Filter</dt><dd>{selection.temporalFilter ?? "—"}</dd></div></dl></Card>
-        <Card><span className="eyebrow">Kimenet</span><dl className="summary-list summary-list--stacked"><div><dt>Fájlnév</dt><dd>{selection.outputName ? `${selection.outputName}.mkv` : "—"}</dd></div><div><dt>Sávok</dt><dd>{selection.tracks.filter((track) => track.action !== "omit").length} megtartva</dd></div><div><dt>ImgBB</dt><dd>{selection.uploadImages === null ? "—" : selection.uploadImages ? "Bekapcsolva" : "Kikapcsolva"}</dd></div><div><dt>I/P/B egyezés</dt><dd>{selection.dualTypeMatch === false ? "Kötelező · régi mentés felülbírálva" : "Kötelező"}</dd></div></dl></Card>
+        <Card><span className="eyebrow">Kimenet</span><dl className="summary-list summary-list--stacked"><div><dt>Fájlnév</dt><dd>{selection.outputName ? `${selection.outputName}.mkv` : "—"}</dd></div><div><dt>Sávok</dt><dd>{selection.tracks.filter((track) => track.action !== "omit").length} megtartva</dd></div><div><dt>Képfeltöltés</dt><dd>{selection.uploadImages === null ? "—" : selection.uploadImages ? imageUploadLabel(selection.imageUploadProvider) : "Kikapcsolva"}</dd></div><div><dt>I/P/B egyezés</dt><dd>{selection.dualTypeMatch === false ? "Kötelező · régi mentés felülbírálva" : "Kötelező"}</dd></div></dl></Card>
         <Card className="saved-json"><details><summary><Code2 size={17} /> Teljes selection JSON</summary><pre>{JSON.stringify(job.selection, null, 2)}</pre></details></Card>
       </div>
     </div>
@@ -316,12 +323,13 @@ function EventTimeline({ events, loading }: { events: EventRecord[]; loading: bo
 }
 
 function EventItem({ event, compact = false }: { event: EventRecord; compact?: boolean }) {
-  const isError = event.kind.toLowerCase().includes("error") || event.state_to === "FAILED";
+  const isError = event.kind.toLowerCase().includes("error") || event.state_to === "FAILED" || event.state_to === "UPLOAD_FAILED";
   const isSuccess = event.state_to === "COMPLETED";
+  const uploadDetail = typeof event.payload.detail === "string" ? event.payload.detail : null;
   return (
     <article className={isError ? "event-item event-item--error" : isSuccess ? "event-item event-item--success" : "event-item"}>
       <span className="event-item__marker">{isError ? <AlertTriangle size={15} /> : isSuccess ? <CheckCircle2 size={15} /> : <Info size={14} />}</span>
-      <div><div className="event-item__heading"><strong>{formatEventMessage(event.kind, event.message)}</strong><time>{formatDate(event.created_at)}</time></div>{event.state_from && event.state_to && <p>{STATE_LABELS[event.state_from]} → {STATE_LABELS[event.state_to]}</p>}{!compact && Object.keys(event.payload).length > 0 && <details><summary>Részletek</summary><pre>{JSON.stringify(event.payload, null, 2)}</pre></details>}</div>
+      <div><div className="event-item__heading"><strong>{formatEventMessage(event.kind, event.message)}</strong><time>{formatDate(event.created_at)}</time></div>{event.state_from && event.state_to && <p>{STATE_LABELS[event.state_from]} → {STATE_LABELS[event.state_to]}</p>}{compact && uploadDetail && <p>{uploadDetail}</p>}{!compact && Object.keys(event.payload).length > 0 && <details><summary>Részletek</summary><pre>{JSON.stringify(event.payload, null, 2)}</pre></details>}</div>
     </article>
   );
 }

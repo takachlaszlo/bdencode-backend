@@ -42,7 +42,9 @@ from bdencode.models import (
     ScanUpdate,
 )
 from bdencode.process import ProcessInterrupted
+from bdencode.qc.image_upload import ImageUploadError, UploadedImage
 from bdencode.queue import JobQueue
+from bdencode.utils import sha256_file
 from bdencode.worker import (
     JobPaths,
     PipelineWorker,
@@ -1200,12 +1202,418 @@ def test_missing_imgbb_credential_becomes_retryable_upload_failure(context):
 
     assert result.state is JobState.UPLOAD_FAILED
     assert result.error is None
+    failure = next(
+        event
+        for event in database.list_events(job_id=job.id, limit=1000)
+        if event.state_to is JobState.UPLOAD_FAILED
+    )
+    assert failure.payload["provider"] is None
+    assert failure.payload["detail"] == "image upload provider initialization failed"
     assert any(
         path.name.endswith("-reference.png")
         for path in worker.settings.job_root(job.id)
         .joinpath("comparison")
         .glob("*.png")
     )
+
+
+class _FakeUploadClient:
+    def __init__(
+        self,
+        provider_name: str,
+        *,
+        fail_on_call: int | None = None,
+        allow_fallback: bool = False,
+        provider_may_have_committed: bool = False,
+        failure_message: str | None = None,
+        on_call: Callable[[Path], None] | None = None,
+    ) -> None:
+        self.provider_name = provider_name
+        self.fail_on_call = fail_on_call
+        self.allow_fallback = allow_fallback
+        self.provider_may_have_committed = provider_may_have_committed
+        self.failure_message = failure_message
+        self.on_call = on_call
+        self.calls: list[str] = []
+
+    def upload_png(self, path: Path) -> UploadedImage:
+        self.calls.append(path.name)
+        if self.on_call is not None:
+            self.on_call(path)
+        if self.fail_on_call == len(self.calls):
+            raise ImageUploadError(
+                self.failure_message or f"{self.provider_name} test failure",
+                provider=self.provider_name,
+                allow_fallback=self.allow_fallback,
+                provider_may_have_committed=self.provider_may_have_committed,
+            )
+        digest = sha256_file(path)
+        image_url = f"https://{self.provider_name}.example/{path.name}"
+        return UploadedImage(
+            provider=self.provider_name,
+            image_url=image_url,
+            viewer_url=image_url,
+            local_sha256=digest,
+            remote_sha256=digest,
+            bbcode=f"[img]{image_url}[/img]",
+        )
+
+
+def _advance_to_uploading(
+    context, provider_factories, *, image_upload_provider: str = "auto"
+):
+    database, settings, scan, scanner, runner, _worker = context
+    worker = PipelineWorker(
+        database,
+        settings,
+        scanner_factory=lambda _settings: scanner,
+        runner_factory=lambda _paths: runner,
+        upload_client_factories=provider_factories,
+    )
+    job = _enqueue(database, scan.source)
+    current = JobQueue(database).claim_next()
+    assert current is not None
+    current = worker.process_one_stage(current)
+    assert current.state is JobState.AWAITING_SELECTION
+    current = database.set_selection(
+        job.id,
+        _selection(
+            upload_images=True,
+            image_upload_provider=image_upload_provider,
+        ),
+    )
+    while current.state is not JobState.UPLOADING:
+        current = worker.process_one_stage(current)
+    return worker, current, JobPaths.create(settings, job.id)
+
+
+def _read_upload_checkpoint(paths: JobPaths) -> dict[str, Any]:
+    return json.loads((paths.comparison / "uploads.json").read_text(encoding="utf-8"))
+
+
+def test_upload_falls_back_only_before_the_first_success(context):
+    primary = _FakeUploadClient("imgbb", fail_on_call=1, allow_fallback=True)
+    fallback = _FakeUploadClient("catbox")
+    unused = _FakeUploadClient("freeimage")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: primary, lambda: fallback, lambda: unused),
+    )
+    expected_names = {path.name for path in _current_comparison_pngs(paths)}
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.COMPLETED
+    assert len(primary.calls) == 1
+    assert set(fallback.calls) == expected_names
+    assert unused.calls == []
+    checkpoint = _read_upload_checkpoint(paths)
+    assert checkpoint["schema_version"] == 2
+    assert checkpoint["provider"] == "catbox"
+    assert set(checkpoint["images"]) == expected_names
+    assert {item["provider"] for item in checkpoint["images"].values()} == {"catbox"}
+
+
+def test_safe_fallback_atomically_advances_the_provisional_provider(context):
+    observed: list[str] = []
+
+    def observe_first_call(provider_name: str) -> Callable[[Path], None]:
+        def observe(_path: Path) -> None:
+            if provider_name in observed:
+                return
+            checkpoint = _read_upload_checkpoint(paths)
+            assert checkpoint == {
+                "schema_version": 2,
+                "provider": provider_name,
+                "provider_provisional": True,
+                "images": {},
+            }
+            observed.append(provider_name)
+
+        return observe
+
+    primary = _FakeUploadClient(
+        "imgbb",
+        fail_on_call=1,
+        allow_fallback=True,
+        on_call=observe_first_call("imgbb"),
+    )
+    fallback = _FakeUploadClient("catbox", on_call=observe_first_call("catbox"))
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: primary, lambda: fallback),
+    )
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.COMPLETED
+    assert observed == ["imgbb", "catbox"]
+    checkpoint = _read_upload_checkpoint(paths)
+    assert checkpoint["provider"] == "catbox"
+    assert "provider_provisional" not in checkpoint
+
+
+def test_all_safe_provider_failures_clear_the_provisional_pin(context):
+    primary = _FakeUploadClient("imgbb", fail_on_call=1, allow_fallback=True)
+    fallback = _FakeUploadClient("catbox", fail_on_call=1, allow_fallback=True)
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: primary, lambda: fallback),
+    )
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.UPLOAD_FAILED
+    assert primary.calls
+    assert fallback.calls
+    assert _read_upload_checkpoint(paths) == {
+        "schema_version": 2,
+        "images": {},
+    }
+
+
+def test_process_interruption_preserves_pre_dispatch_provider_pin(context):
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    observed_checkpoint: dict[str, Any] = {}
+
+    def interrupt_during_upload(_path: Path) -> None:
+        observed_checkpoint.update(_read_upload_checkpoint(paths))
+        raise SimulatedProcessExit
+
+    primary = _FakeUploadClient("imgbb", on_call=interrupt_during_upload)
+    fallback = _FakeUploadClient("catbox")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: primary, lambda: fallback),
+    )
+
+    with pytest.raises(SimulatedProcessExit):
+        worker.process_job(uploading)
+
+    assert observed_checkpoint == {
+        "schema_version": 2,
+        "provider": "imgbb",
+        "provider_provisional": True,
+        "images": {},
+    }
+    assert worker.database.get_job(uploading.id).state is JobState.UPLOADING
+
+    retry_primary = _FakeUploadClient("imgbb", fail_on_call=1, allow_fallback=True)
+    retry_fallback = _FakeUploadClient("catbox")
+    restarted = PipelineWorker(
+        worker.database,
+        worker.settings,
+        upload_client_factories=(
+            lambda: retry_primary,
+            lambda: retry_fallback,
+        ),
+    )
+
+    retried = restarted.process_job(worker.database.get_job(uploading.id))
+
+    assert retried.state is JobState.UPLOAD_FAILED
+    assert len(retry_primary.calls) == 1
+    assert retry_fallback.calls == []
+    assert _read_upload_checkpoint(paths) == observed_checkpoint
+
+
+def test_manual_image_provider_disables_fallback_and_skips_other_hosts(context):
+    primary = _FakeUploadClient("imgbb")
+    selected = _FakeUploadClient("catbox")
+    unused = _FakeUploadClient("freeimage")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: primary, lambda: selected, lambda: unused),
+        image_upload_provider="catbox",
+    )
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.COMPLETED
+    assert primary.calls == []
+    assert selected.calls
+    assert unused.calls == []
+    checkpoint = _read_upload_checkpoint(paths)
+    assert checkpoint["provider"] == "catbox"
+
+
+def test_first_success_locks_provider_across_failure_and_retry(context):
+    primary = _FakeUploadClient("imgbb", fail_on_call=2, allow_fallback=True)
+    fallback = _FakeUploadClient("catbox")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: primary, lambda: fallback),
+    )
+
+    failed = worker.process_job(uploading)
+
+    assert failed.state is JobState.UPLOAD_FAILED
+    assert len(primary.calls) == 2
+    assert fallback.calls == []
+    checkpoint = _read_upload_checkpoint(paths)
+    assert checkpoint["schema_version"] == 2
+    assert checkpoint["provider"] == "imgbb"
+    assert len(checkpoint["images"]) == 1
+    assert {item["provider"] for item in checkpoint["images"].values()} == {"imgbb"}
+
+    retry_primary = _FakeUploadClient("imgbb", fail_on_call=1, allow_fallback=True)
+    retry_fallback = _FakeUploadClient("catbox")
+    restarted = PipelineWorker(
+        worker.database,
+        worker.settings,
+        upload_client_factories=(
+            lambda: retry_primary,
+            lambda: retry_fallback,
+        ),
+    )
+    retrying = JobQueue(worker.database).retry_upload(failed.id)
+
+    retried = restarted.process_job(retrying)
+
+    assert retried.state is JobState.UPLOAD_FAILED
+    assert len(retry_primary.calls) == 1
+    assert retry_fallback.calls == []
+    assert _read_upload_checkpoint(paths) == checkpoint
+
+
+@pytest.mark.parametrize(
+    "failure_message",
+    (
+        "imgbb upload outcome is unknown",
+        "imgbb verification failed after upload",
+    ),
+)
+def test_unverified_commit_durably_pins_provider_across_retry(
+    context, failure_message: str
+):
+    primary = _FakeUploadClient(
+        "imgbb",
+        fail_on_call=1,
+        provider_may_have_committed=True,
+        failure_message=failure_message,
+    )
+    fallback = _FakeUploadClient("catbox")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: primary, lambda: fallback),
+    )
+
+    failed = worker.process_job(uploading)
+
+    assert failed.state is JobState.UPLOAD_FAILED
+    assert len(primary.calls) == 1
+    assert fallback.calls == []
+    checkpoint = _read_upload_checkpoint(paths)
+    assert checkpoint == {
+        "schema_version": 2,
+        "provider": "imgbb",
+        "images": {},
+    }
+
+    retry_primary = _FakeUploadClient("imgbb", fail_on_call=1, allow_fallback=True)
+    retry_fallback = _FakeUploadClient("catbox")
+    restarted = PipelineWorker(
+        worker.database,
+        worker.settings,
+        upload_client_factories=(
+            lambda: retry_primary,
+            lambda: retry_fallback,
+        ),
+    )
+    retrying = JobQueue(worker.database).retry_upload(failed.id)
+
+    retried = restarted.process_job(retrying)
+
+    assert retried.state is JobState.UPLOAD_FAILED
+    assert len(retry_primary.calls) == 1
+    assert retry_fallback.calls == []
+    assert _read_upload_checkpoint(paths) == checkpoint
+
+
+def test_schema_v1_upload_checkpoint_resumes_as_imgbb_without_mixing(context):
+    primary = _FakeUploadClient("imgbb")
+    fallback = _FakeUploadClient("catbox")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: primary, lambda: fallback),
+    )
+    pngs = _current_comparison_pngs(paths)
+    first = pngs[0]
+    digest = sha256_file(first)
+    legacy_url = f"https://legacy-imgbb.example/{first.name}"
+    legacy_item = {
+        "image_url": legacy_url,
+        "viewer_url": legacy_url,
+        "local_sha256": digest,
+        "remote_sha256": digest,
+        "bbcode": f"[img]{legacy_url}[/img]",
+    }
+    (paths.comparison / "uploads.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "images": {first.name: legacy_item},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.COMPLETED
+    assert first.name not in primary.calls
+    assert set(primary.calls) == {path.name for path in pngs[1:]}
+    assert fallback.calls == []
+    checkpoint = _read_upload_checkpoint(paths)
+    assert checkpoint["schema_version"] == 2
+    assert checkpoint["provider"] == "imgbb"
+    migrated_legacy = checkpoint["images"][first.name]
+    assert migrated_legacy["provider"] == "imgbb"
+    assert {
+        key: value for key, value in migrated_legacy.items() if key != "provider"
+    } == legacy_item
+    assert set(checkpoint["images"]) == {path.name for path in pngs}
+
+
+def test_mixed_provider_checkpoint_requires_review_before_any_upload(context):
+    primary = _FakeUploadClient("imgbb")
+    fallback = _FakeUploadClient("catbox")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: primary, lambda: fallback),
+    )
+    pngs = _current_comparison_pngs(paths)
+    mixed: dict[str, dict[str, str]] = {}
+    for path, provider in zip(pngs[:2], ("imgbb", "catbox"), strict=True):
+        digest = sha256_file(path)
+        image_url = f"https://{provider}.example/{path.name}"
+        mixed[path.name] = {
+            "provider": provider,
+            "image_url": image_url,
+            "viewer_url": image_url,
+            "local_sha256": digest,
+            "remote_sha256": digest,
+            "bbcode": f"[img]{image_url}[/img]",
+        }
+    (paths.comparison / "uploads.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "provider": "imgbb",
+                "images": mixed,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert "mixes image providers" in (result.status_message or "")
+    assert primary.calls == []
+    assert fallback.calls == []
 
 
 def test_parse_selection_rejects_path_traversal(context):

@@ -13,6 +13,7 @@ describe("normalizeStoredSelection", () => {
       settings: {},
       tracks: [],
       uploadImages: null,
+      imageUploadProvider: null,
       dualTypeMatch: null,
     });
   });
@@ -38,6 +39,7 @@ describe("normalizeStoredSelection", () => {
         order: 0,
       }],
       upload_images: false,
+      image_upload_provider: "catbox",
       dual_type_match: true,
     })).toEqual({
       playlistId: "00001",
@@ -57,6 +59,7 @@ describe("normalizeStoredSelection", () => {
         order: 0,
       }],
       uploadImages: false,
+      imageUploadProvider: "catbox",
       dualTypeMatch: true,
     });
   });

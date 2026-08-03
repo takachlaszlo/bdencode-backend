@@ -10,8 +10,10 @@ if [[ "$(id -u)" -eq 0 ]]; then
 fi
 
 task_user="$(id -un)"
+task_uid="$(id -u)"
 task_group="$(id -gn)"
 task_home="$(getent passwd "$task_user" | cut -d: -f6)"
+credential_directory="$task_home/.config/bdencode"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 install_transaction_source="$repo_root/install/install_transaction.py"
 installer_apt_lock=/run/lock/bdencode-installer-apt.lock
@@ -33,6 +35,26 @@ if [[ ! "$cpu_percent" =~ ^[0-9]+$ ]] || ((cpu_percent < 1 || cpu_percent > 100)
     exit 2
 fi
 cpu_quota="$((logical_cpus * cpu_percent))%"
+
+assert_path_components_without_symlinks() {
+    local candidate="$1"
+    local component current=/
+    local -a components
+    if [[ "$candidate" != /* ]]; then
+        echo "Credential directory must be absolute: $candidate" >&2
+        return 1
+    fi
+    IFS=/ read -r -a components <<<"${candidate#/}"
+    for component in "${components[@]}"; do
+        [[ -n "$component" ]] || continue
+        current="${current%/}/$component"
+        if [[ -L "$current" ]]; then
+            echo "Credential path may not contain symlinks: $current" >&2
+            return 1
+        fi
+        [[ -e "$current" ]] || break
+    done
+}
 
 unit_should_run() {
     local active_state
@@ -144,7 +166,14 @@ install -d -m 0750 \
     "$data_root/state/overrides" "$data_root/jobs" "$data_root/completed" \
     "$data_root/cache" "$data_root/cache/build" "$data_root/updates" "$app_root/releases" \
     "$app_root/tools/releases"
-install -d -m 0700 "$task_home/.config/bdencode"
+assert_path_components_without_symlinks "$credential_directory"
+install -d -m 0700 "$credential_directory"
+if [[ ! -d "$credential_directory" || -L "$credential_directory" || \
+    "$(stat -c %u -- "$credential_directory")" != "$task_uid" || \
+    "$(stat -c %a -- "$credential_directory")" != 700 ]]; then
+    echo "Credential directory must be owned by $task_user with mode 0700" >&2
+    exit 2
+fi
 
 exec 9>"$data_root/state/deployment.lock"
 flock -x 9
@@ -247,23 +276,25 @@ wait_for_api() {
 }
 
 queue_is_install_safe() {
-    local queue_command queue_help queue_output queue_status legacy_cli
+    local queue_command queue_help queue_output queue_status safe_pause_cli
     local -a queue_args
     queue_command="$app_root/current/venv/bin/bdencode"
-    legacy_cli=1
+    safe_pause_cli=0
 
-    # The first deployment of --allow-review necessarily invokes a previous
-    # release which does not know the option yet. Detect support without opening
-    # the database, then keep the compatibility path fail-closed and restricted
-    # to the old CLI's exact AWAITING_SELECTION busy result.
+    # The first deployment of the install-safe pause flag necessarily invokes
+    # a previous release. Detect support without opening the database, then keep
+    # the compatibility path fail-closed and restricted to exact durable pause
+    # results from the old CLI.
     if ! queue_help="$("$queue_command" queue-idle --help 2>&1)"; then
         echo "Unable to inspect the installed queue-idle command" >&2
         return 1
     fi
     queue_args=(queue-idle)
-    if [[ "$queue_help" == *"--allow-review"* ]]; then
+    if [[ "$queue_help" == *"--allow-install-safe-pause"* ]]; then
+        queue_args+=(--allow-install-safe-pause)
+        safe_pause_cli=1
+    elif [[ "$queue_help" == *"--allow-review"* ]]; then
         queue_args+=(--allow-review)
-        legacy_cli=0
     fi
 
     queue_status=0
@@ -281,9 +312,9 @@ queue_is_install_safe() {
     if [[ "$queue_status" -eq 0 ]]; then
         return 0
     fi
-    if [[ "$legacy_cli" -eq 1 && "$queue_status" -eq 3 && \
-        "$queue_output" =~ ^busy:\ [^[:space:]]+\ AWAITING_SELECTION$ ]]; then
-        echo "Legacy queue gate accepted the persisted AWAITING_SELECTION pause" >&2
+    if [[ "$safe_pause_cli" -eq 0 && "$queue_status" -eq 3 && \
+        "$queue_output" =~ ^busy:\ [^[:space:]]+\ (AWAITING_SELECTION|UPLOAD_FAILED)$ ]]; then
+        echo "Legacy queue gate accepted the persisted install-safe pause" >&2
         return 0
     fi
     return "$queue_status"
@@ -555,6 +586,44 @@ atomic_root_install "$repo_root/deploy/systemd/bdencode-update.timer" \
     /etc/systemd/system/bdencode-update.timer 0644
 atomic_root_install "$repo_root/install/daily-update.sh" \
     /usr/local/libexec/bdencode-daily-update 0755
+
+credential_target=/etc/systemd/system/bdencode-worker.service.d/credential.conf
+credential_new="${credential_target}.new-${release_id}"
+credential_count=0
+credential_names=(imgbb-api-key catbox-userhash freeimage-api-key)
+sudo install -d -m 0755 /etc/systemd/system/bdencode-worker.service.d
+printf '[Service]\n' | sudo tee "$credential_new" >/dev/null
+for credential_name in "${credential_names[@]}"; do
+    credential_path="$credential_directory/${credential_name}.cred"
+    if [[ ! -e "$credential_path" && ! -L "$credential_path" ]]; then
+        continue
+    fi
+    if [[ -L "$credential_path" || ! -f "$credential_path" || ! -s "$credential_path" ]]; then
+        echo "Invalid encrypted credential file: $credential_path" >&2
+        exit 2
+    fi
+    if [[ "$(stat -c %u -- "$credential_path")" != "$task_uid" || \
+        "$(stat -c %a -- "$credential_path")" != 600 ]]; then
+        echo "Credential must be owned by $task_user with mode 0600: $credential_path" >&2
+        exit 2
+    fi
+    sudo systemd-creds decrypt \
+        --name="$credential_name" "$credential_path" /dev/null
+    printf 'LoadCredentialEncrypted=%s:%s\n' \
+        "$credential_name" "$credential_path" \
+        | sudo tee -a "$credential_new" >/dev/null
+    credential_count=$((credential_count + 1))
+done
+if [[ "$credential_count" -gt 0 ]]; then
+    sudo chmod 0644 "$credential_new"
+    sudo sync -f "$credential_new"
+    sudo mv -Tf "$credential_new" "$credential_target"
+    sudo sync -f "$(dirname "$credential_target")"
+else
+    sudo rm -f "$credential_new" "$credential_target"
+    sudo sync -f "$(dirname "$credential_target")"
+fi
+
 sudo systemd-analyze verify \
     /etc/systemd/system/bdencode-api.service \
     /etc/systemd/system/bdencode-worker.service \
@@ -564,17 +633,6 @@ sudo systemd-analyze verify \
     /etc/systemd/system/bdencode-install-recovery.path \
     /etc/systemd/system/bdencode-update.timer \
     apt-daily.service apt-daily-upgrade.service
-
-credential="$task_home/.config/bdencode/imgbb-api-key.cred"
-sudo install -d -m 0755 /etc/systemd/system/bdencode-worker.service.d
-if [[ -s "$credential" ]]; then
-    sudo systemd-creds decrypt --name=imgbb-api-key "$credential" /dev/null
-    printf '[Service]\nLoadCredentialEncrypted=imgbb-api-key:%s\n' "$credential" \
-        | sudo tee /etc/systemd/system/bdencode-worker.service.d/credential.conf >/dev/null
-    sudo chmod 0644 /etc/systemd/system/bdencode-worker.service.d/credential.conf
-else
-    sudo rm -f /etc/systemd/system/bdencode-worker.service.d/credential.conf
-fi
 
 if [[ -d /etc/nginx/apps && -f /etc/htpasswd ]]; then
     nginx_target=/etc/nginx/apps/bdencode.conf

@@ -27,6 +27,23 @@ def test_argv_redaction_handles_single_argument_authorization_and_urls() -> None
     assert "<redacted>" in joined
 
 
+def test_userhash_and_credential_markers_are_redacted() -> None:
+    value = sanitize_text(
+        "userhash=account-value\ncredential: encrypted-value"
+    )
+    redacted = " ".join(
+        redact_argv(
+            [
+                "--userhash=account-value",
+                "https://example.invalid/?userhash=account-value",
+            ]
+        )
+    )
+    assert "account-value" not in value
+    assert "encrypted-value" not in value
+    assert "account-value" not in redacted
+
+
 def test_build_attachable_log_has_sections_without_secret(tmp_path: Path) -> None:
     raw = tmp_path / "raw.log"
     raw.write_text("command --token top-secret\n", encoding="utf-8")

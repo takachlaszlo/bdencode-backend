@@ -18,6 +18,7 @@ export type DiscType = "AUTO" | "BD" | "UHD";
 export type ContentType = "FILM" | "CONCERT" | "ANIME" | "SERIES";
 export type DetailLevel = "beginner" | "advanced" | "pro";
 export type TrackAction = "copy" | "flac" | "omit";
+export type ImageUploadProvider = "auto" | "imgbb" | "catbox" | "freeimage";
 
 export interface HealthResponse {
   status: string;
@@ -122,6 +123,18 @@ export interface RuntimeCapabilitiesResponse {
     permissions_ok?: boolean;
     [key: string]: unknown;
   };
+  image_upload_credentials?: Record<string, {
+    configured?: boolean;
+    present?: boolean;
+    runtime_loaded?: boolean;
+    encrypted_at_rest?: boolean;
+    source?: "systemd-runtime" | "encrypted-file";
+    permissions?: string;
+    permissions_ok?: boolean;
+    owner_ok?: boolean;
+    metadata_ok?: boolean;
+    [key: string]: unknown;
+  }>;
   worker_cpu_policy?: {
     requested_percent?: number;
     logical_cpus?: number | null;
@@ -385,6 +398,7 @@ export interface SelectionPayload {
   };
   tracks: TrackSelection[];
   upload_images: boolean;
+  image_upload_provider: ImageUploadProvider;
   dual_type_match: boolean;
 }
 

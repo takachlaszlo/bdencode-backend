@@ -9,8 +9,10 @@ from typing import Iterable, Mapping, Sequence
 
 _SENSITIVE_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?\S+"),
-    re.compile(r"(?i)((?:api[_-]?key|token|password|secret)\s*[:=]\s*)\S+"),
-    re.compile(r"(?i)([?&](?:key|token)=)[^&\s]+"),
+    re.compile(
+        r"(?i)((?:api[_-]?key|token|password|secret|userhash|credential)\s*[:=]\s*)\S+"
+    ),
+    re.compile(r"(?i)([?&](?:key|token|userhash)=)[^&\s]+"),
 )
 
 

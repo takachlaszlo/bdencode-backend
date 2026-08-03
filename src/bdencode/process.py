@@ -16,7 +16,16 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 
-SECRET_MARKERS = ("api_key", "apikey", "authorization", "token", "password", "secret")
+SECRET_MARKERS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "token",
+    "password",
+    "secret",
+    "userhash",
+    "credential",
+)
 LOG = logging.getLogger(__name__)
 
 
@@ -79,10 +88,12 @@ def redact_argv(argv: Sequence[str]) -> list[str]:
             else:
                 redacted.append(item)
                 hide_next = True
-        elif re.search(r"(?i)([?&](?:key|token|api[_-]?key)=)[^&\s]+", item):
+        elif re.search(
+            r"(?i)([?&](?:key|token|userhash|api[_-]?key)=)[^&\s]+", item
+        ):
             redacted.append(
                 re.sub(
-                    r"(?i)([?&](?:key|token|api[_-]?key)=)[^&\s]+",
+                    r"(?i)([?&](?:key|token|userhash|api[_-]?key)=)[^&\s]+",
                     r"\1<redacted>",
                     item,
                 )

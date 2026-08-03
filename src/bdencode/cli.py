@@ -17,7 +17,9 @@ from .db import Database
 from .models import JobState
 
 
-INSTALL_SAFE_OPERATOR_PAUSES = frozenset({JobState.AWAITING_SELECTION})
+INSTALL_SAFE_OPERATOR_PAUSES = frozenset(
+    {JobState.AWAITING_SELECTION, JobState.UPLOAD_FAILED}
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "also succeed only for AWAITING_SELECTION; NEEDS_REVIEW and all "
             "runnable pipeline states remain busy"
+        ),
+    )
+    queue_idle.add_argument(
+        "--allow-install-safe-pause",
+        action="store_true",
+        help=(
+            "also succeed for durable AWAITING_SELECTION or UPLOAD_FAILED "
+            "operator pauses; runnable and review states remain busy"
         ),
     )
     return parser
@@ -208,7 +218,13 @@ def _queue_idle(args: argparse.Namespace) -> int:
     database.initialize()
     active = database.active_job()
     if active is not None:
-        if args.allow_review and active.state in INSTALL_SAFE_OPERATOR_PAUSES:
+        allow_pause = (
+            args.allow_install_safe_pause
+            and active.state in INSTALL_SAFE_OPERATOR_PAUSES
+        ) or (
+            args.allow_review and active.state is JobState.AWAITING_SELECTION
+        )
+        if allow_pause:
             print(f"operator-pause: {active.id} {active.state.value}")
             return 0
         print(f"busy: {active.id} {active.state.value}", file=sys.stderr)

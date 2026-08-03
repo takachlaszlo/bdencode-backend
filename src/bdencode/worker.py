@@ -110,7 +110,10 @@ from .qc.audio import (
     spectrum_command,
     spectrum_stitch_command,
 )
-from .qc.imgbb import ImageUploadError, ImgBBClient
+from .qc.catbox import CatboxClient
+from .qc.freeimage import FreeimageClient
+from .qc.image_upload import ImageUploadClient, ImageUploadError
+from .qc.imgbb import ImgBBClient
 from .qc.video import (
     FrameRecord,
     FrameSelectionError,
@@ -158,6 +161,7 @@ _SELECTION_KEYS = {
     "tracks",
     "output_name",
     "upload_images",
+    "image_upload_provider",
     "dual_type_match",
 }
 _HASH_CACHE: dict[tuple[str, int, int, int, int, int], str] = {}
@@ -322,6 +326,7 @@ class ParsedSelection:
     tracks: tuple[TrackSelection, ...]
     output_name: str
     upload_images: bool
+    image_upload_provider: str
     dual_type_match: bool = False
 
 
@@ -1090,6 +1095,11 @@ def parse_selection(job: Job, scan: DiscScan) -> ParsedSelection:
         raise ReviewRequired("output_name contains unsafe characters")
     if not isinstance(raw["upload_images"], bool):
         raise ReviewRequired("upload_images must be boolean")
+    image_upload_provider = str(raw.get("image_upload_provider", "auto")).lower()
+    if image_upload_provider not in {"auto", "imgbb", "catbox", "freeimage"}:
+        raise ReviewRequired(
+            "image_upload_provider must be auto, imgbb, catbox or freeimage"
+        )
     dual_type = raw.get("dual_type_match", True)
     if not isinstance(dual_type, bool):
         raise ReviewRequired("dual_type_match must be boolean")
@@ -1102,6 +1112,7 @@ def parse_selection(job: Job, scan: DiscScan) -> ParsedSelection:
         tracks=tuple(tracks),
         output_name=output_name,
         upload_images=raw["upload_images"],
+        image_upload_provider=image_upload_provider,
         dual_type_match=dual_type,
     )
 
@@ -1130,7 +1141,9 @@ class PipelineWorker:
         *,
         scanner_factory: Callable[[Settings], BluRayScanner] | None = None,
         runner_factory: Callable[[JobPaths], Runner] | None = None,
-        upload_client_factory: Callable[[], ImgBBClient] | None = None,
+        upload_client_factory: Callable[[], ImageUploadClient] | None = None,
+        upload_client_factories: Sequence[Callable[[], ImageUploadClient]]
+        | None = None,
         language_runtime: AudioLanguageRuntime | None = None,
         stop_requested: Callable[[], bool] | None = None,
     ) -> None:
@@ -1141,7 +1154,16 @@ class PipelineWorker:
         self.runner_factory = runner_factory or (
             lambda paths: CommandRunner(paths.logs / "commands.jsonl")
         )
-        self.upload_client_factory = upload_client_factory or ImgBBClient
+        if upload_client_factory is not None and upload_client_factories is not None:
+            raise ValueError(
+                "use either upload_client_factory or upload_client_factories"
+            )
+        # Keep the historical single-factory attribute mutable for tests and
+        # integrations.  Production uses the ordered provider chain.
+        self.upload_client_factory = upload_client_factory
+        self.upload_client_factories = tuple(
+            upload_client_factories or (ImgBBClient, CatboxClient, FreeimageClient)
+        )
         self.language_runtime = language_runtime or AudioLanguageRuntime(
             settings.data_root
         )
@@ -1150,6 +1172,25 @@ class PipelineWorker:
 
     def _runner(self, paths: JobPaths) -> Runner:
         return self._runners.setdefault(str(paths.root), self.runner_factory(paths))
+
+    def _image_upload_clients(self) -> list[ImageUploadClient]:
+        factories = (
+            (self.upload_client_factory,)
+            if self.upload_client_factory is not None
+            else self.upload_client_factories
+        )
+        clients: list[ImageUploadClient] = []
+        names: set[str] = set()
+        for factory in factories:
+            client = factory()
+            name = str(getattr(client, "provider_name", "imgbb")).strip().lower()
+            if not name or name in names:
+                raise ImageUploadError("image upload provider names must be unique")
+            names.add(name)
+            clients.append(client)
+        if not clients:
+            raise ImageUploadError("no image upload provider is configured")
+        return clients
 
     def process_one_stage(self, job: Job) -> Job:
         """Run exactly the current durable stage and return refreshed state."""
@@ -1255,11 +1296,29 @@ class PipelineWorker:
                     )
                     return current
                 if current.state is JobState.UPLOADING:
+                    detail = sanitize_text(str(exc)).strip()[:800]
+                    if not detail:
+                        detail = type(exc).__name__
+                    provider = (
+                        exc.provider
+                        if isinstance(exc, ImageUploadError) and exc.provider
+                        else None
+                    )
+                    LOG.warning(
+                        "job %s image upload failed via %s: %s",
+                        job.id,
+                        provider or "unselected provider",
+                        detail,
+                    )
                     return self.queue.advance(
                         job.id,
                         JobState.UPLOAD_FAILED,
                         message="image upload failed; retry is safe",
-                        details={"error_type": type(exc).__name__},
+                        details={
+                            "error_type": type(exc).__name__,
+                            "provider": provider,
+                            "detail": detail,
+                        },
                     )
                 self._fail(current, exc)
                 return self.database.get_job(job.id)
@@ -2989,42 +3048,190 @@ class PipelineWorker:
         if len(allowed_names) != len(pngs):
             raise RuntimeError("comparison image basenames are not unique")
         checkpoint = paths.comparison / "uploads.json"
+        checkpoint_document: dict[str, Any] = {}
         uploaded: dict[str, Any] = {}
         if checkpoint.is_file():
-            uploaded = json.loads(checkpoint.read_text(encoding="utf-8")).get(
-                "images", {}
-            )
-            if not isinstance(uploaded, dict):
-                uploaded = {}
-            uploaded = {
-                name: value
-                for name, value in uploaded.items()
-                if name in allowed_names and isinstance(value, dict)
+            checkpoint_document = json.loads(checkpoint.read_text(encoding="utf-8"))
+            raw_uploaded = checkpoint_document.get("images", {})
+            if isinstance(raw_uploaded, dict):
+                for png in pngs:
+                    value = raw_uploaded.get(png.name)
+                    digest = sha256_file(png)
+                    if (
+                        isinstance(value, dict)
+                        and value.get("local_sha256") == digest
+                        and value.get("remote_sha256") == digest
+                        and str(value.get("image_url", "")).startswith("https://")
+                        and value.get("bbcode")
+                    ):
+                        uploaded[png.name] = dict(value)
+
+        top_provider = checkpoint_document.get("provider")
+        top_provider = (
+            top_provider.strip().lower()
+            if isinstance(top_provider, str) and top_provider.strip()
+            else None
+        )
+        # Any schema-v2 provider loaded at stage entry is a durable lock.  This
+        # includes a provisional pin left by a process interruption after the
+        # network call began.  The current invocation may advance its own
+        # provisional candidate after a classified-safe failure, but a later
+        # invocation must conservatively stay on the persisted provider.
+        provider_lock: str | None = (
+            top_provider
+            if checkpoint_document.get("schema_version") == 2 and top_provider
+            else None
+        )
+        if uploaded:
+            item_providers = {
+                str(item.get("provider", "")).strip().lower()
+                for item in uploaded.values()
+                if str(item.get("provider", "")).strip()
             }
+            if len(item_providers) > 1 or (
+                top_provider and item_providers and top_provider not in item_providers
+            ):
+                raise ReviewRequired("upload checkpoint mixes image providers")
+            # Schema v1 checkpoints predate provider metadata and can only
+            # contain ImgBB results.
+            provider_lock = (
+                provider_lock or top_provider or next(iter(item_providers), "imgbb")
+            )
+            for item in uploaded.values():
+                item.setdefault("provider", provider_lock)
+
         if selection.upload_images:
             try:
-                client = self.upload_client_factory()
-                for png in pngs:
-                    digest = sha256_file(png)
-                    prior = uploaded.get(png.name)
-                    if (
-                        prior
-                        and prior.get("local_sha256") == digest
-                        and prior.get("image_url")
-                    ):
-                        continue
-                    result = client.upload_png(png)
-                    uploaded[png.name] = asdict(result)
-                    atomic_write_json(
-                        checkpoint, {"schema_version": 1, "images": uploaded}
-                    )
+                pending = [png for png in pngs if png.name not in uploaded]
+                if pending:
+                    clients = self._image_upload_clients()
+                    by_name = {
+                        str(client.provider_name).strip().lower(): client
+                        for client in clients
+                    }
+                    if provider_lock:
+                        if (
+                            selection.image_upload_provider != "auto"
+                            and selection.image_upload_provider != provider_lock
+                        ):
+                            raise ReviewRequired(
+                                "selected image provider conflicts with upload checkpoint"
+                            )
+                        client = by_name.get(provider_lock)
+                        if client is None:
+                            raise ImageUploadError(
+                                f"checkpoint provider is unavailable: {provider_lock}"
+                            )
+                        candidates = [client]
+                    elif selection.image_upload_provider != "auto":
+                        client = by_name.get(selection.image_upload_provider)
+                        if client is None:
+                            raise ImageUploadError(
+                                "selected image upload provider is unavailable",
+                                provider=selection.image_upload_provider,
+                            )
+                        candidates = [client]
+                    else:
+                        candidates = clients
+
+                    fallback_failures: list[str] = []
+                    finished = False
+                    for client in candidates:
+                        provider_name = str(client.provider_name).strip().lower()
+                        if provider_lock is None:
+                            # Persist the candidate before entering adapter code:
+                            # the process may die after POST dispatch without an
+                            # exception ever reaching this worker.
+                            atomic_write_json(
+                                checkpoint,
+                                {
+                                    "schema_version": 2,
+                                    "provider": provider_name,
+                                    "provider_provisional": True,
+                                    "images": uploaded,
+                                },
+                            )
+                        try:
+                            for png in pending:
+                                result = client.upload_png(png)
+                                if result.provider != provider_name:
+                                    raise ImageUploadError(
+                                        "image uploader returned the wrong provider",
+                                        provider=provider_name,
+                                    )
+                                provider_lock = provider_name
+                                uploaded[png.name] = asdict(result)
+                                atomic_write_json(
+                                    checkpoint,
+                                    {
+                                        "schema_version": 2,
+                                        "provider": provider_lock,
+                                        "images": uploaded,
+                                    },
+                                )
+                            finished = True
+                            break
+                        except ImageUploadError as exc:
+                            if exc.provider_may_have_committed:
+                                provider_lock = provider_name
+                                atomic_write_json(
+                                    checkpoint,
+                                    {
+                                        "schema_version": 2,
+                                        "provider": provider_lock,
+                                        "images": uploaded,
+                                    },
+                                )
+                            # A provider is immutable after its first success.
+                            # This preserves retry checkpoints and guarantees a
+                            # single host for the complete BBCode package.
+                            if provider_lock == provider_name or not exc.allow_fallback:
+                                raise
+                            fallback_failures.append(
+                                f"{provider_name}: {sanitize_text(str(exc))[:400]}"
+                            )
+                            if selection.image_upload_provider != "auto":
+                                # A manual provider has no next candidate.  Its
+                                # explicitly safe failure must not leave a stale
+                                # provisional lock behind.
+                                atomic_write_json(
+                                    checkpoint,
+                                    {"schema_version": 2, "images": uploaded},
+                                )
+                                raise
+                    if not finished:
+                        # Every candidate failed before committing an image and
+                        # explicitly allowed fallback.  Clear the current-run
+                        # provisional pin so a later automatic retry may begin
+                        # at the start of the configured chain.
+                        atomic_write_json(
+                            checkpoint,
+                            {"schema_version": 2, "images": uploaded},
+                        )
+                        detail = "; ".join(fallback_failures)
+                        raise ImageUploadError(
+                            "all image upload providers are temporarily unavailable"
+                            + (f": {detail}" if detail else "")
+                        )
+
+                if provider_lock is None:
+                    raise ImageUploadError("image upload provider was not selected")
+                # Persist a schema-v1 migration even when every image was
+                # already present and no network request was necessary.
+                atomic_write_json(
+                    checkpoint,
+                    {
+                        "schema_version": 2,
+                        "provider": provider_lock,
+                        "images": uploaded,
+                    },
+                )
             except ImageUploadError:
                 raise
             except Exception as exc:
-                # Credential loading happens before ImgBBClient's HTTP error
-                # wrapper; normalize it so the durable state is UPLOAD_FAILED
-                # and the already-uploaded checkpoint remains retryable.
-                raise ImageUploadError("ImgBB credential or upload failed") from exc
+                raise ImageUploadError(
+                    "image upload provider initialization failed"
+                ) from exc
         else:
             atomic_write_json(
                 checkpoint,
@@ -3038,6 +3245,8 @@ class PipelineWorker:
 
         bbcode = paths.comparison / "comparison.bbcode"
         lines = [f"[b]{selection.output_name} — comparison[/b]"]
+        if uploaded and provider_lock:
+            lines.append(f"[i]Image host: {provider_lock}[/i]")
         for name in sorted(uploaded):
             item = uploaded[name]
             lines.extend((f"[b]{name}[/b]", str(item["bbcode"])))
@@ -3050,6 +3259,7 @@ class PipelineWorker:
             paths.stages / "upload.json",
             {
                 "upload_images": selection.upload_images,
+                "provider": provider_lock,
                 "images": {path.name: sha256_file(path) for path in pngs},
             },
             [checkpoint, bbcode],

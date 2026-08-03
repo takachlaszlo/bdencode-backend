@@ -85,6 +85,7 @@ describe("SelectionWizard", () => {
     const strictMatch = screen.getByRole("checkbox", { name: "Szigorú I/P/B típusazonosság kötelező" });
     expect(strictMatch).toBeChecked();
     expect(strictMatch).toBeDisabled();
+    await user.selectOptions(screen.getByLabelText("Képtárhely"), "catbox");
     await user.click(screen.getByRole("button", { name: "Terv ellenőrzése" }));
 
     expect(await screen.findByText("A terv érvényes")).toBeInTheDocument();
@@ -98,6 +99,7 @@ describe("SelectionWizard", () => {
           settings: expect.objectContaining({ crf: 18 }),
         }),
         tracks: [expect.objectContaining({ stream_id: "audio:4352", action: "copy", language: "eng" })],
+        image_upload_provider: "catbox",
         dual_type_match: true,
       }),
       1,

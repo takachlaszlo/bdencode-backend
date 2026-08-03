@@ -1,4 +1,4 @@
-import type { DetailLevel, SelectionPayload, TrackAction } from "./api/types";
+import type { DetailLevel, ImageUploadProvider, SelectionPayload, TrackAction } from "./api/types";
 
 type Crop = SelectionPayload["video"]["crop"];
 
@@ -22,6 +22,7 @@ export interface StoredSelection {
   settings: Record<string, unknown>;
   tracks: StoredTrackSelection[];
   uploadImages: boolean | null;
+  imageUploadProvider: ImageUploadProvider | null;
   dualTypeMatch: boolean | null;
 }
 
@@ -47,6 +48,12 @@ function normalizePlaylistId(value: unknown): string | null {
 
 function normalizeDetailLevel(value: unknown): DetailLevel | null {
   return value === "beginner" || value === "advanced" || value === "pro" ? value : null;
+}
+
+function normalizeImageUploadProvider(value: unknown): ImageUploadProvider | null {
+  return value === "auto" || value === "imgbb" || value === "catbox" || value === "freeimage"
+    ? value
+    : null;
 }
 
 function normalizeCrop(value: unknown): Crop | null {
@@ -124,6 +131,7 @@ export function normalizeStoredSelection(value: unknown): StoredSelection | null
     settings: { ...(canonicalSettings ?? legacySettings ?? {}) },
     tracks: normalizeTracks(selection.tracks),
     uploadImages: boolean(selection.upload_images),
+    imageUploadProvider: normalizeImageUploadProvider(selection.image_upload_provider),
     dualTypeMatch: boolean(selection.dual_type_match),
   };
 }

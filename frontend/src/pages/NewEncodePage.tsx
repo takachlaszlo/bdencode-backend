@@ -22,7 +22,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { api, ApiError } from "../api/client";
-import type { ContentType, DetailLevel, DiscType, SourceEntry } from "../api/types";
+import type { ContentType, DetailLevel, DiscType, ImageUploadProvider, SourceEntry } from "../api/types";
 import { Badge, Button, Card, LoadingPanel, Notice, PageHeader } from "../components/ui";
 import { basename, CONTENT_LABELS } from "../utils";
 
@@ -34,6 +34,7 @@ interface Draft {
   contentType: ContentType;
   detailLevel: DetailLevel;
   uploadImages: boolean;
+  imageUploadProvider: ImageUploadProvider;
 }
 
 const defaultDraft: Draft = {
@@ -44,6 +45,14 @@ const defaultDraft: Draft = {
   contentType: "FILM",
   detailLevel: "beginner",
   uploadImages: true,
+  imageUploadProvider: "auto",
+};
+
+const imageUploadProviderLabels: Record<ImageUploadProvider, string> = {
+  auto: "Automatikus: ImgBB → Catbox → Freeimage",
+  imgbb: "Csak ImgBB",
+  catbox: "Csak Catbox",
+  freeimage: "Csak Freeimage",
 };
 
 const contentOptions = [
@@ -75,6 +84,9 @@ function loadDraft(): Draft {
     const detailLevel = value.detailLevel === "advanced" || value.detailLevel === "pro" || value.detailLevel === "beginner"
       ? value.detailLevel
       : defaultDraft.detailLevel;
+    const imageUploadProvider = value.imageUploadProvider === "imgbb" || value.imageUploadProvider === "catbox" || value.imageUploadProvider === "freeimage"
+      ? value.imageUploadProvider
+      : "auto";
     return {
       sourcePath: typeof value.sourcePath === "string" ? value.sourcePath : "",
       sourceName: typeof value.sourceName === "string" ? value.sourceName : "",
@@ -83,6 +95,7 @@ function loadDraft(): Draft {
       contentType,
       detailLevel,
       uploadImages: typeof value.uploadImages === "boolean" ? value.uploadImages : true,
+      imageUploadProvider,
     };
   } catch {
     return defaultDraft;
@@ -120,6 +133,7 @@ export function NewEncodePage() {
       settings: {
         detail_level: draft.detailLevel,
         upload_images: draft.uploadImages,
+        image_upload_provider: draft.imageUploadProvider,
       },
     }),
     onSuccess: (job) => {
@@ -298,9 +312,16 @@ export function NewEncodePage() {
 
             <label className="toggle-row">
               <span className="toggle-row__icon"><UploadCloud size={20} /></span>
-              <span><strong>Comparison képek feltöltése</strong><small>Az I/P/B framek és spektrumképek ImgBB-re kerülnek, BBCode-dal együtt.</small></span>
+              <span><strong>Comparison képek feltöltése</strong><small>Az I/P/B framek és spektrumképek az általad választott, ellenőrzött képtárhelyre kerülnek, BBCode-dal együtt.</small></span>
               <input type="checkbox" checked={draft.uploadImages} onChange={(event) => setDraft((value) => ({ ...value, uploadImages: event.target.checked }))} />
               <span className="toggle" aria-hidden="true" />
+            </label>
+            <label className="field">
+              <span>Képtárhely</span>
+              <select aria-label="Képtárhely" value={draft.imageUploadProvider} disabled={!draft.uploadImages} onChange={(event) => setDraft((value) => ({ ...value, imageUploadProvider: event.target.value as ImageUploadProvider }))}>
+                {Object.entries(imageUploadProviderLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+              <small>Kézi választásnál a rendszer nem vált át másik szolgáltatóra.</small>
             </label>
           </Card>
 
@@ -313,7 +334,7 @@ export function NewEncodePage() {
               <div><dt>Tartalom</dt><dd>{CONTENT_LABELS[draft.contentType]}</dd></div>
               <div><dt>Lemez</dt><dd>{draft.discType === "AUTO" ? "Automatikus felismerés" : draft.discType}</dd></div>
               <div><dt>Nézet</dt><dd>{detailOptions.find((item) => item.value === draft.detailLevel)?.title}</dd></div>
-              <div><dt>ImgBB</dt><dd>{draft.uploadImages ? "Bekapcsolva" : "Kikapcsolva"}</dd></div>
+              <div><dt>Képfeltöltés</dt><dd>{draft.uploadImages ? imageUploadProviderLabels[draft.imageUploadProvider] : "Kikapcsolva"}</dd></div>
             </dl>
             <Notice tone="info">A scan nem módosítja a forrást. A playlistet, sávokat és videóbeállításokat az eredmény után hagyod jóvá.</Notice>
             {create.isError && <Notice tone="danger" title="A munka nem hozható létre">{create.error instanceof ApiError ? create.error.detail : create.error.message}</Notice>}

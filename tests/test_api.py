@@ -68,7 +68,7 @@ def test_runtime_capabilities_is_fresh_and_does_not_prepare_paths(
     monkeypatch.setattr(
         doctor,
         "_credential_status",
-        lambda: {
+        lambda _name: {
             "configured": True,
             "encrypted_at_rest": True,
             "permissions_ok": True,

@@ -85,6 +85,25 @@ def test_uninstaller_validates_database_and_credential_paths() -> None:
     assert 'assert_absolute_without_symlinks "$credential_directory"' in content
 
 
+def test_uninstaller_preserves_or_purges_only_fixed_credentials() -> None:
+    content = script()
+    assert "--purge-credentials" in content
+    assert "--purge-credential)" in content
+    assert "Legacy option: remove only the ImgBB credential" in content
+    assert "credential_names=(imgbb-api-key catbox-userhash freeimage-api-key)" in content
+    assert 'credential_purge_mode=imgbb' in content
+    assert 'credential_purge_mode=all' in content
+    assert 'os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW' in content
+    assert 'os.unlink(name, dir_fd=descriptor)' in content
+    assert 'sudo rm -f -- "$credential_path"' not in content
+    assert 'rm -f -- "$credential_directory"' not in content
+    preflight = content.index("Credential target is unexpectedly a directory")
+    mutation = content.index(
+        "if sudo systemctl is-active --quiet bdencode-api.service"
+    )
+    assert preflight < mutation
+
+
 def test_nginx_removal_has_verified_rollback() -> None:
     content = script()
     assert "nginx_binary=/usr/sbin/nginx" in content

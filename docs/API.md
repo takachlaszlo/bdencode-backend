@@ -55,10 +55,15 @@ A webes felület mentés előtt ugyanazt az objektumot a `POST /jobs/{id}/select
         "order": 1
       }
     ],
-    "upload_images": true
+    "upload_images": true,
+    "image_upload_provider": "auto"
   }
 }
 ```
+
+Az `image_upload_provider` értéke `auto`, `imgbb`, `catbox` vagy `freeimage`.
+Automatikus módban a sorrend ImgBB → Catbox → Freeimage, és csak az első
+sikeres kép előtt engedélyezett a váltás. Kézi választásnál nincs failover.
 
 Minden audio- és feliratsávhoz explicit `copy`, `flac` vagy `omit` szükséges. FLAC csak audióhoz érvényes. `temporal_filter`: `progressive`, `ivtc_tff`, `ivtc_bff`, `bwdif_tff`, `bwdif_bff`, `hybrid_safe_bob_tff`, `hybrid_safe_bob_bff`.
 

@@ -18,7 +18,7 @@ Tartós Blu-ray/UHD Blu-ray kódoló rendszer x264/x265 kimenethez, headless bac
 - gyors, rövid időablakokra korlátozott I/P/B mintavétel, alapból öt lossless PNG-párral és a kiválasztott képeken számolt SSIM/PSNR metrikával; teljes filmes VMAF-menet nélkül;
 - lossless PNG, HDR-native 16 bites és determinisztikus SDR proof;
 - teljes dekódolási QC, MediaInfo/MKVInfo, végső MKV codec/profile/szín/HDR10 hard gate, audio PCM/sample/delay/layout/loudness/phase/spektrum;
-- ImgBB feltöltés byteazonos visszaellenőrzéssel és BBCode-generálással;
+- választható automatikus ImgBB → Catbox → Freeimage tartaléklánc vagy kézzel rögzített szolgáltató, egyetlen hostra zárt csomaggal, byteazonos visszaellenőrzéssel és BBCode-generálással;
 - raw és kitisztított log; az MKV csak a kitisztított encode logot kapja meg, comparison fájlokat soha;
 - MPLS/CLPI/PMT nyelv-provenance, ismeretlen audiónál CPU-only faster-whisper mintavétel, bizonytalanságnál review;
 - systemd API/worker/update szolgáltatások és Swizzin nginx `/encoder/` konfiguráció.
@@ -67,8 +67,8 @@ bash install/uninstall.sh \
 A source gyökér soha nem törlési célpont. A teljes adattörlés az átfedő
 source/data útvonalat, symlinket, mountpointot, idegen tulajdonost és túl tág
 rendszerútvonalat elutasítja. Aktív queue vagy helyreállítási tranzakció mellett
-az eltávolítás nem indul el. Az ImgBB credential csak a külön
-`--purge-credential` kapcsolóval törlődik.
+az eltávolítás nem indul el. A képfeltöltő credentialök csak a külön
+`--purge-credentials` kapcsolóval törlődnek.
 
 Az APT-csomagokat az általános eltávolító szándékosan megőrzi: a régi
 telepítések nem rögzítették, mely csomagok voltak már korábban a szerveren,
@@ -107,19 +107,49 @@ pnpm build
 
 A Vite build rögzített base pathja `/encoder/`. A szerver nem futtat Node.js-t: a telepítő kizárólag a tesztelt, repóban lévő `frontend/dist` tartalmát publikálja.
 
-## ImgBB credential
+## Képfeltöltő credentialök
 
-A kulcs nem kerülhet configba, adatbázisba, logba vagy Gitbe. A worker systemd encrypted credentialt olvas `imgbb-api-key` néven. Példa új kulcs rögzítésére:
+A kulcsok nem kerülhetnek configba, adatbázisba, logba vagy Gitbe. A worker három külön systemd encrypted credentialt támogat:
+
+- `imgbb-api-key` – az elsődleges ImgBB API-kulcs;
+- `catbox-userhash` – opcionális, de a fiókhoz kötött és kezelhető Catbox-feltöltéshez szükséges;
+- `freeimage-api-key` – a Freeimage.host API-kulcs.
+
+Mindegyiket rejtett terminálbevitellel, stdinről kell titkosítani. Példa:
 
 ```bash
-read -rsp 'ImgBB API key: ' bdencode_imgbb_key
-printf '%s\n' "$bdencode_imgbb_key" | sudo systemd-creds encrypt \
-  --name=imgbb-api-key - "$HOME/.config/bdencode/imgbb-api-key.cred"
-unset bdencode_imgbb_key
-chmod 600 "$HOME/.config/bdencode/imgbb-api-key.cred"
+provision_bdencode_credential() (
+  set -Eeuo pipefail
+  local credential_name="$1" prompt="$2"
+  local credential_directory="$HOME/.config/bdencode"
+  local credential_tmp bdencode_image_secret
+  sudo -v
+  install -d -m 700 "$credential_directory"
+  credential_tmp="$(mktemp "$credential_directory/.${credential_name}.cred.XXXXXX")"
+  trap 'rm -f -- "$credential_tmp"' EXIT
+  read -rsp "$prompt" bdencode_image_secret
+  printf '\n'
+  [[ -n "$bdencode_image_secret" ]] || {
+    echo 'Az üres credential nem megengedett.' >&2
+    return 1
+  }
+  printf '%s' "$bdencode_image_secret" | sudo systemd-creds encrypt \
+    --name="$credential_name" - - >"$credential_tmp"
+  unset bdencode_image_secret
+  chmod 600 "$credential_tmp"
+  mv -f -- "$credential_tmp" "$credential_directory/${credential_name}.cred"
+  trap - EXIT
+)
+provision_bdencode_credential imgbb-api-key 'ImgBB API key: '
+unset -f provision_bdencode_credential
 ```
 
-A már futó workerhez ezután a telepítőt újra kell futtatni, vagy a credential drop-int kézzel frissíteni.
+A másik két rögzített név `catbox-userhash` és `freeimage-api-key`; a fenti
+`credential_name` értékét kell ezekre cserélni. A stdout-átirányítást a
+célfelhasználó shellje nyitja meg, ezért az encrypted fájl nem lesz
+root-tulajdonú. A telepítő csak symlinkmentes, a célfelhasználó tulajdonában
+lévő `0700` mappából, `0600` módú, visszafejthető credentialt fogad el. A már
+futó workerhez ezután a telepítőt újra kell futtatni.
 
 ## Használat
 
@@ -164,7 +194,11 @@ Az APT guard kizárólag a vaultban szereplő helyi csomagokat engedi a `dpkg` e
 
 A telepítő külön, fix célpontlistás rollback-snapshotot tart a változó host unitokról, az APT drop-injeiről, nginx beállításáról és az app/tool release pointereiről. Az `apt-daily` timerek aktív/engedélyezett állapota is a journal része: a telepítő a csomagművelet előtt leállítja őket, kivárja a futó dpkg-t, korán telepíti a media pint, majd pontosan visszaállítja az előállapotot. A telepítő `apt-get` gyermeke külön tartós lockot örököl; a watchdog kivárja ezt és a natív apt/dpkg lockokat, majd tiszta `dpkg --audit` és `apt-get check` nélkül nem indít runtime-ot. A recovery helper, az API/worker stabil recovery drop-inje és az install-watchdog szándékosan a snapshoton kívül marad, így a visszaállítás a régi runtime-unitok visszatérése után is folytatható. A journal két fázist különböztet meg: a queue vizsgálata alatt egy futó encode-ot soha nem állít le, tényleges mutáció után viszont teljes rollbacket végez. Normál hiba esetén azonnal, SIGKILL után a négy install/runtime/APT markert figyelő `bdencode-install-recovery.path`, rebootkor pedig a recovery gate fejezi be; a journal helye `/var/lib/bdencode/install-transactions`.
 
-A telepítő egy kizárólag `AWAITING_SELECTION` állapotban szünetelő job mellett is frissítheti az alkalmazást, mert ekkor még nem készült encode és a választás nincs jóváhagyva. `READY`, `NEEDS_REVIEW`, kódolás, mux, QC, comparison vagy feltöltés alatt továbbra is fail-closed módon elhalasztja a telepítést.
+A telepítő `AWAITING_SELECTION`, illetve tartós `UPLOAD_FAILED` állapotban
+szünetelő job mellett is frissítheti az alkalmazást. Az utóbbinál minden helyi
+eredmény és feltöltési checkpoint lezárt állapotban vár, ezért a frissítés után
+csak a feltöltés folytatódik. `READY`, `NEEDS_REVIEW`, kódolás, mux, QC,
+comparison vagy aktív `UPLOADING` alatt továbbra is fail-closed módon halaszt.
 
 ## Teszt
 

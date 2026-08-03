@@ -64,7 +64,7 @@ export function ComparisonPanel({ artifacts }: { artifacts: Artifact[] }) {
     <div className="comparison-panel">
       {bbcodeArtifact && (
         <Card className="bbcode-card">
-          <div><span className="eyebrow">Megosztás</span><h3>BBCode csomag</h3><p>Az ImgBB-re feltöltött source/encode párok fórumba illeszthető kódja.</p></div>
+          <div><span className="eyebrow">Megosztás</span><h3>BBCode csomag</h3><p>Az ellenőrzött képtárhelyre feltöltött source/encode párok fórumba illeszthető kódja.</p></div>
           <Button variant="secondary" icon={copied ? <Check size={17} /> : <Clipboard size={17} />} onClick={() => void copyBbcode()} disabled={!bbcode.data}>{copied ? "Másolva" : "BBCode másolása"}</Button>
         </Card>
       )}

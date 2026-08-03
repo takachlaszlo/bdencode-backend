@@ -9,7 +9,7 @@ Usage:
   bash install/uninstall.sh [options]
 
 Remove the BDEncode application and its host integration. Blu-ray sources are
-never modified. Queue/job/output data and the ImgBB credential are preserved
+never modified. Queue/job/output data and image-host credentials are preserved
 unless their dedicated purge options are supplied.
 
 Options:
@@ -17,7 +17,8 @@ Options:
   --source-root PATH        Blu-ray source root (repeatable)
   --purge-data              Also remove the complete data root
   --confirm-data-root PATH  Required exact confirmation for --purge-data
-  --purge-credential        Remove ~/.config/bdencode/imgbb-api-key.cred
+  --purge-credentials       Remove the three fixed image-host credentials
+  --purge-credential        Legacy option: remove only the ImgBB credential
   -h, --help                Show this help
 
 If /etc/bdencode/config.toml is absent, --data-root and at least one
@@ -29,7 +30,8 @@ EOF
 data_root_argument=""
 confirm_data_root=""
 purge_data=0
-purge_credential=0
+purge_credentials=0
+purge_imgbb_credential=0
 declare -a source_root_arguments=()
 
 while (($#)); do
@@ -56,8 +58,12 @@ while (($#)); do
             confirm_data_root="$2"
             shift 2
             ;;
+        --purge-credentials)
+            purge_credentials=1
+            shift
+            ;;
         --purge-credential)
-            purge_credential=1
+            purge_imgbb_credential=1
             shift
             ;;
         -h|--help)
@@ -407,9 +413,24 @@ else
 fi
 
 credential_directory="$task_home/.config/bdencode"
-credential="$credential_directory/imgbb-api-key.cred"
-if [[ "$purge_credential" -eq 1 ]]; then
+credential_names=(imgbb-api-key catbox-userhash freeimage-api-key)
+declare -a credential_paths=()
+for credential_name in "${credential_names[@]}"; do
+    credential_paths+=("$credential_directory/${credential_name}.cred")
+done
+if [[ "$purge_credentials" -eq 1 || "$purge_imgbb_credential" -eq 1 ]]; then
     assert_absolute_without_symlinks "$credential_directory" "credential directory"
+    if [[ -e "$credential_directory" && ! -d "$credential_directory" ]]; then
+        echo "Credential path is not a directory: $credential_directory" >&2
+        exit 2
+    fi
+    for credential_path in "${credential_paths[@]}"; do
+        if sudo test -e "$credential_path" && \
+            sudo test -d "$credential_path" && ! sudo test -L "$credential_path"; then
+            echo "Credential target is unexpectedly a directory: $credential_path" >&2
+            exit 2
+        fi
+    done
 fi
 
 nginx_target=/etc/nginx/apps/bdencode.conf
@@ -620,8 +641,58 @@ for directory in "${system_directories[@]}"; do
     sudo rmdir --ignore-fail-on-non-empty -- "$directory" 2>/dev/null || true
 done
 
-if [[ "$purge_credential" -eq 1 ]]; then
-    rm -f -- "$credential"
+if [[ "$purge_credentials" -eq 1 || "$purge_imgbb_credential" -eq 1 ]]; then
+    credential_purge_mode=imgbb
+    if [[ "$purge_credentials" -eq 1 ]]; then
+        credential_purge_mode=all
+    fi
+    # Traverse every directory component with O_NOFOLLOW and unlink only the
+    # fixed basenames relative to the anchored directory descriptor.  This
+    # prevents a writable parent from being swapped to a symlink between the
+    # preflight and the privileged deletion.
+    sudo python3 - "$credential_directory" "$task_uid" "$credential_purge_mode" <<'PY'
+import os
+import stat
+import sys
+
+directory, raw_uid, mode = sys.argv[1:]
+expected_uid = int(raw_uid)
+names = (
+    ("imgbb-api-key.cred", "catbox-userhash.cred", "freeimage-api-key.cred")
+    if mode == "all"
+    else ("imgbb-api-key.cred",)
+)
+if mode not in {"all", "imgbb"} or not directory.startswith("/"):
+    raise SystemExit("invalid credential purge request")
+
+descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for component in (item for item in directory.split("/") if item):
+        try:
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+        except FileNotFoundError:
+            raise SystemExit(0)
+        os.close(descriptor)
+        descriptor = next_descriptor
+    details = os.fstat(descriptor)
+    if details.st_uid != expected_uid or stat.S_IMODE(details.st_mode) != 0o700:
+        raise SystemExit("credential directory ownership or mode changed")
+    for name in names:
+        try:
+            target = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(target.st_mode):
+            raise SystemExit(f"credential target became a directory: {name}")
+        os.unlink(name, dir_fd=descriptor)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
 fi
 if [[ ! -L "$credential_directory" ]]; then
     rmdir --ignore-fail-on-non-empty -- "$credential_directory" 2>/dev/null || true
@@ -636,7 +707,9 @@ fi
 
 echo "BDEncode application and host integration removed."
 echo "Blu-ray source roots were not modified."
-if [[ "$purge_credential" -eq 0 && -e "$credential" ]]; then
-    echo "Preserved ImgBB credential: $credential"
-fi
+for credential_path in "${credential_paths[@]}"; do
+    if [[ -e "$credential_path" || -L "$credential_path" ]]; then
+        echo "Preserved image-host credential: $credential_path"
+    fi
+done
 echo "APT packages and this Git checkout were intentionally retained."

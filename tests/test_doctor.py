@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import fields
 from pathlib import Path
 
@@ -84,6 +85,17 @@ def test_queue_idle_exit_status(tmp_path: Path) -> None:
     assert main(["--config", str(config), "init-db"]) == 0
     assert main(["--config", str(config), "queue-idle"]) == 0
     assert main(["--config", str(config), "queue-idle", "--allow-review"]) == 0
+    assert (
+        main(
+            [
+                "--config",
+                str(config),
+                "queue-idle",
+                "--allow-install-safe-pause",
+            ]
+        )
+        == 0
+    )
 
 
 def test_queue_idle_allow_review_only_accepts_awaiting_selection(
@@ -94,6 +106,25 @@ def test_queue_idle_allow_review_only_accepts_awaiting_selection(
 
     assert main(["--config", str(config), "queue-idle"]) == 3
     assert main(["--config", str(config), "queue-idle", "--allow-review"]) == 0
+
+
+def test_queue_idle_install_safe_pause_accepts_upload_failed(tmp_path: Path) -> None:
+    config, _database, queue = queue_config(tmp_path)
+    job_in_state(queue, JobState.UPLOAD_FAILED)
+
+    assert main(["--config", str(config), "queue-idle"]) == 3
+    assert main(["--config", str(config), "queue-idle", "--allow-review"]) == 3
+    assert (
+        main(
+            [
+                "--config",
+                str(config),
+                "queue-idle",
+                "--allow-install-safe-pause",
+            ]
+        )
+        == 0
+    )
 
 
 @pytest.mark.parametrize(
@@ -118,9 +149,71 @@ def test_installer_uses_narrow_review_pause_gate() -> None:
     end = installer.index("\n}\ntrap finish EXIT", start)
     gate = installer[start:end]
 
-    assert "queue_args+=(--allow-review)" in gate
-    assert "AWAITING_SELECTION$" in gate
+    assert "queue_args+=(--allow-install-safe-pause)" in gate
+    assert "AWAITING_SELECTION" in gate
+    assert "UPLOAD_FAILED" in gate
     assert "NEEDS_REVIEW" not in gate
+
+
+def test_installer_loads_only_fixed_encrypted_image_host_credentials() -> None:
+    installer = (ROOT / "install" / "install.sh").read_text(encoding="utf-8")
+    for name in ("imgbb-api-key", "catbox-userhash", "freeimage-api-key"):
+        assert name in installer
+    assert "systemd-creds decrypt" in installer
+    assert 'stat -c %u -- "$credential_path"' in installer
+    assert 'stat -c %a -- "$credential_path"' in installer
+    assert '"$credential_name" "$credential_path"' in installer
+    assert "LoadCredentialEncrypted=%s:%s" in installer
+    assert 'assert_path_components_without_symlinks "$credential_directory"' in installer
+    assert 'stat -c %u -- "$credential_directory"' in installer
+    assert 'stat -c %a -- "$credential_directory"' in installer
+
+
+def test_runtime_credential_status_requires_regular_private_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "credentials"
+    runtime.mkdir()
+    credential = runtime / "imgbb-api-key"
+    credential.write_text("encrypted-runtime-value", encoding="utf-8")
+    credential.chmod(0o600)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(runtime))
+    # Windows exposes ACL-backed files as 0666 regardless of chmod. Exercise
+    # the production POSIX metadata contract without making this test host-only.
+    monkeypatch.setattr(doctor.stat, "S_IMODE", lambda _mode: 0o600)
+
+    status = doctor._credential_status("imgbb-api-key")
+
+    assert status["configured"] is True
+    assert status["runtime_loaded"] is True
+    assert status["encrypted_at_rest"] is False
+    assert status["runtime_plaintext"] is True
+    assert status["metadata_ok"] is True
+
+    credential.unlink()
+    credential.mkdir()
+    status = doctor._credential_status("imgbb-api-key")
+    assert status["present"] is True
+    assert status["configured"] is False
+    assert status["metadata_ok"] is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="reliable symlink metadata requires POSIX")
+def test_runtime_credential_status_rejects_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "credentials"
+    runtime.mkdir()
+    target = runtime / "target"
+    target.write_text("value", encoding="utf-8")
+    (runtime / "catbox-userhash").symlink_to(target)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(runtime))
+
+    status = doctor._credential_status("catbox-userhash")
+
+    assert status["present"] is True
+    assert status["configured"] is False
+    assert status["metadata_ok"] is False
 
 
 def test_installer_isolates_tests_from_live_runtime_configuration() -> None:

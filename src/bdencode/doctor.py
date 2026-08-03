@@ -89,26 +89,56 @@ def _data_path_check(settings: Settings) -> dict[str, Any]:
     return root
 
 
-def _credential_status() -> dict[str, Any]:
+def _credential_status(name: str) -> dict[str, Any]:
     credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
-    candidates = []
+    candidates: list[tuple[Path, bool]] = []
     if credential_dir:
-        candidates.append(Path(credential_dir) / "imgbb-api-key")
-    candidates.append(Path.home() / ".config" / "bdencode" / "imgbb-api-key.cred")
-    for candidate in candidates:
+        candidates.append((Path(credential_dir) / name, True))
+    candidates.append(
+        (Path.home() / ".config" / "bdencode" / f"{name}.cred", False)
+    )
+    for candidate, is_runtime in candidates:
         try:
-            details = candidate.stat()
+            details = candidate.lstat()
         except OSError:
             continue
         permissions = stat.S_IMODE(details.st_mode)
+        regular = stat.S_ISREG(details.st_mode)
+        symlink = stat.S_ISLNK(details.st_mode)
+        current_uid = os.getuid() if hasattr(os, "getuid") else details.st_uid
+        owner_ok = is_runtime or details.st_uid == current_uid
+        permissions_ok = (
+            permissions & 0o077 == 0 if is_runtime else permissions == 0o600
+        )
+        metadata_ok = regular and not symlink and owner_ok and permissions_ok
         return {
-            "configured": details.st_size > 0,
-            "encrypted_at_rest": candidate.suffix == ".cred",
+            "configured": metadata_ok and details.st_size > 0,
+            "present": True,
+            "runtime_loaded": (
+                is_runtime and regular and not symlink and details.st_size > 0
+            ),
+            # A systemd runtime credential is the decrypted, private tmpfs
+            # material.  Only the persistent .cred candidate is itself
+            # encrypted at rest.
+            "encrypted_at_rest": not is_runtime,
+            "runtime_plaintext": is_runtime,
+            "source": "systemd-runtime" if is_runtime else "encrypted-file",
             "permissions": f"{permissions:04o}",
-            "permissions_ok": permissions & 0o077 == 0,
+            "permissions_ok": permissions_ok,
+            "owner_ok": owner_ok,
+            "metadata_ok": metadata_ok,
             # Deliberately omit path/content: neither is needed in attachable logs.
         }
-    return {"configured": False, "encrypted_at_rest": False, "permissions_ok": False}
+    return {
+        "configured": False,
+        "present": False,
+        "runtime_loaded": False,
+        "encrypted_at_rest": False,
+        "runtime_plaintext": False,
+        "permissions_ok": False,
+        "owner_ok": False,
+        "metadata_ok": False,
+    }
 
 
 def _vapoursynth_plugins() -> dict[str, Any]:
@@ -179,6 +209,11 @@ def build_report(
     data_check = _data_path_check(settings)
     vs = _vapoursynth_plugins()
     ffmpeg = snapshot["ffmpeg"]
+    image_upload_credentials = {
+        "imgbb": _credential_status("imgbb-api-key"),
+        "catbox": _credential_status("catbox-userhash"),
+        "freeimage": _credential_status("freeimage-api-key"),
+    }
     warnings: list[str] = []
     if not database_available:
         warnings.append("database is not initialized")
@@ -188,8 +223,14 @@ def build_report(
         )
     if missing_recommended:
         warnings.append("recommended tools missing: " + ", ".join(missing_recommended))
-    if not _credential_status()["configured"]:
+    if not image_upload_credentials["imgbb"]["configured"]:
         warnings.append("ImgBB upload credential is not configured")
+    if not image_upload_credentials["catbox"]["configured"]:
+        warnings.append(
+            "Catbox account credential is not configured; fallback uploads are anonymous"
+        )
+    if not image_upload_credentials["freeimage"]["configured"]:
+        warnings.append("Freeimage upload credential is not configured")
     missing_ffmpeg = {
         "encoders": sorted(MANDATORY_FFMPEG_ENCODERS - set(ffmpeg["encoders"])),
         "filters": sorted(MANDATORY_FFMPEG_FILTERS - set(ffmpeg["filters"])),
@@ -221,7 +262,9 @@ def build_report(
         "ffmpeg": ffmpeg,
         "missing_ffmpeg_capabilities": missing_ffmpeg,
         "vapoursynth": vs,
-        "imgbb_credential": _credential_status(),
+        "image_upload_credentials": image_upload_credentials,
+        # Compatibility alias for older frontends and monitoring clients.
+        "imgbb_credential": image_upload_credentials["imgbb"],
         "worker_cpu_policy": {
             "requested_percent": settings.cpu_limit_percent,
             "logical_cpus": os.cpu_count(),
