@@ -98,6 +98,11 @@ export const api = {
     apiFetch<Job>("/jobs", { method: "POST", body: JSON.stringify(request) }),
   cancelJob: (id: string) =>
     apiFetch<Job>(`/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  retryJob: (id: string, expectedVersion: number) =>
+    apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/retry`, {
+      method: "POST",
+      body: JSON.stringify({ expected_version: expectedVersion }),
+    }),
   resumeJob: (id: string) =>
     apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/resume`, { method: "POST" }),
   retryUpload: (id: string) =>

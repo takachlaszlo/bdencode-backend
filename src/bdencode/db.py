@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from .models import (
     BLOCKING_STATES,
+    RETRYABLE_FAILED_STAGES,
     TERMINAL_STATES,
     Artifact,
     ArtifactCreate,
@@ -420,6 +421,143 @@ class Database:
         except sqlite3.IntegrityError as exc:
             raise QueueBlockedError(self.active_job()) from exc
 
+    def retry_failed_job(
+        self,
+        job_id: str,
+        *,
+        message: str | None = None,
+        expected_version: int | None = None,
+    ) -> Job:
+        """Transactionally restore a safely replayable FAILED worker stage.
+
+        FAILED remains terminal in the general state machine.  This dedicated
+        operation requires durable transition provenance and re-enters only a
+        narrow set of marker-guarded stages while the single-active invariant
+        is held by the same SQLite write transaction.
+        """
+
+        try:
+            with self._write() as connection:
+                row = self._job_row(connection, job_id)
+                current = JobState(row["state"])
+                if current is not JobState.FAILED:
+                    raise StateConflictError(
+                        "only FAILED jobs can retry a worker stage",
+                        current=current,
+                    )
+                if expected_version is not None and row["version"] != expected_version:
+                    raise StateConflictError(
+                        f"job version is {row['version']}, expected {expected_version}",
+                        current=current,
+                    )
+
+                failure_event = connection.execute(
+                    """
+                    SELECT id, kind, state_from, state_to
+                    FROM events
+                    WHERE job_id = ?
+                      AND (state_from IS NOT NULL OR state_to IS NOT NULL)
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if (
+                    failure_event is None
+                    or failure_event["kind"] != "job.state"
+                    or failure_event["state_to"] != JobState.FAILED.value
+                    or failure_event["state_from"] is None
+                ):
+                    raise StateConflictError(
+                        "FAILED job has no valid latest failure transition provenance",
+                        current=current,
+                    )
+                try:
+                    retry_stage = JobState(failure_event["state_from"])
+                except ValueError as exc:
+                    raise StateConflictError(
+                        "FAILED job has invalid failure-stage provenance",
+                        current=current,
+                    ) from exc
+
+                stored_resume = row["resume_state"]
+                if stored_resume is not None:
+                    try:
+                        resume_stage = JobState(stored_resume)
+                    except ValueError as exc:
+                        raise StateConflictError(
+                            "FAILED job has invalid stored retry provenance",
+                            current=current,
+                        ) from exc
+                    if resume_stage is not retry_stage:
+                        raise StateConflictError(
+                            "FAILED job retry provenance does not match its failure event",
+                            current=current,
+                        )
+                if retry_stage not in RETRYABLE_FAILED_STAGES:
+                    raise StateConflictError(
+                        f"FAILED stage {retry_stage.value} is not safely retryable",
+                        current=current,
+                    )
+
+                placeholders = ",".join("?" for _ in BLOCKING_STATES)
+                blocker = connection.execute(
+                    f"""
+                    SELECT * FROM jobs
+                    WHERE id != ? AND state IN ({placeholders})
+                    LIMIT 1
+                    """,
+                    (job_id, *(state.value for state in BLOCKING_STATES)),
+                ).fetchone()
+                if blocker is not None:
+                    raise QueueBlockedError(self._decode_job(blocker))
+
+                now = utc_now()
+                retry_message = message or f"retrying failed {retry_stage.value} stage"
+                cursor = connection.execute(
+                    """
+                    UPDATE jobs SET state = ?, status_message = ?, error = NULL,
+                        resume_state = NULL, progress = NULL, finished_at = NULL,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ? AND state = ? AND version = ?
+                    """,
+                    (
+                        retry_stage.value,
+                        retry_message,
+                        now,
+                        job_id,
+                        JobState.FAILED.value,
+                        row["version"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflictError(
+                        "job changed concurrently", current=current
+                    )
+                self._insert_event(
+                    connection,
+                    job_id=job_id,
+                    kind="job.retry",
+                    state_from=JobState.FAILED,
+                    state_to=retry_stage,
+                    message=retry_message,
+                    payload={
+                        "failure_event_id": int(failure_event["id"]),
+                        "retry_stage": retry_stage.value,
+                        "previous_version": int(row["version"]),
+                        "new_version": int(row["version"]) + 1,
+                    },
+                )
+                return self._decode_job(self._job_row(connection, job_id))
+        except sqlite3.IntegrityError as exc:
+            if (
+                getattr(exc, "sqlite_errorcode", None)
+                == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+            ):
+                blocker = self.active_job()
+                if blocker is not None:
+                    raise QueueBlockedError(blocker) from exc
+            raise
+
     def set_selection(
         self,
         job_id: str,
@@ -564,6 +702,7 @@ class Database:
                 progress = 1.0
         if target is JobState.FAILED:
             error = message or "job failed"
+            next_resume = current.value
 
         cursor = connection.execute(
             """

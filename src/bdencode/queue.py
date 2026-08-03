@@ -96,6 +96,19 @@ class JobQueue:
             )
         return self.advance(job_id, JobState.UPLOADING, message=message)
 
+    def retry_failed(
+        self,
+        job_id: str,
+        *,
+        message: str | None = None,
+        expected_version: int | None = None,
+    ) -> Job:
+        return self.database.retry_failed_job(
+            job_id,
+            message=message,
+            expected_version=expected_version,
+        )
+
     def blocker(self) -> Job | None:
         return self.database.active_job()
 

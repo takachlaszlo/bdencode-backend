@@ -34,6 +34,7 @@ from .models import (
     JobCreate,
     JobList,
     JobProgressRequest,
+    JobRetryRequest,
     JobSelectionRequest,
     JobState,
     JobTransitionRequest,
@@ -415,6 +416,17 @@ def create_app(
     @application.post(f"{API_PREFIX}/jobs/{{job_id}}/retry-upload", response_model=Job)
     def retry_upload(job_id: str) -> Job:
         return queue.retry_upload(job_id)
+
+    @application.post(f"{API_PREFIX}/jobs/{{job_id}}/retry", response_model=Job)
+    def retry_failed_job(
+        job_id: str, request: JobRetryRequest | None = None
+    ) -> Job:
+        retry = request or JobRetryRequest()
+        return queue.retry_failed(
+            job_id,
+            message=retry.message,
+            expected_version=retry.expected_version,
+        )
 
     @application.delete(f"{API_PREFIX}/jobs/{{job_id}}", response_model=Job)
     def cancel_job(job_id: str) -> Job:

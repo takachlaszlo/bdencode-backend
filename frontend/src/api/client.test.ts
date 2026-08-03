@@ -65,6 +65,20 @@ describe("API client", () => {
     );
   });
 
+  it("retries a failed job through the encoded retry endpoint", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ id: "job/1", state: "MUXING" }));
+
+    await api.retryJob("job/1", 7);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/encoder/api/v1/jobs/job%2F1/retry",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ expected_version: 7 }),
+      }),
+    );
+  });
+
   it("preserves a plain-text proxy error after reading the response body once", async () => {
     fetchMock.mockResolvedValue(
       new Response("A backend átmenetileg nem érhető el", {

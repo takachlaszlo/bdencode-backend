@@ -40,6 +40,20 @@ class JobState(StrEnum):
 
 TERMINAL_STATES = frozenset({JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED})
 
+# A FAILED job may only be restored into local media stages guarded by durable,
+# content-validated markers. Scanning is excluded because its marker does not
+# fingerprint replaceable source contents; uploading is excluded because a
+# remote success can precede its local checkpoint and is therefore at-least-once.
+RETRYABLE_FAILED_STAGES = frozenset(
+    {
+        JobState.READY,
+        JobState.ENCODING,
+        JobState.MUXING,
+        JobState.QC,
+        JobState.COMPARISON,
+    }
+)
+
 # QUEUED is intentionally not blocking: any number of jobs may wait, while the
 # partial unique index in db.py permits exactly one state from this set.
 BLOCKING_STATES = frozenset(set(JobState) - set(TERMINAL_STATES) - {JobState.QUEUED})
@@ -187,6 +201,11 @@ class JobTransitionRequest(StrictModel):
     state: JobState
     message: str | None = Field(default=None, max_length=4000)
     details: JsonObject = Field(default_factory=dict)
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class JobRetryRequest(StrictModel):
+    message: str | None = Field(default=None, max_length=4000)
     expected_version: int | None = Field(default=None, ge=1)
 
 

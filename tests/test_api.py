@@ -233,6 +233,101 @@ def test_health_capabilities_and_job_flow(tmp_path):
         assert invalid.json()["current_state"] == "SCANNING"
 
 
+def test_failed_job_retry_endpoint_restores_provenance_stage(tmp_path):
+    with make_client(tmp_path) as client:
+        job = client.post(
+            "/api/v1/jobs",
+            json={"source_path": "/storage/Film", "name": "Retry Film"},
+        ).json()
+        client.post("/api/v1/jobs/claim-next")
+        for state in ("READY", "ENCODING", "MUXING"):
+            response = client.post(
+                f"/api/v1/jobs/{job['id']}/transition", json={"state": state}
+            )
+            assert response.status_code == 200
+        failed = client.post(
+            f"/api/v1/jobs/{job['id']}/transition",
+            json={"state": "FAILED", "message": "mkvmerge failed"},
+        ).json()
+
+        stale = client.post(
+            f"/api/v1/jobs/{job['id']}/retry",
+            json={"expected_version": failed["version"] + 1},
+        )
+        assert stale.status_code == 409
+        assert "expected" in stale.json()["detail"]
+
+        response = client.post(f"/api/v1/jobs/{job['id']}/retry")
+
+        assert response.status_code == 200
+        retried = response.json()
+        assert retried["state"] == "MUXING"
+        assert retried["resume_state"] is None
+        assert retried["error"] is None
+        assert retried["progress"] is None
+        assert retried["finished_at"] is None
+        assert retried["version"] == failed["version"] + 1
+        assert retried["status_message"] == "retrying failed MUXING stage"
+        events = client.get(
+            "/api/v1/events", params={"job_id": job["id"]}
+        ).json()["items"]
+        assert events[-1]["kind"] == "job.retry"
+        assert events[-1]["state_from"] == "FAILED"
+        assert events[-1]["state_to"] == "MUXING"
+
+        repeated = client.post(f"/api/v1/jobs/{job['id']}/retry")
+        assert repeated.status_code == 409
+        assert repeated.json()["current_state"] == "MUXING"
+
+
+def test_failed_job_retry_endpoint_reports_active_blocker(tmp_path):
+    with make_client(tmp_path) as client:
+        failed_job = client.post(
+            "/api/v1/jobs",
+            json={"source_path": "/storage/Failed", "name": "Failed"},
+        ).json()
+        client.post("/api/v1/jobs/claim-next")
+        for state in ("READY", "ENCODING", "MUXING", "FAILED"):
+            response = client.post(
+                f"/api/v1/jobs/{failed_job['id']}/transition",
+                json={"state": state},
+            )
+            assert response.status_code == 200
+        blocker = client.post(
+            "/api/v1/jobs",
+            json={"source_path": "/storage/Blocker", "name": "Blocker"},
+        ).json()
+        claimed = client.post("/api/v1/jobs/claim-next").json()["job"]
+        assert claimed["id"] == blocker["id"]
+
+        response = client.post(f"/api/v1/jobs/{failed_job['id']}/retry")
+
+        assert response.status_code == 409
+        problem = response.json()
+        assert problem["active_job"]["id"] == blocker["id"]
+        unchanged = client.get(f"/api/v1/jobs/{failed_job['id']}").json()
+        assert unchanged["state"] == "FAILED"
+
+
+def test_failed_job_retry_endpoint_rejects_unsafe_failure_stage(tmp_path):
+    with make_client(tmp_path) as client:
+        job = client.post(
+            "/api/v1/jobs", json={"source_path": "/storage/Film"}
+        ).json()
+        client.post("/api/v1/jobs/claim-next")
+        failed = client.post(
+            f"/api/v1/jobs/{job['id']}/transition",
+            json={"state": "FAILED", "message": "scan failed"},
+        )
+        assert failed.status_code == 200
+
+        response = client.post(f"/api/v1/jobs/{job['id']}/retry")
+
+        assert response.status_code == 409
+        assert response.json()["current_state"] == "FAILED"
+        assert "not safely retryable" in response.json()["detail"]
+
+
 def test_scan_selection_artifact_and_event_endpoints(tmp_path):
     with make_client(tmp_path) as client:
         job = client.post(

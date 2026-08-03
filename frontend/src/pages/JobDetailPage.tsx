@@ -25,7 +25,7 @@ import {
   StopCircle,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import { Link, useLocation, useParams } from "react-router";
+import { Link, useLocation, useNavigate, useParams } from "react-router";
 import { api, ApiError, artifactContentUrl, fetchArtifactText } from "../api/client";
 import type { Artifact, DiscScanResult, EventRecord, Job, Scan } from "../api/types";
 import { ComparisonPanel } from "../components/ComparisonPanel";
@@ -36,6 +36,10 @@ import { normalizeStoredSelection } from "../selection";
 import { CONTENT_LABELS, formatBytes, formatDate, stageProgress, STATE_LABELS, stateTone } from "../utils";
 
 type Tab = "overview" | "settings" | "comparison" | "events" | "files";
+type JobDetailLocationState = {
+  newlyCreated?: boolean;
+  retryStarted?: boolean;
+};
 
 const tabs: Array<{ value: Tab; label: string; icon: typeof Info }> = [
   { value: "overview", label: "Áttekintés", icon: Gauge },
@@ -52,9 +56,12 @@ function latestSuccessfulScan(scans: Scan[]): Scan | undefined {
 export function JobDetailPage() {
   const { jobId = "" } = useParams();
   const location = useLocation();
+  const navigate = useNavigate();
+  const locationState = location.state as JobDetailLocationState | null;
   const requestedTab = new URLSearchParams(location.search).get("tab") as Tab | null;
   const [tab, setTab] = useState<Tab>(requestedTab && tabs.some((item) => item.value === requestedTab) ? requestedTab : "overview");
   const [cancelOpen, setCancelOpen] = useState(false);
+  const [retryOpen, setRetryOpen] = useState(false);
   const queryClient = useQueryClient();
   const jobQuery = useQuery({ queryKey: ["job", jobId], queryFn: () => api.job(jobId), refetchInterval: 4000 });
   const scansQuery = useQuery({ queryKey: ["scans", jobId], queryFn: () => api.scans(jobId), refetchInterval: 5000 });
@@ -72,6 +79,33 @@ export function JobDetailPage() {
     mutationFn: () => api.retryUpload(jobId),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["job", jobId] }),
   });
+  const retryJob = useMutation({
+    mutationFn: (expectedVersion: number) => api.retryJob(jobId, expectedVersion),
+    onSuccess: (retriedJob) => {
+      setRetryOpen(false);
+      queryClient.setQueryData(["job", jobId], retriedJob);
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["job", jobId] }),
+        queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+        queryClient.invalidateQueries({ queryKey: ["events", jobId] }),
+      ]);
+      navigate(`/jobs/${encodeURIComponent(jobId)}`, {
+        replace: true,
+        state: { retryStarted: true } satisfies JobDetailLocationState,
+      });
+    },
+  });
+
+  function openRetryConfirmation() {
+    retryJob.reset();
+    setRetryOpen(true);
+  }
+
+  function closeRetryConfirmation() {
+    if (retryJob.isPending) return;
+    retryJob.reset();
+    setRetryOpen(false);
+  }
 
   if (jobQuery.isLoading) return <div className="page"><LoadingPanel label="Munka betöltése…" /></div>;
   if (jobQuery.isError || !jobQuery.data) return (
@@ -97,13 +131,17 @@ export function JobDetailPage() {
           <div className="header-actions">
             <Badge tone={stateTone(job.state)}>{STATE_LABELS[job.state]}</Badge>
             {!terminal && <Button variant="danger" icon={<StopCircle size={17} />} onClick={() => setCancelOpen(true)}>Megszakítás kérése</Button>}
+            {job.state === "FAILED" && <Button icon={<RotateCcw size={17} />} onClick={openRetryConfirmation}>Folytatás a hibától</Button>}
             {job.state === "UPLOAD_FAILED" && <Button variant="secondary" icon={<RotateCcw size={17} />} loading={retryUpload.isPending} onClick={() => retryUpload.mutate()}>Feltöltés újra</Button>}
           </div>
         }
       />
 
-      {(location.state as { newlyCreated?: boolean } | null)?.newlyCreated && job.state === "QUEUED" && (
+      {locationState?.newlyCreated && job.state === "QUEUED" && (
         <Notice tone="success" title="A munka létrejött">A worker hamarosan elkezdi a lemez scanjét. Ezután itt választhatod ki a playlistet és a sávokat.</Notice>
+      )}
+      {locationState?.retryStarted && !terminal && (
+        <Notice tone="success" title="A munka folytatása elindult">A worker az ellenőrzött checkpointok alapján folytatja a feldolgozást.</Notice>
       )}
       {job.error && <Notice tone="danger" title="A worker hibát jelzett">{job.error}</Notice>}
       {job.state === "NEEDS_REVIEW" && <Notice tone="warning" title="Operátori ellenőrzés szükséges">{job.status_message || "A munkafolyamat csak a beállítások felülvizsgálata után folytatható."}</Notice>}
@@ -152,6 +190,18 @@ export function JobDetailPage() {
       >
         <Notice tone="warning">A rendszer állapotváltással kéri a megszakítást. A már elkészült munkafájlok és naplók megmaradnak az ellenőrizhető lezárásig.</Notice>
         {cancel.isError && <Notice tone="danger">{cancel.error instanceof ApiError ? cancel.error.detail : cancel.error.message}</Notice>}
+      </Modal>
+
+      <Modal
+        open={retryOpen}
+        title="Folytatod a hibától?"
+        onClose={closeRetryConfirmation}
+        footer={<><Button variant="ghost" disabled={retryJob.isPending} onClick={closeRetryConfirmation}>Mégse</Button><Button icon={<RotateCcw size={17} />} loading={retryJob.isPending} onClick={() => retryJob.mutate(job.version)}>Folytatás a hibától</Button></>}
+      >
+        <Notice tone="warning" title="A kész munka nem vész el">
+          Az újraindítás az érvényes szakasz-checkpointokat és a már elkészült munkafájlokat újrahasználja. A worker az első hiányzó vagy érvénytelen szakasztól folytatja, a hibás szakaszt pedig szükség szerint újrafuttatja.
+        </Notice>
+        {retryJob.isError && <Notice tone="danger" title="A folytatás nem indítható">{retryJob.error instanceof ApiError ? retryJob.error.detail : retryJob.error.message}</Notice>}
       </Modal>
     </div>
   );
