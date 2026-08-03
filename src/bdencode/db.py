@@ -33,6 +33,7 @@ from .models import (
     ScanUpdate,
     validate_transition,
 )
+from .progress import pipeline_progress_baseline
 
 
 SCHEMA_VERSION = 1
@@ -513,16 +514,23 @@ class Database:
 
                 now = utc_now()
                 retry_message = message or f"retrying failed {retry_stage.value} stage"
+                retry_progress = pipeline_progress_baseline(retry_stage)
+                if retry_progress is None:
+                    raise StateConflictError(
+                        f"FAILED stage {retry_stage.value} has no progress baseline",
+                        current=current,
+                    )
                 cursor = connection.execute(
                     """
                     UPDATE jobs SET state = ?, status_message = ?, error = NULL,
-                        resume_state = NULL, progress = NULL, finished_at = NULL,
+                        resume_state = NULL, progress = ?, finished_at = NULL,
                         updated_at = ?, version = version + 1
                     WHERE id = ? AND state = ? AND version = ?
                     """,
                     (
                         retry_stage.value,
                         retry_message,
+                        retry_progress,
                         now,
                         job_id,
                         JobState.FAILED.value,
@@ -639,31 +647,41 @@ class Database:
         *,
         message: str | None = None,
         details: dict[str, Any] | None = None,
+        expected_state: JobState | None = None,
+        emit_event: bool = True,
     ) -> Job:
         if not 0 <= progress <= 1:
             raise ValueError("progress must be between 0 and 1")
         with self._write() as connection:
             row = self._job_row(connection, job_id)
             current = JobState(row["state"])
+            if expected_state is not None and current is not expected_state:
+                raise StateConflictError(
+                    f"job state is {current.value}, expected {expected_state.value}",
+                    current=current,
+                )
             if current in TERMINAL_STATES:
                 raise StateConflictError(
                     "terminal jobs cannot report progress", current=current
                 )
+            previous = float(row["progress"]) if row["progress"] is not None else 0.0
+            effective_progress = max(previous, progress)
             now = utc_now()
             connection.execute(
                 """
                 UPDATE jobs SET progress = ?, status_message = ?, updated_at = ?,
                     version = version + 1 WHERE id = ?
                 """,
-                (progress, message, now, job_id),
+                (effective_progress, message, now, job_id),
             )
-            self._insert_event(
-                connection,
-                job_id=job_id,
-                kind="job.progress",
-                message=message,
-                payload={"progress": progress, **(details or {})},
-            )
+            if emit_event:
+                self._insert_event(
+                    connection,
+                    job_id=job_id,
+                    kind="job.progress",
+                    message=message,
+                    payload={**(details or {}), "progress": effective_progress},
+                )
             return self._decode_job(self._job_row(connection, job_id))
 
     def _transition_in_connection(
@@ -690,7 +708,13 @@ class Database:
         next_resume: str | None = row["resume_state"]
         if current is JobState.QUEUED and target is JobState.SCANNING:
             started_at = now
-            progress = 0.0
+        baseline = pipeline_progress_baseline(target)
+        if current is JobState.NEEDS_REVIEW and target is JobState.READY:
+            # A revised material selection invalidates downstream checkpoints,
+            # so the complete-pipeline meter restarts at READY deliberately.
+            progress = baseline
+        elif baseline is not None:
+            progress = max(float(progress or 0.0), baseline)
         if target is JobState.NEEDS_REVIEW:
             next_resume = current.value
         elif current is JobState.NEEDS_REVIEW:

@@ -22,6 +22,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
+from .chapters import render_matroska_chapters
 from .config import Settings
 from .capabilities import capability_snapshot
 from .db import Database
@@ -95,7 +96,8 @@ from .mux import (
     validate_hdr10_side_data,
     validate_mkvmerge_identification,
 )
-from .process import CommandRunner, ProcessFailure
+from .process import CommandRunner, ProcessFailure, ProcessInterrupted
+from .progress import EncodeProgressReporter
 from .qc.artifacts import inspect_png
 from .qc.audio import (
     analysis_command,
@@ -289,6 +291,9 @@ class Runner(Protocol):
         stderr_paths: Sequence[Path] | None = None,
         timeout: float | None = None,
         check: bool = True,
+        stderr_line_callback: Callable[[str], None] | None = None,
+        interrupt_requested: Callable[[], bool] | None = None,
+        poll_interval: float = 0.2,
     ) -> Any: ...
 
 
@@ -1087,6 +1092,7 @@ class PipelineWorker:
         runner_factory: Callable[[JobPaths], Runner] | None = None,
         upload_client_factory: Callable[[], ImgBBClient] | None = None,
         language_runtime: AudioLanguageRuntime | None = None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.database = database
         self.settings = settings.validate()
@@ -1099,6 +1105,7 @@ class PipelineWorker:
         self.language_runtime = language_runtime or AudioLanguageRuntime(
             settings.data_root
         )
+        self.stop_requested = stop_requested or (lambda: False)
         self._runners: dict[str, Runner] = {}
 
     def _runner(self, paths: JobPaths) -> Runner:
@@ -1126,6 +1133,13 @@ class PipelineWorker:
     def process_job(self, job: Job) -> Job:
         """Continue one job until completion or an operator-controlled pause."""
         while job.state not in TERMINAL_STATES:
+            if self.stop_requested():
+                LOG.info(
+                    "job %s paused at %s for worker shutdown",
+                    job.id,
+                    job.state.value,
+                )
+                return self.database.get_job(job.id)
             if job.state in {
                 JobState.AWAITING_SELECTION,
                 JobState.NEEDS_REVIEW,
@@ -1151,8 +1165,31 @@ class PipelineWorker:
                 else:
                     job = current
                 return job
+            except ProcessInterrupted:
+                current = self.database.get_job(job.id)
+                if current.state is JobState.CANCELLED:
+                    LOG.info("job %s encode stopped after operator cancellation", job.id)
+                elif self.stop_requested():
+                    LOG.info("job %s encode stopped for worker shutdown", job.id)
+                else:
+                    LOG.warning(
+                        "job %s process was interrupted; durable state remains %s",
+                        job.id,
+                        current.state.value,
+                    )
+                # Keeping the durable state lets the next worker invocation
+                # replay the stage or reuse a marker completed at the boundary;
+                # an API cancellation has already committed CANCELLED itself.
+                return current
             except (ImageUploadError, OSError) as exc:
                 current = self.database.get_job(job.id)
+                if self.stop_requested():
+                    LOG.info(
+                        "job %s stopped during %s without a failure transition",
+                        job.id,
+                        current.state.value,
+                    )
+                    return current
                 if current.state is JobState.UPLOADING:
                     return self.queue.advance(
                         job.id,
@@ -1163,7 +1200,15 @@ class PipelineWorker:
                 self._fail(current, exc)
                 return self.database.get_job(job.id)
             except Exception as exc:
-                self._fail(self.database.get_job(job.id), exc)
+                current = self.database.get_job(job.id)
+                if self.stop_requested():
+                    LOG.info(
+                        "job %s stopped during %s without a failure transition",
+                        job.id,
+                        current.state.value,
+                    )
+                    return current
+                self._fail(current, exc)
                 return self.database.get_job(job.id)
         return job
 
@@ -1532,26 +1577,89 @@ class PipelineWorker:
             "script_sha256": sha256_file(paths.script),
             "settings": selection.settings.to_dict(),
         }
+
+        def interrupted() -> bool:
+            if self.stop_requested():
+                return True
+            try:
+                return self.database.get_job(job.id).state is JobState.CANCELLED
+            except Exception:
+                LOG.exception(
+                    "job %s cancellation polling failed; encode continues", job.id
+                )
+                return False
+
         marker = paths.stages / "video-encode.json"
         if not _valid_stage(marker, inputs, [paths.encoded_video]):
+            temporary_video = paths.work / "video-encoded.partial.mkv"
+            temporary_video.unlink(missing_ok=True)
             commands = encode_pipeline_commands(
                 paths.script,
-                paths.encoded_video,
+                temporary_video,
                 selection.settings,
                 metadata={
                     "bdencode_job": job.id,
                     "bdencode_scan": scan.fingerprint,
                 },
             )
-            self._runner(paths).run_pipeline(
-                commands,
-                cwd=paths.work,
-                stderr_paths=[
-                    paths.logs / "vapoursynth.log",
-                    paths.logs / "video-encode.log",
-                ],
-            )
+            playlist = scan.playlist(selection.playlist_id)
+
+            def persist_progress(
+                progress: float, message: str, details: dict[str, object]
+            ) -> None:
+                self.database.record_progress(
+                    job.id,
+                    progress,
+                    message=message,
+                    details=details,
+                    expected_state=JobState.ENCODING,
+                    emit_event="milestone_percent" in details,
+                )
+
+            reporter: EncodeProgressReporter | None = None
+            try:
+                reporter = EncodeProgressReporter(
+                    playlist.duration_seconds,
+                    paths.logs / "video-progress.jsonl",
+                    persist_progress,
+                )
+                reporter.start()
+            except Exception:
+                # Invalid legacy duration metadata must not turn optional
+                # progress observation into an encode failure.
+                LOG.exception(
+                    "job %s video progress reporter is unavailable; encode continues",
+                    job.id,
+                )
+
+            try:
+                self._runner(paths).run_pipeline(
+                    commands,
+                    cwd=paths.work,
+                    stderr_paths=[
+                        paths.logs / "vapoursynth.log",
+                        paths.logs / "video-encode.log",
+                    ],
+                    stderr_line_callback=reporter.handle_line if reporter else None,
+                    interrupt_requested=interrupted,
+                )
+                # Close the tiny race in which cancellation commits after the
+                # final poll but before a successful temporary output is
+                # promoted to the durable checkpoint path.
+                if interrupted():
+                    raise ProcessInterrupted()
+                os.replace(temporary_video, paths.encoded_video)
+                if reporter is not None:
+                    reporter.complete()
+            except BaseException:
+                temporary_video.unlink(missing_ok=True)
+                raise
             _write_stage(marker, inputs, [paths.encoded_video])
+        # Hashing and writing a multi-gigabyte checkpoint creates a real race
+        # window after FFmpeg exits. Stop cleanly at the durable boundary rather
+        # than entering mux/QC after shutdown or operator cancellation.
+        if interrupted():
+            raise ProcessInterrupted()
         self.queue.advance(job.id, JobState.MUXING, message="video encode complete")
 
     @staticmethod
@@ -1638,21 +1746,23 @@ class PipelineWorker:
             )
             (audio if stream.kind is StreamKind.AUDIO else subtitles).append(track)
 
+        playlist = scan.playlist(selection.playlist_id)
         chapters = paths.work / "chapters.xml"
-        chapter_inputs = {"reference_sha256": sha256_file(paths.reference)}
-        chapter_marker = paths.stages / "chapters.json"
-        if not _valid_stage(chapter_marker, chapter_inputs, [chapters]):
-            chapter_result = self._runner(paths).run(
-                ["mkvextract", str(paths.reference), "chapters", str(chapters)],
-                cwd=paths.work,
-                stderr_path=paths.logs / "chapters.log",
-                ok_returncodes=(0, 1),
-            )
-            _write_stage(chapter_marker, chapter_inputs, [chapters])
-            if getattr(chapter_result, "returncode", 0) == 1:
-                raise ReviewRequired(
-                    "mkvextract completed with warnings; inspect chapters.log before resuming"
+        chapters_path: Path | None = None
+        if playlist.chapters:
+            chapter_inputs = {
+                "format": "matroska-chapters-v1",
+                "scan_fingerprint": scan.fingerprint,
+                "playlist_id": playlist.playlist_id,
+                "chapter_starts": list(playlist.chapters),
+            }
+            chapter_marker = paths.stages / "chapters.json"
+            if not _valid_stage(chapter_marker, chapter_inputs, [chapters]):
+                _atomic_write_text(
+                    chapters, render_matroska_chapters(playlist.chapters)
                 )
+                _write_stage(chapter_marker, chapter_inputs, [chapters])
+            chapters_path = chapters
 
         sanitized_log = paths.logs / "encode.log"
         self._write_sanitized_log(job, selection, paths, sanitized_log)
@@ -1671,7 +1781,9 @@ class PipelineWorker:
                 {"path": str(item.path), "sha256": sha256_file(item.path)}
                 for item in (*audio, *subtitles)
             ],
-            "chapters_sha256": sha256_file(chapters),
+            "chapters_sha256": (
+                sha256_file(chapters_path) if chapters_path is not None else None
+            ),
             "log_sha256": sha256_file(sanitized_log),
             "tags_sha256": sha256_file(tags),
         }
@@ -1680,7 +1792,7 @@ class PipelineWorker:
             paths.encoded_video,
             audio_tracks=audio,
             subtitle_tracks=subtitles,
-            chapters_path=chapters,
+            chapters_path=chapters_path,
             tags_path=tags,
             sanitized_log_path=sanitized_log,
             title=selection.output_name,
@@ -2727,11 +2839,11 @@ def run_worker(
     settings = settings.validate()
     settings.create_directories()
     database.initialize()
-    worker = PipelineWorker(database, settings)
     interval = settings.worker_poll_seconds if poll_interval is None else poll_interval
     if interval < 0:
         raise ValueError("poll_interval cannot be negative")
     stopping = False
+    worker = PipelineWorker(database, settings, stop_requested=lambda: stopping)
     instance_lock = None
     fcntl_module = None
 

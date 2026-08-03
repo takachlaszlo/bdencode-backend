@@ -1,7 +1,7 @@
 import { ArrowRight, Check, Clock3, Disc3 } from "lucide-react";
 import { Link } from "react-router";
 import type { Job } from "../api/types";
-import { CONTENT_LABELS, formatDate, stageProgress, STATE_LABELS, stateTone } from "../utils";
+import { CONTENT_LABELS, formatDate, formatStatusMessage, stageProgress, STATE_LABELS, stateTone } from "../utils";
 import { Badge, ProgressBar } from "./ui";
 
 export function JobCard({ job, compact = false }: { job: Job; compact?: boolean }) {
@@ -24,7 +24,7 @@ export function JobCard({ job, compact = false }: { job: Job; compact?: boolean 
             <ProgressBar value={progress} />
             <div className="job-card__meta">
               <span><Clock3 size={14} aria-hidden="true" /> {formatDate(job.updated_at)}</span>
-              <span className="job-card__message">{job.status_message || "Munkafolyamat előkészítve"}</span>
+              <span className="job-card__message">{formatStatusMessage(job.status_message, "Munkafolyamat előkészítve")}</span>
             </div>
           </>
         )}

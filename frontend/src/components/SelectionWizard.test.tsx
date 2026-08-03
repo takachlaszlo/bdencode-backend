@@ -100,7 +100,7 @@ describe("SelectionWizard", () => {
     );
 
     await user.click(
-      screen.getByRole("button", { name: "Jóváhagyás és várólistára helyezés" }),
+      screen.getByRole("button", { name: "Jóváhagyás és automatikus indítás" }),
     );
     await waitFor(() => expect(api.saveSelection).toHaveBeenCalledTimes(1));
     expect(onComplete).toHaveBeenCalledTimes(1);

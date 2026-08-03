@@ -6,7 +6,7 @@ import re
 import struct
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import pytest
 from fastapi.testclient import TestClient
@@ -38,6 +38,7 @@ from bdencode.models import (
     ScanState,
     ScanUpdate,
 )
+from bdencode.process import ProcessInterrupted
 from bdencode.queue import JobQueue
 from bdencode.worker import (
     JobPaths,
@@ -348,6 +349,9 @@ class FakeRunner:
         stderr_paths: Sequence[Path] | None = None,
         timeout: float | None = None,
         check: bool = True,
+        stderr_line_callback: Callable[[str], None] | None = None,
+        interrupt_requested: Callable[[], bool] | None = None,
+        poll_interval: float = 0.2,
     ) -> None:
         normalized = [
             tuple(os.fspath(item) for item in command) for command in commands
@@ -458,6 +462,18 @@ def _selection(**updates: Any) -> dict[str, Any]:
     return value
 
 
+def _prepare_encoding(context):
+    database, _settings, scan, _scanner, _runner, worker = context
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    awaiting_selection = worker.process_one_stage(claimed)
+    ready = database.set_selection(awaiting_selection.id, _selection())
+    encoding = worker.process_one_stage(ready)
+    assert encoding.state is JobState.ENCODING
+    return job, encoding
+
+
 def test_scan_checkpoint_survives_crash_before_database_transition(
     context, monkeypatch
 ):
@@ -536,6 +552,173 @@ def test_prepare_checkpoint_skips_reference_remux_after_transition_crash(
         )
         == 1
     )
+
+
+def test_video_encode_promotes_only_successful_temporary_output(context):
+    database, settings, _scan, _scanner, _runner, worker = context
+    job, encoding = _prepare_encoding(context)
+    paths = JobPaths.create(settings, job.id)
+
+    result = worker.process_one_stage(encoding)
+
+    assert result.state is JobState.MUXING
+    assert paths.encoded_video.read_bytes() == b"mock-video"
+    assert not (paths.work / "video-encoded.partial.mkv").exists()
+    assert (paths.stages / "video-encode.json").is_file()
+    progress_records = [
+        json.loads(line)
+        for line in (paths.logs / "video-progress.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert progress_records[-1]["stage_fraction"] == 1.0
+    assert database.get_job(job.id).progress == 0.78
+    progress_events = [
+        event
+        for event in database.list_events(job_id=job.id)
+        if event.kind == "job.progress"
+    ]
+    assert [event.payload["milestone_percent"] for event in progress_events] == [
+        0,
+        100,
+    ]
+
+
+def test_invalid_duration_disables_only_progress_observation(context):
+    database, settings, scan, scanner, _runner, worker = context
+    scanner.result = replace(
+        scan,
+        playlists=(replace(scan.playlists[0], duration_seconds=0),),
+    )
+    job, encoding = _prepare_encoding(context)
+
+    result = worker.process_one_stage(encoding)
+    paths = JobPaths.create(settings, job.id)
+
+    assert result.state is JobState.MUXING
+    assert paths.encoded_video.is_file()
+    assert not (paths.logs / "video-progress.jsonl").exists()
+
+
+def test_api_cancellation_interrupts_encode_without_failed_transition(context):
+    database, settings, _scan, _scanner, _runner, worker = context
+    job, encoding = _prepare_encoding(context)
+
+    class CancellingRunner(FakeRunner):
+        def run_pipeline(self, commands, **kwargs):
+            normalized = [
+                tuple(os.fspath(item) for item in command) for command in commands
+            ]
+            self.commands.extend(normalized)
+            self._write(Path(normalized[-1][-1]), b"partial-video")
+            worker.queue.cancel(job.id, message="operator cancelled")
+            assert kwargs["interrupt_requested"]()
+            raise ProcessInterrupted()
+
+    cancelling_runner = CancellingRunner()
+    interrupted_worker = PipelineWorker(
+        database,
+        settings,
+        runner_factory=lambda _paths: cancelling_runner,
+    )
+
+    result = interrupted_worker.process_job(encoding)
+    paths = JobPaths.create(settings, job.id)
+
+    assert result.state is JobState.CANCELLED
+    assert result.error is None
+    assert not paths.encoded_video.exists()
+    assert not (paths.work / "video-encoded.partial.mkv").exists()
+    assert not (paths.stages / "video-encode.json").exists()
+    assert all(
+        event.state_to is not JobState.FAILED
+        for event in database.list_events(job_id=job.id)
+    )
+
+
+def test_service_stop_interrupts_encode_and_leaves_stage_resumable(context):
+    database, settings, _scan, _scanner, _runner, _worker = context
+    job, encoding = _prepare_encoding(context)
+    stopping = [False]
+
+    class StoppingRunner(FakeRunner):
+        def run_pipeline(self, commands, **kwargs):
+            normalized = [
+                tuple(os.fspath(item) for item in command) for command in commands
+            ]
+            self.commands.extend(normalized)
+            self._write(Path(normalized[-1][-1]), b"partial-video")
+            stopping[0] = True
+            assert kwargs["interrupt_requested"]()
+            raise ProcessInterrupted()
+
+    stopping_worker = PipelineWorker(
+        database,
+        settings,
+        runner_factory=lambda _paths: StoppingRunner(),
+        stop_requested=lambda: stopping[0],
+    )
+
+    result = stopping_worker.process_job(encoding)
+    paths = JobPaths.create(settings, job.id)
+
+    assert result.state is JobState.ENCODING
+    assert result.error is None
+    assert not paths.encoded_video.exists()
+    assert not (paths.work / "video-encoded.partial.mkv").exists()
+    assert not (paths.stages / "video-encode.json").exists()
+
+
+def test_service_stop_after_video_checkpoint_pauses_before_mux(
+    context, monkeypatch
+):
+    database, settings, _scan, _scanner, runner, worker = context
+    job, encoding = _prepare_encoding(context)
+    stopping = [False]
+    original_write_stage = worker_module._write_stage
+
+    def stop_after_video_marker(marker, inputs, outputs):
+        original_write_stage(marker, inputs, outputs)
+        if marker.name == "video-encode.json":
+            stopping[0] = True
+
+    monkeypatch.setattr(worker_module, "_write_stage", stop_after_video_marker)
+    worker.stop_requested = lambda: stopping[0]
+
+    paused = worker.process_job(encoding)
+    paths = JobPaths.create(settings, job.id)
+
+    assert paused.state is JobState.ENCODING
+    assert paths.encoded_video.is_file()
+    assert (paths.stages / "video-encode.json").is_file()
+    encode_calls = sum(command[0] == "vspipe" for command in runner.commands)
+
+    stopping[0] = False
+    resumed = worker.process_one_stage(paused)
+
+    assert resumed.state is JobState.MUXING
+    assert sum(command[0] == "vspipe" for command in runner.commands) == encode_calls
+
+
+def test_api_cancel_after_video_checkpoint_never_enters_mux(context, monkeypatch):
+    database, settings, _scan, _scanner, runner, worker = context
+    job, encoding = _prepare_encoding(context)
+    original_write_stage = worker_module._write_stage
+
+    def cancel_after_video_marker(marker, inputs, outputs):
+        original_write_stage(marker, inputs, outputs)
+        if marker.name == "video-encode.json":
+            worker.queue.cancel(job.id, message="operator cancelled")
+
+    monkeypatch.setattr(worker_module, "_write_stage", cancel_after_video_marker)
+
+    cancelled = worker.process_job(encoding)
+    paths = JobPaths.create(settings, job.id)
+
+    assert cancelled.state is JobState.CANCELLED
+    assert paths.encoded_video.is_file()
+    assert (paths.stages / "video-encode.json").is_file()
+    assert not any(command[0] == "mkvmerge" for command in runner.commands)
 
 
 def test_language_inference_report_survives_ready_stage_replay(context, monkeypatch):
@@ -658,6 +841,53 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     tampered.write_bytes(tampered.read_bytes() + b"tampered")
     with pytest.raises(RuntimeError, match="hash differs"):
         _current_comparison_pngs(job_paths)
+
+
+def test_mux_chapters_come_from_reviewed_playlist(context):
+    database, settings, scan, scanner, runner, worker = context
+    scanner.result = replace(
+        scan,
+        playlists=(replace(scan.playlists[0], chapters=(0.0, 440.08, 1007.6)),),
+    )
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.COMPLETED
+    assert not any(command[0] == "mkvextract" for command in runner.commands)
+    mux_command = next(
+        command
+        for command in runner.commands
+        if command[0] == "mkvmerge" and "--output" in command
+    )
+    assert "--chapters" in mux_command
+    chapters = settings.job_root(job.id) / "work" / "chapters.xml"
+    assert chapters.is_file()
+    assert "00:07:20.080000000" in chapters.read_text(encoding="utf-8")
+
+
+def test_mux_omits_chapter_option_when_playlist_has_none(context):
+    database, _settings, scan, _scanner, runner, worker = context
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.COMPLETED
+    assert not any(command[0] == "mkvextract" for command in runner.commands)
+    mux_command = next(
+        command
+        for command in runner.commands
+        if command[0] == "mkvmerge" and "--output" in command
+    )
+    assert "--chapters" not in mux_command
 
 
 def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):

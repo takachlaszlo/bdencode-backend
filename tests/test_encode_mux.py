@@ -62,6 +62,9 @@ def test_encode_pipeline_has_no_shell_syntax() -> None:
     assert len(commands) == 2
     assert commands[0][-1] == "-"
     assert "pipe:0" in commands[1]
+    assert commands[1][commands[1].index("-progress") + 1] == "pipe:2"
+    assert commands[1][commands[1].index("-stats_period") + 1] == "2"
+    assert "-nostats" in commands[1]
     assert all("|" not in argument for command in commands for argument in command)
 
 

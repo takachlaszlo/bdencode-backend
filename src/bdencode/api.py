@@ -407,6 +407,8 @@ def create_app(
             request.progress,
             message=request.message,
             details=request.details,
+            expected_state=request.expected_state,
+            emit_event=request.emit_event,
         )
 
     @application.post(f"{API_PREFIX}/jobs/{{job_id}}/resume", response_model=Job)

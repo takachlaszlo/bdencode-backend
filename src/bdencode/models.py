@@ -237,6 +237,8 @@ class JobProgressRequest(StrictModel):
     progress: float = Field(ge=0, le=1)
     message: str | None = Field(default=None, max_length=4000)
     details: JsonObject = Field(default_factory=dict)
+    expected_state: JobState | None = None
+    emit_event: bool = True
 
 
 class ScanCreate(StrictModel):

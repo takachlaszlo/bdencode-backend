@@ -233,6 +233,53 @@ def test_health_capabilities_and_job_flow(tmp_path):
         assert invalid.json()["current_state"] == "SCANNING"
 
 
+def test_progress_endpoint_honors_expected_state_and_event_control(tmp_path):
+    with make_client(tmp_path) as client:
+        job = client.post(
+            "/api/v1/jobs",
+            json={"source_path": "/storage/Film", "name": "Progress Film"},
+        ).json()
+        client.post("/api/v1/jobs/claim-next")
+        for state in ("READY", "ENCODING"):
+            response = client.post(
+                f"/api/v1/jobs/{job['id']}/transition", json={"state": state}
+            )
+            assert response.status_code == 200
+        before = len(
+            client.get("/api/v1/events", params={"job_id": job["id"]}).json()[
+                "items"
+            ]
+        )
+
+        updated = client.post(
+            f"/api/v1/jobs/{job['id']}/progress",
+            json={
+                "progress": 0.5,
+                "message": "Videó kódolása: 55.6%",
+                "expected_state": "ENCODING",
+                "emit_event": False,
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["progress"] == 0.5
+        after = len(
+            client.get("/api/v1/events", params={"job_id": job["id"]}).json()[
+                "items"
+            ]
+        )
+        assert after == before
+
+        client.post(
+            f"/api/v1/jobs/{job['id']}/transition", json={"state": "MUXING"}
+        )
+        late = client.post(
+            f"/api/v1/jobs/{job['id']}/progress",
+            json={"progress": 0.9, "expected_state": "ENCODING"},
+        )
+        assert late.status_code == 409
+        assert late.json()["current_state"] == "MUXING"
+
+
 def test_failed_job_retry_endpoint_restores_provenance_stage(tmp_path):
     with make_client(tmp_path) as client:
         job = client.post(
@@ -264,7 +311,7 @@ def test_failed_job_retry_endpoint_restores_provenance_stage(tmp_path):
         assert retried["state"] == "MUXING"
         assert retried["resume_state"] is None
         assert retried["error"] is None
-        assert retried["progress"] is None
+        assert retried["progress"] == 0.78
         assert retried["finished_at"] is None
         assert retried["version"] == failed["version"] + 1
         assert retried["status_message"] == "retrying failed MUXING stage"

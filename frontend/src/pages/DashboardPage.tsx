@@ -15,7 +15,7 @@ import { api } from "../api/client";
 import type { Job } from "../api/types";
 import { JobCard } from "../components/JobCard";
 import { Badge, Card, EmptyState, LoadingPanel, PageHeader, ProgressBar } from "../components/ui";
-import { formatDate, isActiveState, stageProgress, STATE_LABELS, stateTone } from "../utils";
+import { formatDate, formatStatusMessage, isActiveState, stageProgress, STATE_LABELS, stateTone } from "../utils";
 
 function nestedNumber(value: unknown, ...keys: string[]): number | null {
   let current: unknown = value;
@@ -81,8 +81,8 @@ export function DashboardPage() {
             <LoadingPanel />
           ) : active ? (
             <>
-              <div className="active-card__progress-number">{Math.round(stageProgress(active) * 100)}<small>%</small></div>
-              <ProgressBar value={stageProgress(active)} label={active.status_message || STATE_LABELS[active.state]} />
+              <div className="active-card__progress-number">{Math.round(stageProgress(active) * 100)}<small>% · teljes</small></div>
+              <ProgressBar value={stageProgress(active)} label={formatStatusMessage(active.status_message, STATE_LABELS[active.state])} />
               <Link to={`/jobs/${active.id}`} className="text-link">Részletek megnyitása <ArrowRight size={15} /></Link>
             </>
           ) : (

@@ -15,6 +15,7 @@ from bdencode.models import (
     ScanState,
     ScanUpdate,
 )
+from bdencode.progress import pipeline_progress_baseline
 from bdencode.queue import JobQueue
 
 
@@ -88,6 +89,100 @@ def test_state_machine_rejects_skips_and_uses_optimistic_version(database):
 
     ready = queue.advance(job.id, JobState.READY, expected_version=claimed.version)
     assert ready.version == claimed.version + 1
+
+
+def test_pipeline_progress_baselines_and_updates_are_monotonic(database):
+    queue = JobQueue(database)
+    job = enqueue(queue, "progress")
+    scanning = queue.claim_next()
+    assert scanning is not None and scanning.progress == 0.02
+    ready = queue.advance(job.id, JobState.READY)
+    assert ready.progress == 0.12
+    encoding = queue.advance(job.id, JobState.ENCODING)
+    assert encoding.progress == 0.15
+
+    advanced = database.record_progress(
+        job.id,
+        0.5,
+        message="Videó kódolása: 55.6%",
+        expected_state=JobState.ENCODING,
+    )
+    regressed = database.record_progress(
+        job.id,
+        0.4,
+        message="stale observer update",
+        expected_state=JobState.ENCODING,
+    )
+    assert advanced.progress == 0.5
+    assert regressed.progress == 0.5
+    muxing = queue.advance(job.id, JobState.MUXING)
+    assert muxing.progress == 0.78
+
+
+def test_progress_expected_state_rejects_late_callback_without_event(database):
+    queue = JobQueue(database)
+    job = enqueue(queue, "late-progress")
+    queue.claim_next()
+    queue.advance(job.id, JobState.READY)
+    queue.advance(job.id, JobState.ENCODING)
+    before_events = len(database.list_events(job_id=job.id))
+
+    database.record_progress(
+        job.id,
+        0.3,
+        expected_state=JobState.ENCODING,
+        emit_event=False,
+    )
+    assert len(database.list_events(job_id=job.id)) == before_events
+    queue.advance(job.id, JobState.MUXING)
+
+    with pytest.raises(StateConflictError, match="expected ENCODING"):
+        database.record_progress(
+            job.id,
+            0.9,
+            expected_state=JobState.ENCODING,
+            emit_event=False,
+        )
+    assert database.get_job(job.id).progress == 0.78
+
+
+def test_reviewed_selection_resets_progress_to_ready_baseline(database):
+    queue = JobQueue(database)
+    job = enqueue(queue, "revised-selection")
+    queue.claim_next()
+    queue.advance(job.id, JobState.READY)
+    queue.advance(job.id, JobState.ENCODING)
+    database.record_progress(
+        job.id,
+        0.6,
+        expected_state=JobState.ENCODING,
+        emit_event=False,
+    )
+    queue.needs_review(job.id, message="crop must be revised")
+
+    revised = database.set_selection(job.id, {"playlist_id": "00001"})
+
+    assert revised.state is JobState.READY
+    assert revised.progress == pipeline_progress_baseline(JobState.READY)
+
+
+@pytest.mark.parametrize("terminal", (JobState.FAILED, JobState.CANCELLED))
+def test_terminal_error_state_preserves_last_progress(database, terminal):
+    queue = JobQueue(database)
+    job = enqueue(queue, f"terminal-{terminal.value}")
+    queue.claim_next()
+    queue.advance(job.id, JobState.READY)
+    queue.advance(job.id, JobState.ENCODING)
+    database.record_progress(
+        job.id,
+        0.42,
+        expected_state=JobState.ENCODING,
+        emit_event=False,
+    )
+
+    stopped = queue.advance(job.id, terminal, message="stopped")
+
+    assert stopped.progress == 0.42
 
 
 def test_needs_review_and_upload_failure_both_block_queue(database):
@@ -225,7 +320,7 @@ def test_failed_retry_restores_marker_guarded_stage_and_audits(database):
     assert retried.resume_state is None
     assert retried.error is None
     assert retried.status_message == "operator requested safe mux retry"
-    assert retried.progress is None
+    assert retried.progress == pipeline_progress_baseline(JobState.MUXING)
     assert retried.finished_at is None
     assert retried.version == failed.version + 1
     retry_event = database.list_events(job_id=failed.id)[-1]

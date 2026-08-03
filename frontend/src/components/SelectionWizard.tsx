@@ -369,7 +369,7 @@ export function SelectionWizard({
         <div>
           <span className="eyebrow">Scan elkészült</span>
           <h2>Kódolási beállítások</h2>
-          <p>A worker csak a jóváhagyott, szerveroldalon is ellenőrzött tervet indítja el.</p>
+          <p>Jóváhagyás után a worker automatikusan elindítja a szerveroldalon ellenőrzött tervet; külön indítógomb nincs.</p>
         </div>
         <div className="codec-lockup">
           <span>{scan.disc_kind === "uhd" ? "UHD" : "BD"}</span>
@@ -611,7 +611,7 @@ export function SelectionWizard({
             <span className="validation-card__icon">{validation ? <Check size={26} /> : <SlidersHorizontal size={26} />}</span>
             <span className="eyebrow">Szerveroldali planner</span>
             <h3>{validation ? "A terv érvényes" : "Ellenőrzésre vár"}</h3>
-            <p>{validation ? "A tényleges effektív profil elkészült. Most már biztonságosan várólistára tehető." : "A backend ugyanazzal a logikával ellenőriz, amelyet a worker kódoláskor használ."}</p>
+            <p>{validation ? "A tényleges effektív profil elkészült. Jóváhagyás után a worker automatikusan folytatja." : "A backend ugyanazzal a logikával ellenőriz, amelyet a worker kódoláskor használ."}</p>
             {validation && (
               <>
                 <dl className="summary-list">
@@ -628,7 +628,7 @@ export function SelectionWizard({
             {!validation ? (
               <Button icon={<Check size={17} />} onClick={() => validate.mutate()} loading={validate.isPending} disabled={needsColorConfirmation && !colorConfirmed}>Terv ellenőrzése</Button>
             ) : (
-              <Button icon={<Clapperboard size={18} />} onClick={() => save.mutate()} loading={save.isPending}>Jóváhagyás és várólistára helyezés</Button>
+              <Button icon={<Clapperboard size={18} />} onClick={() => save.mutate()} loading={save.isPending}>Jóváhagyás és automatikus indítás</Button>
             )}
           </Card>
         </div>

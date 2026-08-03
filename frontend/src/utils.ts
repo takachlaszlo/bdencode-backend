@@ -4,7 +4,7 @@ export const STATE_LABELS: Record<JobState, string> = {
   QUEUED: "Várólistán",
   SCANNING: "Lemez elemzése",
   AWAITING_SELECTION: "Beállításra vár",
-  READY: "Indításra kész",
+  READY: "Előkészítés",
   ENCODING: "Videó kódolása",
   MUXING: "MKV összeállítása",
   QC: "Minőség-ellenőrzés",
@@ -24,18 +24,18 @@ export const CONTENT_LABELS: Record<ContentType, string> = {
   SERIES: "Sorozat",
 };
 
-const PIPELINE: JobState[] = [
-  "QUEUED",
-  "SCANNING",
-  "AWAITING_SELECTION",
-  "READY",
-  "ENCODING",
-  "MUXING",
-  "QC",
-  "COMPARISON",
-  "UPLOADING",
-  "COMPLETED",
-];
+const PIPELINE_BASELINES: Partial<Record<JobState, number>> = {
+  QUEUED: 0,
+  SCANNING: 0.02,
+  AWAITING_SELECTION: 0.10,
+  READY: 0.12,
+  ENCODING: 0.15,
+  MUXING: 0.78,
+  QC: 0.85,
+  COMPARISON: 0.92,
+  UPLOADING: 0.98,
+  COMPLETED: 1,
+};
 
 export function stateTone(state: JobState): "neutral" | "info" | "success" | "warning" | "danger" {
   if (state === "COMPLETED") return "success";
@@ -49,9 +49,9 @@ export function stateTone(state: JobState): "neutral" | "info" | "success" | "wa
 
 export function stageProgress(job: Job): number {
   if (typeof job.progress === "number") return Math.max(0, Math.min(1, job.progress));
-  const index = PIPELINE.indexOf(job.state);
-  if (index < 0) return 0;
-  return index / (PIPELINE.length - 1);
+  const fallbackState = job.resume_state
+    ?? (job.state === "UPLOAD_FAILED" ? "UPLOADING" : job.state);
+  return PIPELINE_BASELINES[fallbackState] ?? 0;
 }
 
 export function isActiveState(state: JobState): boolean {
@@ -102,6 +102,55 @@ export function humanize(value: string): string {
   return value
     .replaceAll("_", " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+const EVENT_KIND_LABELS: Record<string, string> = {
+  "job.created": "Munka létrehozva",
+  "job.state": "Állapotváltozás",
+  "job.selection": "Beállítások jóváhagyva",
+  "job.progress": "Előrehaladás",
+  "job.retry": "Folytatás elindítva",
+  "scan.created": "Lemezvizsgálat létrehozva",
+  "scan.state": "Lemezvizsgálat állapota",
+  "artifact.created": "Melléklet létrehozva",
+};
+
+const EVENT_MESSAGE_LABELS: Record<string, string> = {
+  "claimed by worker": "A worker megkezdte a lemezvizsgálatot",
+  "scan complete; playlist, processing and tracks require confirmation": "A lemezvizsgálat elkészült; a playlist, a feldolgozás és a sávok jóváhagyásra várnak",
+  "selection accepted": "A beállítások elfogadva",
+  "reference timeline prepared": "A referencia-idővonal elkészült",
+  "video encode complete": "A videókódolás elkészült",
+  "final Matroska mux complete": "A végleges Matroska összeállítása elkészült",
+  "container and audio QC passed": "A konténer- és hangellenőrzés sikeres",
+  "I/P/B comparison complete": "Az I/P/B összehasonlítás elkészült",
+  "encode, QC and comparison completed": "A kódolás, az ellenőrzés és az összehasonlítás elkészült",
+  "image upload failed; retry is safe": "A képfeltöltés sikertelen; biztonságosan újrapróbálható",
+};
+
+export function formatStatusMessage(message: string | null, fallback: string): string {
+  if (!message) return fallback;
+  const retry = /^retrying failed ([A-Z_]+) stage$/.exec(message);
+  if (retry) {
+    const state = retry[1] as JobState;
+    return `${STATE_LABELS[state] ?? retry[1]}: biztonságos folytatás`;
+  }
+  return EVENT_MESSAGE_LABELS[message] ?? formatWorkerError(message);
+}
+
+export function formatWorkerError(error: string): string {
+  if (error.includes("chapters.xml")) {
+    return "A fejezetlista létrehozása sikertelen volt. A kész videó- és hangsávok megmaradtak; a javítás után biztonságosan folytatható.";
+  }
+  if (error.includes("subtitle.mks") || error.includes("-subtitle.mks")) {
+    return "Egy feliratsáv Matroska-fájlja nem készült el. A kész videó- és hangsávok megmaradtak; a javítás után biztonságosan folytatható.";
+  }
+  return error;
+}
+
+export function formatEventMessage(kind: string, message: string | null): string {
+  if (message && message !== kind) return formatStatusMessage(message, "");
+  return EVENT_KIND_LABELS[kind] ?? humanize(kind.replaceAll(".", "_"));
 }
 
 export function basename(path: string): string {

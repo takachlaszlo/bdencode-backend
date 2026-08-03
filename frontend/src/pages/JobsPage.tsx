@@ -33,7 +33,7 @@ export function JobsPage({ mode }: { mode: "queue" | "archive" }) {
       <PageHeader
         eyebrow={mode === "queue" ? "Munkafolyamat" : "Előzmények"}
         title={mode === "queue" ? "Várólista" : "Elkészült munkák"}
-        description={mode === "queue" ? "A rendszer egyszerre egy munkát dolgoz fel; a többi biztonságosan várakozik." : "Kész, hibás és megszakított kódolások visszakereshető mellékletekkel."}
+        description={mode === "queue" ? "A rendszer külön indítógomb nélkül, automatikusan dolgozza fel az első munkát; a többi biztonságosan várakozik." : "Kész, hibás és megszakított kódolások visszakereshető mellékletekkel."}
         actions={<Link className="button button--primary" to="/new"><CirclePlus size={18} /><span>Új kódolás</span></Link>}
       />
 

@@ -28,13 +28,13 @@ const failedJob = makeJob({
   state: "FAILED",
   progress: 0.55,
   status_message: "A muxolás sikertelen",
-  error: "FFmpeg nem tudta létrehozni a feliratsávot",
+  error: "FileNotFoundError: /job/work/chapters.xml",
   resume_state: "MUXING",
 });
 
 const retriedJob = makeJob({
   state: "MUXING",
-  progress: null,
+  progress: 0.78,
   status_message: "Folytatás az érvényes checkpointoktól",
   error: null,
   resume_state: null,
@@ -66,6 +66,8 @@ describe("JobDetailPage failed-job retry", () => {
     const { queryClient } = renderFailedJob();
     const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
 
+    expect(await screen.findByText(/A fejezetlista létrehozása sikertelen volt/)).toBeInTheDocument();
+
     await user.click(await screen.findByRole("button", { name: "Folytatás a hibától" }));
 
     const dialog = screen.getByRole("dialog", { name: "Folytatod a hibától?" });
@@ -78,7 +80,7 @@ describe("JobDetailPage failed-job retry", () => {
       expect(api.retryJob).toHaveBeenCalledWith("job-1", failedJob.version),
     );
     expect(await screen.findByText("A munka folytatása elindult")).toBeInTheDocument();
-    expect(screen.getByText("56%")).toBeInTheDocument();
+    expect(screen.getByText("78%")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Folytatod a hibától?" })).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Vissza a várólistához/ })).toBeInTheDocument();
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["job", "job-1"] });
