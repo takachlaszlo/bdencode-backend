@@ -60,6 +60,35 @@ def _path_check(path: Path, *, writable: bool) -> dict[str, Any]:
     return result
 
 
+def _data_path_check(settings: Settings) -> dict[str, Any]:
+    """Report workspace capacity and the narrow runtime write contract.
+
+    The systemd services deliberately see ``data_root`` itself as read-only.
+    Only the state, job, completed-output, cache and update subtrees are made
+    writable.  The UI's workspace status therefore represents those required
+    roots collectively while retaining the root mount's actual write result
+    for diagnostics.
+    """
+
+    root = _path_check(settings.data_root, writable=False)
+    required = {
+        "state": settings.state_root,
+        "jobs": settings.jobs_root,
+        "completed": settings.completed_root,
+        "cache": settings.cache_root,
+        "updates": settings.updates_root,
+    }
+    required_checks = {
+        name: _path_check(path, writable=True) for name, path in required.items()
+    }
+    runtime_writable = all(item["ok"] for item in required_checks.values())
+    root["root_writable"] = root["writable"]
+    root["writable"] = runtime_writable
+    root["ok"] = bool(root["readable"] and runtime_writable)
+    root["required_writable_paths"] = required_checks
+    return root
+
+
 def _credential_status() -> dict[str, Any]:
     credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
     candidates = []
@@ -147,7 +176,7 @@ def build_report(
     source_checks = [
         _path_check(path, writable=False) for path in settings.source_roots
     ]
-    data_check = _path_check(settings.data_root, writable=True)
+    data_check = _data_path_check(settings)
     vs = _vapoursynth_plugins()
     ffmpeg = snapshot["ffmpeg"]
     warnings: list[str] = []

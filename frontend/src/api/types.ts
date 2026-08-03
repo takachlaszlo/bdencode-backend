@@ -65,6 +65,8 @@ export interface RuntimePathCapability {
   exists?: boolean;
   readable?: boolean;
   writable?: boolean;
+  root_writable?: boolean;
+  required_writable_paths?: Record<string, RuntimePathCapability>;
   free_bytes?: number;
   total_bytes?: number;
   ok?: boolean;

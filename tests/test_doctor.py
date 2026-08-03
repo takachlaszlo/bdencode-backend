@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from bdencode import doctor
 from bdencode.cli import main
 from bdencode.config import Settings
 from bdencode.db import Database
@@ -151,3 +152,80 @@ def test_settings_cpu_quota_is_total_machine_fraction(tmp_path: Path) -> None:
         data_root=tmp_path / "encode", source_roots=(source,), cpu_limit_percent=80
     ).validate()
     assert settings.cpu_limit_percent == 80
+
+
+def test_data_path_uses_required_children_for_runtime_writability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "encode"
+    source = tmp_path / "storage"
+    data.mkdir()
+    source.mkdir()
+    settings = Settings(data_root=data, source_roots=(source,)).validate()
+    required = (
+        settings.state_root,
+        settings.jobs_root,
+        settings.completed_root,
+        settings.cache_root,
+        settings.updates_root,
+    )
+    for path in required:
+        path.mkdir()
+
+    def access(path: Path, mode: int) -> bool:
+        if mode == doctor.os.W_OK:
+            return Path(path) != data
+        return True
+
+    monkeypatch.setattr(doctor.os, "access", access)
+
+    report = doctor._data_path_check(settings)
+
+    assert report["path"] == str(data)
+    assert report["readable"] is True
+    assert report["root_writable"] is False
+    assert report["writable"] is True
+    assert report["ok"] is True
+    assert report["free_bytes"] > 0
+    assert report["total_bytes"] > 0
+    assert all(
+        item["ok"] for item in report["required_writable_paths"].values()
+    )
+
+
+@pytest.mark.parametrize("failure_mode", ["missing", "unwritable"])
+def test_data_path_fails_when_a_required_child_is_unusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    data = tmp_path / "encode"
+    source = tmp_path / "storage"
+    data.mkdir()
+    source.mkdir()
+    settings = Settings(data_root=data, source_roots=(source,)).validate()
+    required = {
+        "state": settings.state_root,
+        "jobs": settings.jobs_root,
+        "completed": settings.completed_root,
+        "cache": settings.cache_root,
+        "updates": settings.updates_root,
+    }
+    failed_path = required["cache"]
+    for path in required.values():
+        if failure_mode != "missing" or path != failed_path:
+            path.mkdir()
+
+    def access(path: Path, mode: int) -> bool:
+        if mode == doctor.os.W_OK:
+            return Path(path) not in {data, failed_path}
+        return True
+
+    monkeypatch.setattr(doctor.os, "access", access)
+
+    report = doctor._data_path_check(settings)
+
+    assert report["root_writable"] is False
+    assert report["writable"] is False
+    assert report["ok"] is False
+    assert report["required_writable_paths"]["cache"]["ok"] is False

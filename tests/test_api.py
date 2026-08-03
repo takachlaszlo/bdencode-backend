@@ -84,12 +84,19 @@ def test_runtime_capabilities_is_fresh_and_does_not_prepare_paths(
     assert calls == 2
     first_report = first.json()
     second_report = second.json()
-    assert first_report["paths"]["data"] == {
-        "path": str(data_root),
-        "exists": False,
-        "readable": False,
-        "writable": False,
-        "ok": False,
+    data_status = first_report["paths"]["data"]
+    assert data_status["path"] == str(data_root)
+    assert data_status["exists"] is False
+    assert data_status["readable"] is False
+    assert data_status["root_writable"] is False
+    assert data_status["writable"] is False
+    assert data_status["ok"] is False
+    assert set(data_status["required_writable_paths"]) == {
+        "state",
+        "jobs",
+        "completed",
+        "cache",
+        "updates",
     }
     assert first_report["vapoursynth"]["ok"] is True
     assert isinstance(first_report["warnings"], list)
