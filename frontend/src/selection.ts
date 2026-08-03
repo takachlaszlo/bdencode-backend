@@ -74,7 +74,12 @@ function normalizeCrop(value: unknown): Crop | null {
 function normalizeTrackAction(value: unknown): TrackAction | null {
   if (typeof value !== "string") return null;
   const normalized = value.toLowerCase();
-  return normalized === "copy" || normalized === "flac" || normalized === "omit"
+  return normalized === "copy"
+    || normalized === "flac"
+    || normalized === "ac3"
+    || normalized === "eac3"
+    || normalized === "dts"
+    || normalized === "omit"
     ? normalized
     : null;
 }

@@ -23,6 +23,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Protocol, Sequence
 
+from .audio import (
+    effective_audio_policy,
+    expected_audio_codec,
+)
 from .chapters import render_matroska_chapters
 from .config import Settings
 from .capabilities import capability_snapshot
@@ -109,6 +113,7 @@ from .qc.audio import (
     plan_spectrum_windows,
     spectrum_command,
     spectrum_stitch_command,
+    verify_audio_output,
 )
 from .qc.catbox import CatboxClient
 from .qc.freeimage import FreeimageClient
@@ -1868,6 +1873,15 @@ class PipelineWorker:
                 "stream_index": stream.index,
                 "action": item.action.value,
             }
+            if stream.kind is StreamKind.AUDIO:
+                audio_policy = effective_audio_policy(
+                    item.action.value,
+                    source_codec=stream.codec,
+                    source_profile=stream.codec_profile,
+                    source_channels=stream.channels,
+                    source_sample_rate=stream.sample_rate,
+                )
+                inputs["effective_audio_policy"] = audio_policy.to_dict()
             marker = paths.stages / f"track-{number:02d}.json"
             if not _valid_stage(marker, inputs, [output]):
                 if stream.kind is StreamKind.AUDIO:
@@ -1876,6 +1890,10 @@ class PipelineWorker:
                         stream.index,
                         output,
                         action=item.action.value,
+                        source_codec=stream.codec,
+                        source_profile=stream.codec_profile,
+                        source_channels=stream.channels,
+                        source_sample_rate=stream.sample_rate,
                     )
                 elif stream.kind is StreamKind.SUBTITLE:
                     command = subtitle_track_command(
@@ -2097,7 +2115,7 @@ class PipelineWorker:
         )
         audio_policies = [
             FinalTrackPolicy(
-                "audio", "flac" if item.action is TrackAction.FLAC else stream.codec
+                "audio", expected_audio_codec(item.action.value, stream.codec)
             )
             for _number, item, stream in retained_streams
             if stream.kind is StreamKind.AUDIO
@@ -2142,6 +2160,7 @@ class PipelineWorker:
             item.id: index for index, item in enumerate(playlist.audio_streams)
         }
         audio_inputs: dict[str, Any] = {
+            "manifest_schema_version": 2,
             "reference_sha256": sha256_file(paths.reference),
             "output_sha256": sha256_file(output),
             "tracks": [],
@@ -2150,6 +2169,13 @@ class PipelineWorker:
             entry for entry in retained_streams if entry[2].kind is StreamKind.AUDIO
         ]
         for final_audio_ordinal, (number, item, stream) in enumerate(retained):
+            audio_policy = effective_audio_policy(
+                item.action.value,
+                source_codec=stream.codec,
+                source_profile=stream.codec_profile,
+                source_channels=stream.channels,
+                source_sample_rate=stream.sample_rate,
+            )
             intermediate = self._track_path(paths, number, item, stream)
             source_audio_ordinal = audio_ordinals[stream.id]
             prefix = paths.analysis / f"audio-{number:02d}"
@@ -2167,6 +2193,7 @@ class PipelineWorker:
                 "reference": audio_inputs["reference_sha256"],
                 "final_output": audio_inputs["output_sha256"],
                 "intermediate": intermediate_sha256,
+                "effective_audio_policy": audio_policy.to_dict(),
             }
             commands: list[tuple[list[str], Path, Literal["stdout", "stderr"]]] = [
                 (
@@ -2180,12 +2207,6 @@ class PipelineWorker:
                     "stdout",
                 ),
                 (
-                    pcm_hash_command(paths.reference, source_audio_ordinal),
-                    source_pcm,
-                    "stdout",
-                ),
-                (pcm_hash_command(output, final_audio_ordinal), encode_pcm, "stdout"),
-                (
                     analysis_command(
                         paths.reference, source_audio_ordinal, source_analysis
                     ),
@@ -2198,6 +2219,19 @@ class PipelineWorker:
                     "stderr",
                 ),
             ]
+            if audio_policy.pcm_match_required:
+                commands[2:2] = [
+                    (
+                        pcm_hash_command(paths.reference, source_audio_ordinal),
+                        source_pcm,
+                        "stdout",
+                    ),
+                    (
+                        pcm_hash_command(output, final_audio_ordinal),
+                        encode_pcm,
+                        "stdout",
+                    ),
+                ]
             for command, result_path, result_mode in commands:
                 command_inputs = {
                     "argv": command,
@@ -2291,22 +2325,29 @@ class PipelineWorker:
                     inspect_png(final_spectrum, require_high_bit_depth=True)
 
             comparison = compare_audio_probes(source_value, encode_value)
-            pcm_match = sha256_file(source_pcm) == sha256_file(encode_pcm)
-            delay_tolerance = Decimal(1) / Decimal(source_value.sample_rate)
-            delay_match = abs(comparison.delay_seconds) <= delay_tolerance
-            structural_match = (
-                comparison.sample_rate_match
-                and comparison.channels_match
-                and comparison.channel_layout_match
+            pcm_match = (
+                sha256_file(source_pcm) == sha256_file(encode_pcm)
+                if audio_policy.pcm_match_required
+                else None
             )
-            if not structural_match or not pcm_match or not delay_match:
+            verification = verify_audio_output(
+                source_value,
+                encode_value,
+                audio_policy,
+                decoded_pcm_sha256_match=pcm_match,
+            )
+            one_sample_tolerance = Decimal(1) / Decimal(source_value.sample_rate)
+            delay_within_one_sample = (
+                abs(comparison.delay_seconds) <= one_sample_tolerance
+            )
+            if not verification.passed:
                 raise ReviewRequired(
                     f"final audio verification failed for {stream.id}",
                     details={
                         "action": item.action.value,
                         "comparison": comparison.to_dict(),
-                        "pcm_match": pcm_match,
-                        "delay_tolerance_seconds": str(delay_tolerance),
+                        "effective_target": audio_policy.to_dict(),
+                        "verification": verification.to_dict(),
                     },
                 )
             source_probe_value = asdict(source_value)
@@ -2322,11 +2363,27 @@ class PipelineWorker:
                     "source_probe": source_probe_value,
                     "encode_probe": encode_probe_value,
                     "comparison": comparison.to_dict(),
+                    "verification_mode": audio_policy.verification_mode,
+                    "effective_target": audio_policy.to_dict(),
+                    "verification": verification.to_dict(),
                     "decoded_pcm_sha256_match": pcm_match,
-                    "delay_within_one_sample": delay_match,
-                    "delay_tolerance_seconds": str(delay_tolerance),
-                    "source_pcm_sha256": sha256_file(source_pcm),
-                    "encode_pcm_sha256": sha256_file(encode_pcm),
+                    "decoded_pcm_sha256_required": audio_policy.pcm_match_required,
+                    "delay_within_one_sample": delay_within_one_sample,
+                    "timing_within_tolerance": verification.timing_within_tolerance,
+                    "duration_within_tolerance": verification.duration_within_tolerance,
+                    "delay_tolerance_seconds": str(
+                        verification.timing_tolerance_seconds
+                    ),
+                    "source_pcm_sha256": (
+                        sha256_file(source_pcm)
+                        if audio_policy.pcm_match_required
+                        else None
+                    ),
+                    "encode_pcm_sha256": (
+                        sha256_file(encode_pcm)
+                        if audio_policy.pcm_match_required
+                        else None
+                    ),
                     "source_spectrum": source_spectrum.name,
                     "encode_spectrum": encode_spectrum.name,
                     "source_spectrum_sha256": sha256_file(source_spectrum),
@@ -2336,29 +2393,29 @@ class PipelineWorker:
                     "spectrum_max_window_seconds": "300",
                 }
             )
-            audio_outputs.extend(
-                (
-                    source_probe,
-                    encode_probe,
-                    source_pcm,
-                    encode_pcm,
-                    source_analysis,
-                    encode_analysis,
-                    source_spectrum,
-                    encode_spectrum,
-                )
-            )
+            track_outputs = [
+                source_probe,
+                encode_probe,
+                source_analysis,
+                encode_analysis,
+                source_spectrum,
+                encode_spectrum,
+            ]
+            if audio_policy.pcm_match_required:
+                track_outputs.extend((source_pcm, encode_pcm))
+            audio_outputs.extend(track_outputs)
             audio_inputs["tracks"].append(
                 {
                     "stream": stream.id,
                     "action": item.action.value,
                     "sha256": intermediate_sha256,
+                    "effective_audio_policy": audio_policy.to_dict(),
                 }
             )
         audio_marker = paths.stages / "qc-audio.json"
         if not _valid_stage(audio_marker, audio_inputs, audio_outputs):
             atomic_write_json(
-                audio_manifest_path, {"schema_version": 1, "tracks": audio_results}
+                audio_manifest_path, {"schema_version": 2, "tracks": audio_results}
             )
             _write_stage(audio_marker, audio_inputs, audio_outputs)
 

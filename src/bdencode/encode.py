@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from bdencode.audio import audio_encode_args
 from bdencode.media.profiles import EncoderSettings
 
 
@@ -111,17 +112,28 @@ def audio_track_command(
     output_path: Path,
     *,
     action: str,
+    source_codec: str = "unknown",
+    source_profile: str | None = None,
+    source_channels: int | None = None,
+    source_sample_rate: int | None = None,
     ffmpeg: str = "ffmpeg",
 ) -> list[str]:
     if stream_index < 0:
         raise ValueError("stream_index cannot be negative")
-    normalized = action.lower()
-    if normalized not in {"copy", "flac"}:
-        raise ValueError("audio action must be copy or flac")
-    codec_args = (
-        ["-c:a", "copy"]
-        if normalized == "copy"
-        else ["-c:a", "flac", "-compression_level", "8"]
+    source_codec_token = "".join(
+        character for character in source_codec.casefold() if character.isalnum()
+    )
+    decoder_args = (
+        ["-drc_scale", "0"]
+        if source_codec_token in {"ac3", "eac3", "eac3secondary"}
+        else []
+    )
+    codec_args = audio_encode_args(
+        action,
+        source_codec=source_codec,
+        source_profile=source_profile,
+        source_channels=source_channels,
+        source_sample_rate=source_sample_rate,
     )
     return [
         ffmpeg,
@@ -130,6 +142,7 @@ def audio_track_command(
         "-v",
         "info",
         "-copyts",
+        *decoder_args,
         "-i",
         str(reference_path),
         "-map",
@@ -142,6 +155,8 @@ def audio_track_command(
         "-1",
         "-map_chapters",
         "-1",
+        "-f",
+        "matroska",
         "-y",
         str(output_path),
     ]

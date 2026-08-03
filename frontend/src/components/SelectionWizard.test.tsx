@@ -77,6 +77,11 @@ describe("SelectionWizard", () => {
     await user.click(screen.getByRole("button", { name: "Tovább" }));
     expect(screen.getByRole("heading", { name: "Hangsávok" })).toBeInTheDocument();
     expect(screen.getByDisplayValue("eng")).toBeInTheDocument();
+    for (const label of ["Copy", "FLAC", "AC-3", "E-AC-3", "DTS", "Kihagyás"]) {
+      expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
+    }
+    await user.click(screen.getByRole("button", { name: "E-AC-3" }));
+    expect(screen.getByText(/1024 kb\/s · 48 kHz · legfeljebb 5\.1/)).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Tovább" }));
     expect(screen.getByRole("heading", { name: "Ajánlott profil" })).toBeInTheDocument();
@@ -98,7 +103,7 @@ describe("SelectionWizard", () => {
           detail_level: "beginner",
           settings: expect.objectContaining({ crf: 18 }),
         }),
-        tracks: [expect.objectContaining({ stream_id: "audio:4352", action: "copy", language: "eng" })],
+        tracks: [expect.objectContaining({ stream_id: "audio:4352", action: "eac3", language: "eng" })],
         image_upload_provider: "catbox",
         dual_type_match: true,
       }),

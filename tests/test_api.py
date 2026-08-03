@@ -52,6 +52,9 @@ def test_runtime_capabilities_is_fresh_and_does_not_prepare_paths(
                 "encoders": sorted(doctor.MANDATORY_FFMPEG_ENCODERS),
                 "filters": sorted(doctor.MANDATORY_FFMPEG_FILTERS),
                 "protocols": sorted(doctor.MANDATORY_FFMPEG_PROTOCOLS),
+                "bitstream_filters": sorted(
+                    doctor.MANDATORY_FFMPEG_BITSTREAM_FILTERS
+                ),
             },
         }
 
@@ -204,6 +207,17 @@ def test_health_capabilities_and_job_flow(tmp_path):
         assert capabilities.status_code == 200
         assert capabilities.json()["constraints"]["max_active_jobs"] == 1
         assert capabilities.json()["output_video_codecs"] == ["x264", "x265"]
+        assert capabilities.json()["audio_actions"] == [
+            "copy",
+            "flac",
+            "ac3",
+            "eac3",
+            "dts",
+            "omit",
+        ]
+        assert capabilities.json()["constraints"]["audio_transcode_presets"]["dts"][
+            "bitrate_kbps"
+        ] == 1536
 
         first = client.post(
             "/api/v1/jobs",

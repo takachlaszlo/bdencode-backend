@@ -8,8 +8,10 @@ Tartós Blu-ray/UHD Blu-ray kódoló rendszer x264/x265 kimenethez, headless bac
 - UHD HEVC → x265, kizárólag statikus HDR10-megőrzéssel;
 - Dolby Vision, HDR10+ dinamikus metaadat és 3D/MVC kimenet tiltva;
 - film, koncert, anime, sorozatlemez, több playlist/edition és seamless branching modell;
-- sávonként `copy`, `flac` vagy `omit`, külön nyelv/név/default/forced/role;
-- Blu-ray LPCM-nél a Matroska által nem támogatott bitstream-copy helyett kötelező a veszteségmentes FLAC vagy az `omit`;
+- sávonként `copy`, `flac`, `ac3`, `eac3`, `dts` vagy `omit`, külön nyelv/név/default/forced/role;
+- rögzített minőségi audio presetek: AC-3 640 kb/s, E-AC-3 1024 kb/s és DTS core 1536 kb/s, 48 kHz-en, legfeljebb 5.1 csatornával;
+- DTS-HD célzott DTS-konverziójánál újrakódolás nélküli `dca_core` kinyerés; TrueHD/egyéb forrásnál ellenőrzött DTS core átkódolás;
+- Blu-ray LPCM-nél a Matroska által nem támogatott bitstream-copy helyett kötelező a FLAC/AC-3/E-AC-3/DTS konverzió vagy az `omit`;
 - kezdő, haladó és profi encoder-séma;
 - egyszerre pontosan egy teljes pipeline, SQLite WAL állapottal és reboot utáni folytatással;
 - frame-pontos VapourSynth + BestSource referencia, FFmpeg/x264/x265 encode;
@@ -17,7 +19,7 @@ Tartós Blu-ray/UHD Blu-ray kódoló rendszer x264/x265 kimenethez, headless bac
 - progresszív forrásnál az eredeti és a kész bitstream I/P/B típusa kötelezően egyezik;
 - gyors, rövid időablakokra korlátozott I/P/B mintavétel, alapból öt lossless PNG-párral és a kiválasztott képeken számolt SSIM/PSNR metrikával; teljes filmes VMAF-menet nélkül;
 - lossless PNG, HDR-native 16 bites és determinisztikus SDR proof;
-- teljes dekódolási QC, MediaInfo/MKVInfo, végső MKV codec/profile/szín/HDR10 hard gate, audio PCM/sample/delay/layout/loudness/phase/spektrum;
+- teljes dekódolási QC, MediaInfo/MKVInfo, végső MKV codec/profile/szín/HDR10 hard gate; veszteségmentes audiónál PCM-hash, veszteséges audiónál cél-codec/bitráta/mintavétel/csatorna/időzítés, továbbá loudness/phase/spektrum;
 - választható automatikus ImgBB → Catbox → Freeimage tartaléklánc vagy kézzel rögzített szolgáltató, egyetlen hostra zárt csomaggal, byteazonos visszaellenőrzéssel és BBCode-generálással;
 - raw és kitisztított log; az MKV csak a kitisztított encode logot kapja meg, comparison fájlokat soha;
 - MPLS/CLPI/PMT nyelv-provenance, ismeretlen audiónál CPU-only faster-whisper mintavétel, bizonytalanságnál review;

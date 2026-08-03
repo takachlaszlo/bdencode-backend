@@ -182,16 +182,29 @@ function formatMetric(value: number | null | undefined, digits: number, suffix =
     : "—";
 }
 
+const AUDIO_COMPARISON_LABELS: Record<AudioComparisonTrack["action"], string> = {
+  copy: "Veszteségmentes másolás",
+  flac: "FLAC konverzió",
+  ac3: "AC-3 konverzió",
+  eac3: "E-AC-3 konverzió",
+  dts: "DTS core kimenet",
+  omit: "Kihagyott sáv",
+};
+
 function AudioTrackComparison({ track, images }: { track: AudioComparisonTrack; images: Map<string, Artifact> }) {
   const source = images.get(track.source_spectrum);
   const encode = images.get(track.encode_spectrum);
+  const pcmRequired = track.decoded_pcm_sha256_required ?? (track.action === "copy" || track.action === "flac");
+  const timingMatch = track.timing_within_tolerance ?? track.delay_within_one_sample;
   return (
     <Card className="audio-track-card">
       <div className="audio-track-card__header">
-        <div><span className="audio-track-card__icon"><AudioWaveform size={20} /></span><div><h3>{track.stream_id}</h3><p>{track.action === "flac" ? "FLAC konverzió" : "Veszteségmentes másolás"}</p></div></div>
+        <div><span className="audio-track-card__icon"><AudioWaveform size={20} /></span><div><h3>{track.stream_id}</h3><p>{AUDIO_COMPARISON_LABELS[track.action]}</p></div></div>
         <div className="audio-checks">
-          <Badge tone={track.decoded_pcm_sha256_match ? "success" : "danger"}>{track.decoded_pcm_sha256_match ? "PCM egyezik" : "PCM eltérés"}</Badge>
-          <Badge tone={track.delay_within_one_sample ? "success" : "danger"}>{track.delay_within_one_sample ? "Időzítés rendben" : "Időzítési eltérés"}</Badge>
+          {pcmRequired
+            ? <Badge tone={track.decoded_pcm_sha256_match ? "success" : "danger"}>{track.decoded_pcm_sha256_match ? "PCM egyezik" : "PCM eltérés"}</Badge>
+            : <Badge tone="info">Veszteséges cél · PCM hash nem elvárt</Badge>}
+          <Badge tone={timingMatch ? "success" : "danger"}>{timingMatch ? "Időzítés rendben" : "Időzítési eltérés"}</Badge>
         </div>
       </div>
       {source && encode ? (
@@ -200,7 +213,7 @@ function AudioTrackComparison({ track, images }: { track: AudioComparisonTrack; 
           <figure><a href={artifactContentUrl(encode.id)} target="_blank" rel="noreferrer"><img src={artifactContentUrl(encode.id)} alt={`${track.stream_id} encode spektrum`} loading="lazy" /></a><figcaption>Encode <ExternalLink size={13} /></figcaption></figure>
         </div>
       ) : <Notice tone="warning">A spektrumképek még nem érhetők el mellékletként.</Notice>}
-      <details className="metric-details"><summary>Mérési részletek</summary><pre>{JSON.stringify(track.comparison, null, 2)}</pre></details>
+      <details className="metric-details"><summary>Mérési részletek</summary><pre>{JSON.stringify({ effective_target: track.effective_target, verification: track.verification, comparison: track.comparison }, null, 2)}</pre></details>
     </Card>
   );
 }

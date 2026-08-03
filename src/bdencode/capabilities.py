@@ -74,19 +74,25 @@ def discover_tool(name: str, runner: CommandRunner | None = None) -> ToolCapabil
 def ffmpeg_features(runner: CommandRunner | None = None) -> dict[str, list[str]]:
     command_runner = runner or CommandRunner()
     if not shutil.which("ffmpeg"):
-        return {"encoders": [], "filters": [], "protocols": []}
+        return {
+            "encoders": [],
+            "filters": [],
+            "protocols": [],
+            "bitstream_filters": [],
+        }
     result: dict[str, list[str]] = {}
     for category, flag in (
         ("encoders", "-encoders"),
         ("filters", "-filters"),
         ("protocols", "-protocols"),
+        ("bitstream_filters", "-bsfs"),
     ):
         completed = command_runner.capture(
             ["ffmpeg", "-hide_banner", flag], check=False
         )
         text = completed.stdout + completed.stderr
         wanted = {
-            "encoders": ("libx264", "libx265", "flac"),
+            "encoders": ("libx264", "libx265", "flac", "ac3", "eac3", "dca"),
             "filters": (
                 "libvmaf",
                 "ssim",
@@ -102,6 +108,7 @@ def ffmpeg_features(runner: CommandRunner | None = None) -> dict[str, list[str]]
                 "pad",
             ),
             "protocols": ("bluray",),
+            "bitstream_filters": ("dca_core",),
         }[category]
         result[category] = sorted(
             item for item in wanted if re.search(rf"\b{re.escape(item)}\b", text)

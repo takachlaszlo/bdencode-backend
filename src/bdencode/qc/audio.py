@@ -8,6 +8,8 @@ from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..audio import EffectiveAudioPolicy, audio_timing_tolerance
+
 
 @dataclass(frozen=True, slots=True)
 class AudioProbe:
@@ -19,6 +21,8 @@ class AudioProbe:
     start_time: Decimal
     duration: Decimal | None
     bits_per_raw_sample: int | None
+    profile: str | None = None
+    bit_rate: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +50,101 @@ class AudioComparison:
         if self.duration_delta_seconds is not None:
             result["duration_delta_seconds"] = str(self.duration_delta_seconds)
         return result
+
+
+@dataclass(frozen=True, slots=True)
+class AudioVerification:
+    verification_mode: str
+    expected_codec: str
+    expected_sample_rate: int
+    expected_channels: int
+    codec_match: bool
+    bitrate_match: bool
+    sample_rate_match: bool
+    channels_match: bool
+    target_structure_match: bool
+    decoded_pcm_sha256_required: bool
+    decoded_pcm_sha256_match: bool | None
+    timing_within_tolerance: bool
+    duration_within_tolerance: bool
+    timing_tolerance_seconds: Decimal
+    passed: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["timing_tolerance_seconds"] = str(self.timing_tolerance_seconds)
+        return value
+
+
+def verify_audio_output(
+    source: AudioProbe,
+    encode: AudioProbe,
+    policy: EffectiveAudioPolicy,
+    *,
+    decoded_pcm_sha256_match: bool | None,
+) -> AudioVerification:
+    comparison = compare_audio_probes(source, encode)
+    expected_codec = source.codec if policy.action == "copy" else policy.codec_name
+    expected_sample_rate = (
+        source.sample_rate if policy.sample_rate is None else policy.sample_rate
+    )
+    expected_channels = source.channels if policy.channels is None else policy.channels
+    codec_match = encode.codec.casefold() == expected_codec.casefold()
+    expected_bit_rate = (
+        policy.bitrate_kbps * 1000 if policy.bitrate_kbps is not None else None
+    )
+    bitrate_match = expected_bit_rate is None or encode.bit_rate == expected_bit_rate
+    sample_rate_match = encode.sample_rate == expected_sample_rate
+    channels_match = encode.channels == expected_channels
+    if policy.pcm_match_required:
+        target_structure_match = (
+            codec_match
+            and comparison.sample_rate_match
+            and comparison.channels_match
+            and comparison.channel_layout_match
+        )
+    else:
+        target_structure_match = (
+            codec_match and bitrate_match and sample_rate_match and channels_match
+        )
+    tolerance = (
+        Decimal(1) / Decimal(expected_sample_rate)
+        if policy.pcm_match_required
+        else audio_timing_tolerance(policy.action, expected_sample_rate)
+    )
+    timing_match = abs(comparison.delay_seconds) <= tolerance
+    duration_match = (
+        comparison.duration_delta_seconds is not None
+        and abs(comparison.duration_delta_seconds) <= tolerance
+    )
+    pcm_gate = (
+        decoded_pcm_sha256_match is True
+        if policy.pcm_match_required
+        else decoded_pcm_sha256_match is None
+    )
+    passed = (
+        target_structure_match
+        and timing_match
+        and pcm_gate
+        and (policy.pcm_match_required or duration_match)
+    )
+    return AudioVerification(
+        verification_mode=policy.verification_mode,
+        expected_codec=expected_codec,
+        expected_sample_rate=expected_sample_rate,
+        expected_channels=expected_channels,
+        codec_match=codec_match,
+        bitrate_match=bitrate_match,
+        sample_rate_match=sample_rate_match,
+        channels_match=channels_match,
+        target_structure_match=target_structure_match,
+        decoded_pcm_sha256_required=policy.pcm_match_required,
+        decoded_pcm_sha256_match=decoded_pcm_sha256_match,
+        timing_within_tolerance=timing_match,
+        duration_within_tolerance=duration_match,
+        timing_tolerance_seconds=tolerance,
+        passed=passed,
+    )
 
 
 MAX_SPECTRUM_WINDOW_SECONDS = Decimal("300")
@@ -131,6 +230,8 @@ def parse_audio_probe(document: str | bytes | Mapping[str, Any]) -> AudioProbe:
         sample_count = int((stream_duration * sample_rate).to_integral_value())
     return AudioProbe(
         codec=str(item.get("codec_name", "unknown")),
+        profile=_optional_str(item.get("profile")),
+        bit_rate=_optional_int(item.get("bit_rate")),
         sample_rate=sample_rate,
         channels=int(item["channels"]),
         channel_layout=item.get("channel_layout"),
@@ -150,6 +251,10 @@ def _optional_int(value: Any) -> int | None:
         return None if value in (None, "N/A", "") else int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_str(value: Any) -> str | None:
+    return None if value in (None, "N/A", "", "unknown") else str(value)
 
 
 def compare_audio_probes(source: AudioProbe, encoded: AudioProbe) -> AudioComparison:
@@ -179,7 +284,7 @@ def audio_probe_command(
         "-select_streams",
         f"a:{stream}",
         "-show_entries",
-        "stream=codec_type,codec_name,sample_rate,channels,channel_layout,nb_samples,start_time,duration,bits_per_raw_sample:format=duration",
+        "stream=codec_type,codec_name,profile,bit_rate,sample_rate,channels,channel_layout,nb_samples,start_time,duration,bits_per_raw_sample:format=duration",
         "-of",
         "json",
         str(path),

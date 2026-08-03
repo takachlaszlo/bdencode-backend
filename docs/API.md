@@ -65,7 +65,7 @@ Az `image_upload_provider` értéke `auto`, `imgbb`, `catbox` vagy `freeimage`.
 Automatikus módban a sorrend ImgBB → Catbox → Freeimage, és csak az első
 sikeres kép előtt engedélyezett a váltás. Kézi választásnál nincs failover.
 
-Minden audio- és feliratsávhoz explicit `copy`, `flac` vagy `omit` szükséges. FLAC csak audióhoz érvényes. `temporal_filter`: `progressive`, `ivtc_tff`, `ivtc_bff`, `bwdif_tff`, `bwdif_bff`, `hybrid_safe_bob_tff`, `hybrid_safe_bob_bff`.
+Minden audio- és feliratsávhoz explicit művelet szükséges. Audiónál: `copy`, `flac`, `ac3`, `eac3`, `dts` vagy `omit`; feliratnál csak `copy` vagy `omit`. Az audio célok determinisztikusak: AC-3 640 kb/s, E-AC-3 1024 kb/s, DTS core 1536 kb/s, mind 48 kHz-en és legfeljebb 5.1 csatornával. DTS-HD forrás `dts` céljánál a beágyazott core újrakódolás nélkül kerül kiemelésre. Az effektív presetek a `GET /api/v1/capabilities` válasz `constraints.audio_transcode_presets` mezőjében is olvashatók. `temporal_filter`: `progressive`, `ivtc_tff`, `ivtc_bff`, `bwdif_tff`, `bwdif_bff`, `hybrid_safe_bob_tff`, `hybrid_safe_bob_bff`.
 
 Az opcionális `dual_type_match` alapértéke `true`: progresszív timeline esetén az I/P/B pár csak akkor fogadható el, ha ugyanazon presentation frame az eredeti és a kész bitstreamben is ugyanabba a kategóriába tartozik. IVTC/deinterlace után a tömörítetlen referencia nem rendelkezik forrás-bitstream képtípussal, ezért ott a kategória a kész encode típusa, az index/PTS-egyezés továbbra is kötelező.
 

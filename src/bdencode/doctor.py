@@ -29,7 +29,7 @@ MANDATORY_TOOLS = (
     "bdencode-libbluray-scan",
 )
 RECOMMENDED_TOOLS = ("x264", "x265")
-MANDATORY_FFMPEG_ENCODERS = {"libx264", "libx265", "flac"}
+MANDATORY_FFMPEG_ENCODERS = {"libx264", "libx265", "flac", "ac3", "eac3", "dca"}
 MANDATORY_FFMPEG_FILTERS = {
     "ssim",
     "psnr",
@@ -43,6 +43,7 @@ MANDATORY_FFMPEG_FILTERS = {
     "pad",
 }
 MANDATORY_FFMPEG_PROTOCOLS = {"bluray"}
+MANDATORY_FFMPEG_BITSTREAM_FILTERS = {"dca_core"}
 
 
 def _path_check(path: Path, *, writable: bool) -> dict[str, Any]:
@@ -263,6 +264,10 @@ def build_report(
         "encoders": sorted(MANDATORY_FFMPEG_ENCODERS - set(ffmpeg["encoders"])),
         "filters": sorted(MANDATORY_FFMPEG_FILTERS - set(ffmpeg["filters"])),
         "protocols": sorted(MANDATORY_FFMPEG_PROTOCOLS - set(ffmpeg["protocols"])),
+        "bitstream_filters": sorted(
+            MANDATORY_FFMPEG_BITSTREAM_FILTERS
+            - set(ffmpeg.get("bitstream_filters", ()))
+        ),
     }
     if any(missing_ffmpeg.values()):
         warnings.append("mandatory FFmpeg capabilities missing")

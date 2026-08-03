@@ -63,4 +63,22 @@ describe("normalizeStoredSelection", () => {
       dualTypeMatch: true,
     });
   });
+
+  it.each(["ac3", "eac3", "dts"] as const)("preserves the %s audio target", (action) => {
+    const value = normalizeStoredSelection({
+      playlist_id: "00001",
+      tracks: [{ stream_id: "audio:4352", action }],
+    });
+
+    expect(value?.tracks).toEqual([{ stream_id: "audio:4352", action, order: 0 }]);
+  });
+
+  it("drops an unknown audio action instead of restoring an unsafe value", () => {
+    const value = normalizeStoredSelection({
+      playlist_id: "00001",
+      tracks: [{ stream_id: "audio:4352", action: "mp3" }],
+    });
+
+    expect(value?.tracks).toEqual([]);
+  });
 });

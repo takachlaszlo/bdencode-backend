@@ -9,6 +9,11 @@ from pathlib import Path
 import re
 from typing import Any
 
+from ..audio import (
+    AUDIO_TRANSCODE_PRESETS,
+    audio_encode_args,
+    effective_audio_policy,
+)
 from .bluray import (
     DiscKind,
     DiscScan,
@@ -28,6 +33,9 @@ _BCP47_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 class TrackAction(StrEnum):
     COPY = "copy"
     FLAC = "flac"
+    AC3 = "ac3"
+    EAC3 = "eac3"
+    DTS = "dts"
     OMIT = "omit"
 
 
@@ -271,11 +279,7 @@ class EncodePlanner:
         for number, (selection, stream) in enumerate(selected, start=1):
             if selection.action is TrackAction.OMIT:
                 continue
-            extension = (
-                ".flac"
-                if selection.action is TrackAction.FLAC
-                else (".mks" if stream.kind is StreamKind.SUBTITLE else ".mka")
-            )
+            extension = ".mks" if stream.kind is StreamKind.SUBTITLE else ".mka"
             intermediate = (
                 work_dir / f"track-{number:02d}-{stream.kind.value}{extension}"
             )
@@ -294,15 +298,56 @@ class EncodePlanner:
             ]
             if stream.kind is StreamKind.SUBTITLE:
                 argv.extend(("-an", "-c:s", "copy", "-f", "matroska"))
-            elif selection.action is TrackAction.FLAC:
-                argv.extend(("-sn", "-c:a", "flac", "-compression_level", "8"))
-                if stream.object_audio:
+            else:
+                audio_policy = effective_audio_policy(
+                    selection.action.value,
+                    source_codec=stream.codec,
+                    source_profile=stream.codec_profile,
+                    source_channels=stream.channels,
+                    source_sample_rate=stream.sample_rate,
+                )
+                argv.append("-sn")
+                argv.extend(
+                    audio_encode_args(
+                        selection.action.value,
+                        source_codec=stream.codec,
+                        source_profile=stream.codec_profile,
+                        source_channels=stream.channels,
+                        source_sample_rate=stream.sample_rate,
+                    )
+                )
+                argv.extend(("-f", "matroska"))
+                if stream.object_audio and selection.action is not TrackAction.COPY:
+                    handling = (
+                        "FLAC preserves channels/PCM but omits"
+                        if selection.action is TrackAction.FLAC
+                        else "DTS core extraction omits"
+                        if audio_policy.strategy == "dts_core_extract"
+                        else "transcoding omits"
+                    )
                     warnings.append(
-                        f"{stream.id} contains object-audio metadata; FLAC preserves channels/PCM but loses Atmos/DTS:X objects."
+                        f"{stream.id} contains object-audio metadata; {handling} "
+                        "Atmos/DTS:X objects."
                     )
                     needs_review = True
-            else:
-                argv.extend(("-sn", "-c:a", "copy"))
+                if audio_policy.verification_mode == "lossy_transcode":
+                    preset = AUDIO_TRANSCODE_PRESETS[selection.action.value]
+                    target_channels = audio_policy.channels
+                    warnings.append(
+                        f"{stream.id} is intentionally transcoded to lossy "
+                        f"{preset.label} at {preset.bitrate_kbps} kb/s and 48 kHz."
+                    )
+                    if target_channels != stream.channels:
+                        warnings.append(
+                            f"{stream.id} is {stream.channels}-channel audio; "
+                            f"{preset.label} is encoded as {target_channels} channels "
+                            "(maximum 5.1)."
+                        )
+                elif audio_policy.strategy == "dts_core_extract":
+                    warnings.append(
+                        f"{stream.id}: the embedded DTS core is extracted without "
+                        "re-encoding; DTS-HD/DTS:X extension data is omitted."
+                    )
             argv.append(os.fspath(intermediate))
             commands.append(
                 PlannedCommand(
@@ -365,6 +410,18 @@ class EncodePlanner:
                     "action": selection.action.value,
                     "resolved_language": selection.bcp47(stream),
                     "source_track": stream.to_dict(),
+                    "effective_audio_target": (
+                        effective_audio_policy(
+                            selection.action.value,
+                            source_codec=stream.codec,
+                            source_profile=stream.codec_profile,
+                            source_channels=stream.channels,
+                            source_sample_rate=stream.sample_rate,
+                        ).to_dict()
+                        if stream.kind is StreamKind.AUDIO
+                        and selection.action is not TrackAction.OMIT
+                        else None
+                    ),
                 }
                 for selection, stream in selected
             ],
@@ -468,7 +525,7 @@ class EncodePlanner:
         missing = set(eligible) - set(selections)
         if request.require_explicit_track_selection and missing:
             raise ValueError(
-                "every audio/subtitle track needs copy, FLAC or omit: "
+                "every audio/subtitle track needs an explicit output action or omit: "
                 + ", ".join(sorted(missing))
             )
         result: list[tuple[TrackSelection, MediaStream]] = []
@@ -476,18 +533,21 @@ class EncodePlanner:
             request.track_selections, key=lambda item: (item.order, item.stream_id)
         ):
             stream = eligible[selection.stream_id]
-            if (
-                stream.kind is StreamKind.SUBTITLE
-                and selection.action is TrackAction.FLAC
-            ):
-                raise ValueError("FLAC is valid only for audio tracks")
+            if stream.kind is StreamKind.SUBTITLE and selection.action not in {
+                TrackAction.COPY,
+                TrackAction.OMIT,
+            }:
+                raise ValueError(
+                    f"{selection.action.value} is valid only for audio tracks"
+                )
             if (
                 stream.kind is StreamKind.AUDIO
                 and stream.codec.casefold() == "pcm_bluray"
                 and selection.action is TrackAction.COPY
             ):
                 raise ValueError(
-                    "Blu-ray LPCM cannot be copied into Matroska; select FLAC or omit"
+                    "Blu-ray LPCM cannot be copied into Matroska; select FLAC, "
+                    "AC-3, E-AC-3, DTS or omit"
                 )
             result.append((selection, stream))
         return result

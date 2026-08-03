@@ -1287,6 +1287,157 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
             assert content.content.startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_lossy_audio_transcode_uses_target_qc_without_pcm_hash_gate(context):
+    database, settings, scan, scanner, runner, worker = context
+    audio = MediaStream(
+        id="audio:4352",
+        index=1,
+        pid=4352,
+        kind=StreamKind.AUDIO,
+        codec="truehd",
+        codec_profile="TrueHD",
+        channels=8,
+        channel_layout="7.1",
+        sample_rate=48_000,
+        object_audio=True,
+    )
+    scanner.result = replace(
+        scan,
+        playlists=(
+            replace(
+                scan.playlists[0],
+                streams=(*scan.playlists[0].streams, audio),
+            ),
+        ),
+    )
+
+    real_run = runner.run
+
+    def run_with_eac3_reports(argv, **kwargs):
+        command = tuple(os.fspath(item) for item in argv)
+        if command[0] == "ffmpeg" and "-f" in command:
+            muxer = command[command.index("-f") + 1]
+            if muxer == "hash":
+                pytest.fail("lossy audio QC must not run a meaningless PCM hash gate")
+        real_run(argv, **kwargs)
+        stdout_path = kwargs.get("stdout_path")
+        if stdout_path is None:
+            return
+        if command[0] == "mkvmerge" and "--identify" in command:
+            runner._write(
+                stdout_path,
+                json.dumps(
+                    {
+                        "container": {"properties": {"title": "Movie.Encode"}},
+                        "tracks": [
+                            {"id": 0, "type": "video", "properties": {}},
+                            {
+                                "id": 1,
+                                "type": "audio",
+                                "properties": {
+                                    "language": "en",
+                                    "default_track": False,
+                                    "forced_track": False,
+                                },
+                            },
+                        ],
+                        "attachments": [
+                            {
+                                "file_name": "encode.log",
+                                "content_type": "text/plain; charset=utf-8",
+                            }
+                        ],
+                    }
+                ),
+            )
+        elif stdout_path.name == "ffprobe-streams.json":
+            runner._write(
+                stdout_path,
+                json.dumps(
+                    {
+                        "streams": [
+                            {
+                                "index": 0,
+                                "codec_name": "h264",
+                                "profile": "High",
+                                "codec_type": "video",
+                                "width": 1920,
+                                "height": 1080,
+                                "pix_fmt": "yuv420p",
+                                "color_range": "tv",
+                                "color_space": "bt709",
+                                "color_transfer": "bt709",
+                                "color_primaries": "bt709",
+                                "chroma_location": "left",
+                            },
+                            {"index": 1, "codec_name": "eac3", "codec_type": "audio"},
+                        ]
+                    }
+                ),
+            )
+        elif stdout_path.name.endswith("-probe.json"):
+            source_probe = "-source-probe" in stdout_path.name
+            runner._write(
+                stdout_path,
+                json.dumps(
+                    {
+                        "streams": [
+                            {
+                                "codec_type": "audio",
+                                "codec_name": "truehd" if source_probe else "eac3",
+                                "sample_rate": "48000",
+                                "channels": 8 if source_probe else 6,
+                                "channel_layout": "7.1" if source_probe else "5.1(side)",
+                                "bit_rate": None if source_probe else "1024000",
+                                "start_time": "0",
+                                "duration": "601" if source_probe else "601.016",
+                            }
+                        ]
+                    }
+                ),
+            )
+
+    runner.run = run_with_eac3_reports
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(
+        job.id,
+        _selection(
+            tracks=[
+                {"stream_id": "audio:4352", "action": "eac3", "language": "eng"}
+            ]
+        ),
+    )
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.COMPLETED, result.status_message
+    manifest = json.loads(
+        (
+            settings.completed_root
+            / "Movie.Encode"
+            / "analysis"
+            / "audio-comparison.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest["schema_version"] == 2
+    track = manifest["tracks"][0]
+    assert track["verification_mode"] == "lossy_transcode"
+    assert track["decoded_pcm_sha256_required"] is False
+    assert track["decoded_pcm_sha256_match"] is None
+    assert track["verification"]["passed"] is True
+    assert track["effective_target"]["codec_name"] == "eac3"
+    audio_command = next(
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg" and "-c:a" in command and "eac3" in command
+    )
+    assert audio_command[audio_command.index("-b:a") + 1] == "1024k"
+    assert audio_command[audio_command.index("-ac") + 1] == "6"
+
+
 def test_missing_imgbb_credential_becomes_retryable_upload_failure(context):
     database, _settings, scan, _scanner, runner, worker = context
     worker.upload_client_factory = lambda: (_ for _ in ()).throw(

@@ -161,6 +161,68 @@ def test_bd_plan_uses_x264_flac_pgs_and_shell_free_argv(tmp_path: Path) -> None:
     assert plan.needs_review  # object metadata is intentionally lost by FLAC
 
 
+@pytest.mark.parametrize(
+    ("action", "encoder", "bitrate"),
+    ((TrackAction.AC3, "ac3", "640k"), (TrackAction.EAC3, "eac3", "1024k"), (TrackAction.DTS, "dca", "1536k")),
+)
+def test_planner_builds_fixed_lossy_audio_targets_with_7_1_warning(
+    tmp_path: Path, action: TrackAction, encoder: str, bitrate: str
+) -> None:
+    scan = _scan(tmp_path)
+    request = replace(
+        _request(tmp_path, scan, recommended_profile("x264")),
+        track_selections=(
+            TrackSelection("audio:4352", action, language="eng"),
+            TrackSelection("subtitle:4608", TrackAction.COPY, language="hun"),
+        ),
+    )
+
+    plan = EncodePlanner(work_root=tmp_path / "encode").build(request)
+    audio = plan.commands[1].argv
+
+    assert audio[audio.index("-c:a") + 1] == encoder
+    assert audio[audio.index("-b:a") + 1] == bitrate
+    assert audio[audio.index("-ar") + 1] == "48000"
+    assert audio[audio.index("-ac") + 1] == "6"
+    assert any("maximum 5.1" in warning for warning in plan.warnings)
+
+
+def test_planner_extracts_dts_hd_core_without_reencoding(tmp_path: Path) -> None:
+    scan = _scan(tmp_path)
+    dts_hd = replace(
+        scan.playlists[0].audio_streams[0],
+        codec="dts",
+        codec_profile="DTS-HD MA",
+    )
+    scan = replace(
+        scan,
+        playlists=(
+            replace(
+                scan.playlists[0],
+                streams=(
+                    scan.playlists[0].video_streams[0],
+                    dts_hd,
+                    scan.playlists[0].subtitle_streams[0],
+                ),
+            ),
+        ),
+    )
+    request = replace(
+        _request(tmp_path, scan, recommended_profile("x264")),
+        track_selections=(
+            TrackSelection("audio:4352", TrackAction.DTS, language="eng"),
+            TrackSelection("subtitle:4608", TrackAction.COPY, language="hun"),
+        ),
+    )
+
+    plan = EncodePlanner(work_root=tmp_path / "encode").build(request)
+    audio = plan.commands[1].argv
+
+    assert audio[audio.index("-c:a") + 1] == "copy"
+    assert audio[audio.index("-bsf:a") + 1] == "dca_core"
+    assert any("without re-encoding" in warning for warning in plan.warnings)
+
+
 def test_uhd_plan_keeps_static_hdr10_and_drops_dv_and_hdr10plus(tmp_path: Path) -> None:
     video = VideoProperties(
         VideoCodec.HEVC,

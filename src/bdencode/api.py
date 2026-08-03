@@ -10,6 +10,7 @@ from typing import Annotated
 from fastapi import FastAPI, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 
+from .audio import AUDIO_ACTIONS, audio_presets_payload
 from .db import (
     Database,
     NotFoundError,
@@ -164,7 +165,7 @@ def create_app(
             disc_types=list(DiscType),
             content_types=list(ContentType),
             detail_levels=["beginner", "advanced", "pro"],
-            audio_actions=["copy", "flac", "omit"],
+            audio_actions=list(AUDIO_ACTIONS),
             constraints={
                 "max_active_jobs": 1,
                 "queued_jobs_allowed": True,
@@ -173,6 +174,7 @@ def create_app(
                 "dolby_vision_retention": False,
                 "hdr_modes": ["SDR", "HDR10"],
                 "comparison_images": "lossless PNG",
+                "audio_transcode_presets": audio_presets_payload(),
             },
         )
 

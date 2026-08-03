@@ -17,7 +17,7 @@ export type JobState =
 export type DiscType = "AUTO" | "BD" | "UHD";
 export type ContentType = "FILM" | "CONCERT" | "ANIME" | "SERIES";
 export type DetailLevel = "beginner" | "advanced" | "pro";
-export type TrackAction = "copy" | "flac" | "omit";
+export type TrackAction = "copy" | "flac" | "ac3" | "eac3" | "dts" | "omit";
 export type ImageUploadProvider = "auto" | "imgbb" | "catbox" | "freeimage";
 
 export interface HealthResponse {
@@ -107,12 +107,14 @@ export interface RuntimeCapabilitiesResponse {
     encoders?: string[];
     filters?: string[];
     protocols?: string[];
+    bitstream_filters?: string[];
     [key: string]: unknown;
   };
   missing_ffmpeg_capabilities?: {
     encoders?: string[];
     filters?: string[];
     protocols?: string[];
+    bitstream_filters?: string[];
     [key: string]: unknown;
   };
   vapoursynth?: RuntimeVapourSynthCapability;
@@ -462,8 +464,14 @@ export interface AudioComparisonTrack {
   action: TrackAction;
   source_spectrum: string;
   encode_spectrum: string;
-  decoded_pcm_sha256_match: boolean;
+  decoded_pcm_sha256_match: boolean | null;
+  decoded_pcm_sha256_required?: boolean;
   delay_within_one_sample: boolean;
+  timing_within_tolerance?: boolean;
+  duration_within_tolerance?: boolean;
+  verification_mode?: "lossless_pcm" | "lossy_transcode" | "dts_core_extract";
+  effective_target?: Record<string, unknown>;
+  verification?: Record<string, unknown>;
   comparison: Record<string, unknown>;
   source_probe: Record<string, unknown>;
   encode_probe: Record<string, unknown>;

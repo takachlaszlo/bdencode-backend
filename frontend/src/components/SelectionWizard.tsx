@@ -70,6 +70,18 @@ const IMAGE_UPLOAD_PROVIDER_LABELS: Record<ImageUploadProvider, string> = {
   freeimage: "Csak Freeimage",
 };
 
+const AUDIO_TRACK_ACTIONS: TrackAction[] = ["copy", "flac", "ac3", "eac3", "dts", "omit"];
+const AUDIO_ACTION_DETAILS: Record<TrackAction, { label: string; description: string }> = {
+  copy: { label: "Copy", description: "Az eredeti hangsáv változtatás nélkül" },
+  flac: { label: "FLAC", description: "Veszteségmentes PCM-konverzió, eredeti csatornaszám" },
+  ac3: { label: "AC-3", description: "640 kb/s · 48 kHz · legfeljebb 5.1" },
+  eac3: { label: "E-AC-3", description: "1024 kb/s · 48 kHz · legfeljebb 5.1" },
+  dts: { label: "DTS", description: "DTS core · 1536 kb/s · 48 kHz · legfeljebb 5.1" },
+  omit: { label: "Kihagyás", description: "A sáv nem kerül a kész MKV-ba" },
+};
+
+const AUDIO_TRANSCODE_ACTIONS = new Set<TrackAction>(["flac", "ac3", "eac3", "dts"]);
+
 function imageUploadProvider(value: unknown): ImageUploadProvider {
   return value === "imgbb" || value === "catbox" || value === "freeimage"
     ? value
@@ -822,11 +834,21 @@ function TrackTable({
               return <Notice key={stream.id} tone="danger">A(z) {stream.id} sávhoz nem készült választási terv. Válaszd ki újra a playlistet.</Notice>;
             }
             const uncertain = !selection.language || stream.language?.needs_review;
+            const actionDetails = AUDIO_ACTION_DETAILS[selection.action];
+            const sourceDetails = [
+              stream.codec.toUpperCase(),
+              stream.codec_profile,
+              stream.channels ? `${stream.channels} csatorna` : null,
+              stream.channel_layout,
+              stream.sample_rate ? `${stream.sample_rate / 1000} kHz` : null,
+              stream.bit_depth ? `${stream.bit_depth} bit` : null,
+              stream.object_audio ? "objektumalapú hang" : null,
+            ].filter(Boolean).join(" · ");
             return (
               <div key={stream.id} className={selection.action === "omit" ? "track-row track-row--omitted" : "track-row"}>
                 <div className="track-row__identity">
                   <span className="track-row__type">{stream.kind === "audio" ? <Music size={17} /> : <Subtitles size={17} />}</span>
-                  <span><strong>{stream.title || `${stream.codec.toUpperCase()} sáv`}</strong><small>{stream.codec.toUpperCase()} {stream.channels ? `· ${stream.channels} csatorna` : ""} {stream.object_audio ? "· objektumalapú hang" : ""}</small></span>
+                  <span><strong>{stream.title || `${stream.codec.toUpperCase()} sáv`}</strong><small>{sourceDetails}</small></span>
                 </div>
                 <label className="track-language">
                   <Languages size={16} aria-hidden="true" />
@@ -839,20 +861,23 @@ function TrackTable({
                   />
                   {uncertain && <span role="img" aria-label="Bizonytalan vagy hiányzó nyelv" title="Bizonytalan vagy hiányzó nyelv"><AlertTriangle size={15} aria-hidden="true" /></span>}
                 </label>
-                <div className="track-actions" role="group" aria-label={`${stream.title || stream.id} kezelése`}>
-                  {(stream.kind === "audio" ? ["copy", "flac", "omit"] : ["copy", "omit"]).map((action) => (
+                <div className={stream.kind === "audio" ? "track-actions track-actions--audio" : "track-actions"} role="group" aria-label={`${stream.title || stream.id} kezelése`}>
+                  {(stream.kind === "audio" ? AUDIO_TRACK_ACTIONS : ["copy", "omit"] as TrackAction[]).map((action) => (
                     <button type="button" key={action} className={selection.action === action ? "active" : ""} aria-pressed={selection.action === action} onClick={() => onUpdate(stream.id, { action: action as TrackAction })}>
-                      {action === "copy" ? "Copy" : action === "flac" ? "FLAC" : "Kihagyás"}
+                      {AUDIO_ACTION_DETAILS[action].label}
                     </button>
                   ))}
                 </div>
+                {stream.kind === "audio" && <div className="track-target-note"><strong>{actionDetails.label}:</strong> {actionDetails.description}</div>}
                 {selection.action !== "omit" && (
                   <div className="track-flags">
                     <label><input type="checkbox" checked={selection.default} onChange={(event) => onUpdate(stream.id, { default: event.target.checked })} /> Alapértelmezett</label>
                     <label><input type="checkbox" checked={selection.forced} onChange={(event) => onUpdate(stream.id, { forced: event.target.checked })} /> Kényszerített</label>
                   </div>
                 )}
-                {stream.object_audio && selection.action === "flac" && <div className="track-warning">FLAC esetén az Atmos/DTS:X objektum-metaadat elvész.</div>}
+                {stream.object_audio && AUDIO_TRANSCODE_ACTIONS.has(selection.action) && <div className="track-warning">Átalakításkor az Atmos/DTS:X objektum-metaadat elvész; a csatornaalapú hangsáv marad meg.</div>}
+                {stream.kind === "audio" && stream.channels && stream.channels > 6 && ["ac3", "eac3", "dts"].includes(selection.action) && <div className="track-warning">A {stream.channels} csatornás forrás ennél a célnál ellenőrzötten 5.1-re lesz keverve.</div>}
+                {stream.kind === "audio" && selection.action === "dts" && /dts/i.test(`${stream.codec} ${stream.codec_profile || ""}`) && /hd/i.test(`${stream.codec} ${stream.codec_profile || ""}`) && <div className="track-target-note">A beágyazott DTS core újrakódolás nélkül lesz kinyerve.</div>}
               </div>
             );
           })}

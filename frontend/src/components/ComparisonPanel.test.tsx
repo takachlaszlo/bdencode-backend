@@ -127,6 +127,33 @@ describe("ComparisonPanel", () => {
     ).toBeInTheDocument();
   });
 
+  it("labels lossy audio as intentional instead of reporting a PCM integrity error", async () => {
+    const lossyManifest: AudioComparisonManifest = {
+      schema_version: 2,
+      tracks: [{
+        ...audioManifest.tracks[0],
+        action: "eac3",
+        decoded_pcm_sha256_match: null,
+        decoded_pcm_sha256_required: false,
+        timing_within_tolerance: true,
+        verification_mode: "lossy_transcode",
+      }],
+    };
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse(lossyManifest))));
+
+    renderApp(
+      <ComparisonPanel
+        artifacts={[
+          makeArtifact({ id: "audio-manifest", kind: "AUDIO_COMPARISON", name: "audio-comparison.json", mime_type: "application/json" }),
+        ]}
+      />,
+    );
+
+    expect(await screen.findByText("E-AC-3 konverzió")).toBeInTheDocument();
+    expect(screen.getByText("Veszteséges cél · PCM hash nem elvárt")).toBeInTheDocument();
+    expect(screen.queryByText("PCM eltérés")).not.toBeInTheDocument();
+  });
+
   it("shows a neutral same-frame label when source picture type is not applicable", async () => {
     const transformedManifest: VideoComparisonManifest = {
       ...videoManifest,

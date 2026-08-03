@@ -31,11 +31,15 @@ A kész MKV külön hard gate-en igazolja az elvárt H.264/H.265 profilt, méret
 
 ## Audio evidence
 
-Minden választott sávhoz sample rate/count, start delay, duration, bit depth, channels/layout, kanonikus dekódolt `pcm_s32le` SHA-256, EBU R128, peak/clipping, astats és phase mérés készül. A source és a végső MKV sávjának spektruma azonos FFmpeg scale/window/pixel formátummal külön PNG. A PCM, topológia és legfeljebb egy audio-sample PTS-tolerancia minden megtartott hangsávnál gate.
+Minden választott sávhoz sample rate/count, start delay, duration, bit depth, channels/layout, EBU R128, peak/clipping, astats és phase mérés készül. A source és a végső MKV sávjának spektruma azonos FFmpeg scale/window/pixel formátummal külön PNG. Copy és FLAC esetén a kanonikus dekódolt `pcm_s32le` SHA-256, a topológia és legfeljebb egy audio-sample PTS-tolerancia kötelező gate.
+
+AC-3/E-AC-3/DTS veszteséges átkódolásnál a PCM hash szándékosan nem fut és nem jelenik meg hibaként. Helyette az effektív cél-codec, bitráta, 48 kHz mintavétel, tervezett csatornaszám, kezdő PTS és legfeljebb egy codec-frame időtartam-eltérés a hard gate. A manifest `verification_mode` és `effective_target` mezőkkel rögzíti, melyik szabály érvényesült.
 
 FLAC esetén a tömörítési szint 8, a dekódolt PCM-egyezés kötelező. TrueHD Atmos/DTS:X objektum-metaadat FLAC-ban nem tartható meg; ehhez a frontend Copy-t ajánl és figyelmeztet.
 
-A Blu-ray LPCM (`pcm_bluray`) nem muxolható változtatás nélküli bitstreamként Matroskába, ezért ennél a sávnál a backend elutasítja a Copy választást, és FLAC vagy omit döntést kér. A FLAC út továbbra is sample-pontos PCM-hash gate-en megy át.
+Az AC-3 preset 640 kb/s, az E-AC-3 1024 kb/s, a DTS core 1536 kb/s; mindegyik 48 kHz-es és legfeljebb 5.1 csatornás. A 6.1/7.1 forrás downmixe látható figyelmeztetés és naplózott effektív cél mellett történik. DTS-HD MA/HRA vagy DTS:X forrás `dts` céljánál a worker a beágyazott DTS core-t `dca_core` bitstream-szűrővel, újrakódolás nélkül emeli ki; sima DTS-t másol, TrueHD/egyéb forrást a `dca` encoderrel kódol.
+
+A Blu-ray LPCM (`pcm_bluray`) nem muxolható változtatás nélküli bitstreamként Matroskába, ezért ennél a sávnál a backend elutasítja a Copy választást, és FLAC/AC-3/E-AC-3/DTS vagy omit döntést kér. A FLAC út továbbra is sample-pontos PCM-hash gate-en megy át.
 
 ## Artifact policy
 
