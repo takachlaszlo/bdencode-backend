@@ -52,6 +52,84 @@ export interface CapabilitiesResponse {
   };
 }
 
+export interface RuntimeToolCapability {
+  path?: string | null;
+  version?: string | null;
+  sha256?: string | null;
+  available?: boolean;
+  [key: string]: unknown;
+}
+
+export interface RuntimePathCapability {
+  path?: string;
+  exists?: boolean;
+  readable?: boolean;
+  writable?: boolean;
+  free_bytes?: number;
+  total_bytes?: number;
+  ok?: boolean;
+  [key: string]: unknown;
+}
+
+export interface RuntimeVapourSynthCapability {
+  ok?: boolean;
+  plugins?: Record<string, boolean> | unknown[];
+  error?: string | null;
+  [key: string]: unknown;
+}
+
+export interface RuntimeCapabilitiesResponse {
+  status?: string;
+  database?: {
+    path?: string;
+    schema_version?: number;
+    active_job?: string | null;
+    [key: string]: unknown;
+  };
+  paths?: {
+    data?: RuntimePathCapability;
+    sources?: RuntimePathCapability[];
+    [key: string]: unknown;
+  };
+  host?: {
+    hostname?: string;
+    platform?: string;
+    machine?: string;
+    python?: string;
+    logical_cpus?: number | null;
+    [key: string]: unknown;
+  };
+  tools?: Record<string, RuntimeToolCapability>;
+  ffmpeg?: {
+    encoders?: string[];
+    filters?: string[];
+    protocols?: string[];
+    [key: string]: unknown;
+  };
+  missing_ffmpeg_capabilities?: {
+    encoders?: string[];
+    filters?: string[];
+    protocols?: string[];
+    [key: string]: unknown;
+  };
+  vapoursynth?: RuntimeVapourSynthCapability;
+  imgbb_credential?: {
+    configured?: boolean;
+    encrypted_at_rest?: boolean;
+    permissions?: string;
+    permissions_ok?: boolean;
+    [key: string]: unknown;
+  };
+  worker_cpu_policy?: {
+    requested_percent?: number;
+    logical_cpus?: number | null;
+    systemd_cpu_quota_percent?: number;
+    [key: string]: unknown;
+  };
+  warnings?: string[];
+  [key: string]: unknown;
+}
+
 export interface Job {
   id: string;
   name: string;

@@ -10,6 +10,7 @@ import type {
   JobState,
   ProfileRecommendationResponse,
   ProfileSchemaResponse,
+  RuntimeCapabilitiesResponse,
   ScanList,
   SelectionPayload,
   SelectionValidation,
@@ -82,7 +83,7 @@ export const api = {
   health: () => apiFetch<HealthResponse>("/health"),
   capabilities: () => apiFetch<CapabilitiesResponse>("/capabilities"),
   runtimeCapabilities: () =>
-    apiFetch<Record<string, unknown>>("/runtime-capabilities"),
+    apiFetch<RuntimeCapabilitiesResponse>("/runtime-capabilities"),
   sources: (path?: string) =>
     apiFetch<SourceBrowserResponse>(
       `/sources${path ? `?path=${encodeURIComponent(path)}` : ""}`,

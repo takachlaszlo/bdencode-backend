@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict
-from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
@@ -49,8 +48,8 @@ from .models import (
     allowed_transitions,
 )
 from .queue import JobQueue
-from .capabilities import capability_snapshot
 from .config import ConfigurationError, Settings
+from .doctor import build_report
 from .media.profiles import (
     DetailLevel,
     VideoEncoder,
@@ -178,7 +177,8 @@ def create_app(
 
     @application.get(f"{API_PREFIX}/runtime-capabilities")
     def runtime_capabilities() -> dict[str, object]:
-        return _cached_runtime_capabilities()
+        runtime_settings = settings or load_settings()
+        return build_report(db, runtime_settings, prepare=False)
 
     @application.get(f"{API_PREFIX}/profiles/{{encoder}}/schema")
     def encoder_schema(
@@ -527,8 +527,3 @@ def create_app(
 # Keeps ``uvicorn bdencode.api:app`` useful; no database is opened until a route
 # actually accesses it, so importing the module has no filesystem side effects.
 app = create_app()
-
-
-@lru_cache(maxsize=1)
-def _cached_runtime_capabilities() -> dict[str, object]:
-    return capability_snapshot()

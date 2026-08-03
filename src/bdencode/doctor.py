@@ -115,9 +115,27 @@ def _vapoursynth_plugins() -> dict[str, Any]:
         return {"ok": False, "plugins": [], "error": type(exc).__name__}
 
 
-def build_report(database: Database, settings: Settings) -> dict[str, Any]:
-    settings.create_directories()
-    database.initialize()
+def build_report(
+    database: Database, settings: Settings, *, prepare: bool = True
+) -> dict[str, Any]:
+    """Build a complete runtime report.
+
+    The operator-facing CLI keeps its historical preparation behavior.  API
+    status reads pass ``prepare=False`` so inspecting an unprepared deployment
+    cannot create its configured data or database directories as a side
+    effect.
+    """
+
+    if prepare:
+        settings.create_directories()
+
+    database_available = (
+        prepare
+        or database.display_path == ":memory:"
+        or Path(database.display_path).expanduser().is_file()
+    )
+    if database_available:
+        database.initialize()
     snapshot = capability_snapshot((*MANDATORY_TOOLS, *RECOMMENDED_TOOLS))
     tools = snapshot["tools"]
     missing_mandatory = [
@@ -133,6 +151,8 @@ def build_report(database: Database, settings: Settings) -> dict[str, Any]:
     vs = _vapoursynth_plugins()
     ffmpeg = snapshot["ffmpeg"]
     warnings: list[str] = []
+    if not database_available:
+        warnings.append("database is not initialized")
     if "libvmaf" not in ffmpeg["filters"]:
         warnings.append(
             "FFmpeg libvmaf filter missing; the official standalone VMAF CLI will be used"
@@ -149,18 +169,22 @@ def build_report(database: Database, settings: Settings) -> dict[str, Any]:
     if any(missing_ffmpeg.values()):
         warnings.append("mandatory FFmpeg capabilities missing")
     ok = (
-        not missing_mandatory
+        database_available
+        and not missing_mandatory
         and not any(missing_ffmpeg.values())
         and vs["ok"]
         and data_check["ok"]
         and all(item["ok"] for item in source_checks)
     )
+    active_job = database.active_job() if database_available else None
     return {
         "status": "ok" if ok else "error",
         "database": {
             "path": database.display_path,
-            "schema_version": database.schema_version(),
-            "active_job": database.active_job().id if database.active_job() else None,
+            "schema_version": (
+                database.schema_version() if database_available else None
+            ),
+            "active_job": active_job.id if active_job else None,
         },
         "paths": {"data": data_check, "sources": source_checks},
         "host": snapshot["host"],

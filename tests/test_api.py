@@ -2,12 +2,107 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from bdencode import doctor
 from bdencode.api import create_app
+from bdencode.config import Settings
 from bdencode.db import Database
 
 
 def make_client(tmp_path) -> TestClient:
     return TestClient(create_app(Database(tmp_path / "api.sqlite3")))
+
+
+def test_runtime_capabilities_is_fresh_and_does_not_prepare_paths(
+    tmp_path, monkeypatch
+):
+    data_root = tmp_path / "unprepared-encode"
+    source_root = tmp_path / "unprepared-storage"
+    settings = Settings(
+        data_root=data_root,
+        source_roots=(source_root,),
+    ).validate()
+    database_root = tmp_path / "unprepared-state"
+    database = Database(database_root / "api.sqlite3")
+    calls = 0
+    expected_tools = (*doctor.MANDATORY_TOOLS, *doctor.RECOMMENDED_TOOLS)
+
+    def capability_report(names):
+        nonlocal calls
+        calls += 1
+        assert tuple(names) == expected_tools
+        return {
+            "host": {
+                "hostname": "test-host",
+                "platform": "test-platform",
+                "machine": "test-machine",
+                "python": "3.test",
+                "logical_cpus": 8,
+            },
+            "tools": {
+                name: {
+                    "name": name,
+                    "path": f"/tools/{name}",
+                    "version": f"test-call-{calls}",
+                    "sha256": "0" * 64,
+                    "available": True,
+                }
+                for name in names
+            },
+            "ffmpeg": {
+                "encoders": sorted(doctor.MANDATORY_FFMPEG_ENCODERS),
+                "filters": sorted(doctor.MANDATORY_FFMPEG_FILTERS),
+                "protocols": sorted(doctor.MANDATORY_FFMPEG_PROTOCOLS),
+            },
+        }
+
+    monkeypatch.setattr(doctor, "capability_snapshot", capability_report)
+    monkeypatch.setattr(
+        doctor,
+        "_vapoursynth_plugins",
+        lambda: {
+            "ok": True,
+            "plugins": {name: True for name in ("bs", "bwdif", "vivtc", "resize")},
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_credential_status",
+        lambda: {
+            "configured": True,
+            "encrypted_at_rest": True,
+            "permissions_ok": True,
+        },
+    )
+
+    with TestClient(create_app(database, settings=settings)) as client:
+        first = client.get("/api/v1/runtime-capabilities")
+        second = client.get("/api/v1/runtime-capabilities")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == 2
+    first_report = first.json()
+    second_report = second.json()
+    assert first_report["paths"]["data"] == {
+        "path": str(data_root),
+        "exists": False,
+        "readable": False,
+        "writable": False,
+        "ok": False,
+    }
+    assert first_report["vapoursynth"]["ok"] is True
+    assert isinstance(first_report["warnings"], list)
+    assert first_report["database"]["schema_version"] is None
+    assert "database is not initialized" in first_report["warnings"]
+    assert set(first_report["tools"]) == set(expected_tools)
+    assert "tsMuxeR" not in first_report["tools"]
+    assert "whisper-cli" not in first_report["tools"]
+    assert first_report["tools"]["ffmpeg"]["version"] == "test-call-1"
+    assert second_report["tools"]["ffmpeg"]["version"] == "test-call-2"
+    assert not data_root.exists()
+    assert not source_root.exists()
+    assert not database_root.exists()
 
 
 def scan_result(
