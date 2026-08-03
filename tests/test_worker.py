@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import struct
 from dataclasses import replace
 from pathlib import Path
@@ -504,7 +505,7 @@ def test_scan_checkpoint_survives_crash_before_database_transition(
 
 
 def test_scan_failure_atomically_fails_job_instead_of_looping(context):
-    database, _settings, scan, scanner, _runner, worker = context
+    database, settings, scan, scanner, _runner, worker = context
 
     def fail_scan(*_args, **_kwargs):
         scanner.calls += 1
@@ -518,6 +519,35 @@ def test_scan_failure_atomically_fails_job_instead_of_looping(context):
     assert result.state is JobState.FAILED
     assert scanner.calls == 1
     assert database.list_scans(job_id=job.id)[0].status is ScanState.FAILED
+    assert (settings.job_root(job.id) / "work").is_dir()
+
+
+def test_completed_job_stays_completed_when_work_cleanup_fails(
+    context, monkeypatch
+):
+    database, settings, scan, _scanner, _runner, worker = context
+
+    def fail_cleanup(_path):
+        raise OSError("simulated cleanup failure")
+
+    monkeypatch.setattr(shutil, "rmtree", fail_cleanup)
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.COMPLETED
+    assert (settings.completed_root / "Movie.Encode" / "Movie.Encode.mkv").is_file()
+    assert (settings.job_root(job.id) / "work").is_dir()
+    warnings = [
+        item
+        for item in database.list_events(job_id=job.id, limit=1000)
+        if item.kind == "job.workspace-cleanup-warning"
+    ]
+    assert len(warnings) == 1
 
 
 def test_prepare_checkpoint_skips_reference_remux_after_transition_crash(
@@ -835,6 +865,18 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     assert len(list((completed / "comparison").glob("*-reference.png"))) == 3
     assert len(list((completed / "comparison").glob("*-encode.png"))) == 3
     assert not (completed / "comparison" / stale.name).exists()
+    assert not (settings.job_root(job.id) / "work").exists()
+    cleanup = [
+        item
+        for item in database.list_events(job_id=job.id, limit=1000)
+        if item.kind == "job.workspace-cleaned"
+    ]
+    assert len(cleanup) == 1
+    assert cleanup[0].payload["bytes_removed"] > 0
+    assert all(
+        Path(artifact.path).is_file()
+        for artifact in database.list_artifacts(job_id=job.id, limit=1000)
+    )
 
     job_paths = JobPaths.create(settings, job.id)
     tampered = next(job_paths.comparison.glob("*-reference.png"))
@@ -865,9 +907,7 @@ def test_mux_chapters_come_from_reviewed_playlist(context):
         if command[0] == "mkvmerge" and "--output" in command
     )
     assert "--chapters" in mux_command
-    chapters = settings.job_root(job.id) / "work" / "chapters.xml"
-    assert chapters.is_file()
-    assert "00:07:20.080000000" in chapters.read_text(encoding="utf-8")
+    assert not (settings.job_root(job.id) / "work").exists()
 
 
 def test_mux_omits_chapter_option_when_playlist_has_none(context):

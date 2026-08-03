@@ -110,6 +110,8 @@ const EVENT_KIND_LABELS: Record<string, string> = {
   "job.selection": "Beállítások jóváhagyva",
   "job.progress": "Előrehaladás",
   "job.retry": "Folytatás elindítva",
+  "job.workspace-cleaned": "Ideiglenes munkafájlok törölve",
+  "job.workspace-cleanup-warning": "Az ideiglenes munkafájlok takarítása nem sikerült",
   "scan.created": "Lemezvizsgálat létrehozva",
   "scan.state": "Lemezvizsgálat állapota",
   "artifact.created": "Melléklet létrehozva",

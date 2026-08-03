@@ -2728,9 +2728,75 @@ class PipelineWorker:
         )
         self._write_manifest(job, selection, paths, final_output)
         shutil.copy2(paths.manifest_json, completed / "manifest.json")
-        self.queue.advance(
+        completed_job = self.queue.advance(
             job.id, JobState.COMPLETED, message="encode, QC and comparison completed"
         )
+        self._cleanup_completed_work(completed_job, paths)
+
+    def _cleanup_completed_work(self, job: Job, paths: JobPaths) -> None:
+        """Remove only bulky retry data after the durable COMPLETE transition.
+
+        FAILED and operator-paused jobs deliberately retain ``work`` so their
+        validated checkpoints can be resumed.  Logs, analysis, comparisons,
+        stage records and manifests remain under the job root even after a
+        successful encode because database artifacts point to those files.
+
+        Cleanup is best-effort and can never turn an already completed encode
+        back into a failure.  Every target is resolved and checked against the
+        configured job root before recursive removal.
+        """
+
+        if job.state is not JobState.COMPLETED or not paths.work.exists():
+            return
+
+        removed_bytes = 0
+        try:
+            jobs_root = self.settings.jobs_root.resolve(strict=True)
+            job_root = paths.root.resolve(strict=True)
+            if job_root.parent != jobs_root or job_root.name != job.id:
+                raise RuntimeError("completed workspace has an unsafe job root")
+            if paths.work.is_symlink():
+                raise RuntimeError("completed work path must not be a symlink")
+            work = paths.work.resolve(strict=True)
+            if work != job_root / "work":
+                raise RuntimeError("completed work path escaped its job root")
+
+            for candidate in work.rglob("*"):
+                try:
+                    if candidate.is_symlink():
+                        removed_bytes += candidate.lstat().st_size
+                    elif candidate.is_file():
+                        removed_bytes += candidate.stat().st_size
+                except OSError:
+                    # Size is diagnostic only; deletion remains authoritative.
+                    pass
+            shutil.rmtree(work)
+        except (OSError, RuntimeError) as exc:
+            LOG.warning("completed job %s workspace cleanup failed: %s", job.id, exc)
+            try:
+                self.database.add_event(
+                    EventCreate(
+                        job_id=job.id,
+                        kind="job.workspace-cleanup-warning",
+                        message="completed encode retained temporary work files",
+                        payload={"error_type": type(exc).__name__},
+                    )
+                )
+            except Exception:
+                LOG.exception("job %s cleanup warning could not be recorded", job.id)
+            return
+
+        try:
+            self.database.add_event(
+                EventCreate(
+                    job_id=job.id,
+                    kind="job.workspace-cleaned",
+                    message="temporary encode work files removed after completion",
+                    payload={"bytes_removed": removed_bytes},
+                )
+            )
+        except Exception:
+            LOG.exception("job %s cleanup event could not be recorded", job.id)
 
     def _write_manifest(
         self,

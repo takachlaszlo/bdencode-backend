@@ -49,6 +49,8 @@ const tabs: Array<{ value: Tab; label: string; icon: typeof Info }> = [
   { value: "files", label: "Fájlok és logok", icon: FolderOpen },
 ];
 
+const RETRYABLE_FAILED_STATES = new Set(["READY", "ENCODING", "MUXING", "QC", "COMPARISON"]);
+
 function latestSuccessfulScan(scans: Scan[]): Scan | undefined {
   return scans.find((scan) => ["AWAITING_SELECTION", "COMPLETED"].includes(scan.status));
 }
@@ -117,6 +119,11 @@ export function JobDetailPage() {
   const scan = scanRow?.result && "playlists" in scanRow.result ? scanRow.result as DiscScanResult : null;
   const artifacts = artifactsQuery.data?.items ?? [];
   const events = eventsQuery.data?.items ?? [];
+  const workspaceCleaned = events.some((event) => event.kind === "job.workspace-cleaned");
+  const workspaceCleanupWarning = events.some((event) => event.kind === "job.workspace-cleanup-warning");
+  const retryableFailure = job.state === "FAILED"
+    && job.resume_state !== null
+    && RETRYABLE_FAILED_STATES.has(job.resume_state);
   const configurable = ["AWAITING_SELECTION", "NEEDS_REVIEW"].includes(job.state) && scan;
   const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(job.state);
 
@@ -131,7 +138,7 @@ export function JobDetailPage() {
           <div className="header-actions">
             <Badge tone={stateTone(job.state)}>{STATE_LABELS[job.state]}</Badge>
             {!terminal && <Button variant="danger" icon={<StopCircle size={17} />} onClick={() => setCancelOpen(true)}>Megszakítás kérése</Button>}
-            {job.state === "FAILED" && <Button icon={<RotateCcw size={17} />} onClick={openRetryConfirmation}>Folytatás a hibától</Button>}
+            {retryableFailure && <Button icon={<RotateCcw size={17} />} onClick={openRetryConfirmation}>Folytatás a hibától</Button>}
             {job.state === "UPLOAD_FAILED" && <Button variant="secondary" icon={<RotateCcw size={17} />} loading={retryUpload.isPending} onClick={() => retryUpload.mutate()}>Feltöltés újra</Button>}
           </div>
         }
@@ -144,6 +151,21 @@ export function JobDetailPage() {
         <Notice tone="success" title="A munka folytatása elindult">A worker az ellenőrzött checkpointok alapján folytatja a feldolgozást.</Notice>
       )}
       {job.error && <Notice tone="danger" title="A feldolgozás hibát jelzett"><p>{formatWorkerError(job.error)}</p><details><summary>Technikai részletek</summary><pre>{job.error}</pre></details></Notice>}
+      {retryableFailure && (
+        <Notice tone="warning" title="A munkafájlok a biztonságos folytatáshoz megmaradtak">
+          A takarítás szándékosan vár: a rendszer megőrzi az érvényes checkpointokat és az elkészült részeredményeket. Folytatáskor csak a hiányzó vagy érvénytelen szakaszok futnak újra. Sikeres véglegesítés után a nagyméretű ideiglenes <code>work</code> mappa automatikusan törlődik; a logok, elemzések és comparison mellékletek megmaradnak.
+        </Notice>
+      )}
+      {job.state === "COMPLETED" && workspaceCleaned && (
+        <Notice tone="success" title="A kódolás lezárult és a munkaterület kitakarítva">
+          A végleges MKV, valamint a logok, elemzések és comparison fájlok másolata a completed mappába került. A nagyméretű ideiglenes fájlok törlődtek; a scan, a terv, a stage rekordok és az ellenőrzési naplók a munka auditjában is megmaradtak.
+        </Notice>
+      )}
+      {job.state === "COMPLETED" && workspaceCleanupWarning && (
+        <Notice tone="warning" title="A kódolás elkészült, de maradtak ideiglenes fájlok">
+          A végleges MKV biztonságban van. A munkaterület takarítása nem sikerült; a részletek az eseménynaplóban találhatók.
+        </Notice>
+      )}
       {job.state === "NEEDS_REVIEW" && <Notice tone="warning" title="Operátori ellenőrzés szükséges">{formatStatusMessage(job.status_message, "A munkafolyamat csak a beállítások felülvizsgálata után folytatható.")}</Notice>}
 
       <Card className="job-progress-card">

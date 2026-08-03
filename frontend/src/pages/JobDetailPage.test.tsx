@@ -67,6 +67,8 @@ describe("JobDetailPage failed-job retry", () => {
     const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
 
     expect(await screen.findByText(/A fejezetlista létrehozása sikertelen volt/)).toBeInTheDocument();
+    expect(screen.getByText("A munkafájlok a biztonságos folytatáshoz megmaradtak")).toBeInTheDocument();
+    expect(screen.getByText(/A takarítás szándékosan vár/)).toBeInTheDocument();
 
     await user.click(await screen.findByRole("button", { name: "Folytatás a hibától" }));
 
@@ -104,5 +106,20 @@ describe("JobDetailPage failed-job retry", () => {
     expect(await within(dialog).findByText("A folytatás nem indítható")).toBeInTheDocument();
     expect(within(dialog).getByText("Egy másik munka jelenleg blokkolja a várólistát")).toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "Folytatod a hibától?" })).toBeInTheDocument();
+  });
+
+  it("does not offer checkpoint retry for a non-retryable scan failure", async () => {
+    vi.mocked(api.job).mockResolvedValue(
+      makeJob({
+        state: "FAILED",
+        error: "RuntimeError: unreadable disc",
+        resume_state: "SCANNING",
+      }),
+    );
+    renderFailedJob();
+
+    expect(await screen.findByRole("link", { name: /Vissza az archívumhoz/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Folytatás a hibától" })).not.toBeInTheDocument();
+    expect(screen.queryByText("A munkafájlok a biztonságos folytatáshoz megmaradtak")).not.toBeInTheDocument();
   });
 });
