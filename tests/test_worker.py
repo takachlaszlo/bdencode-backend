@@ -6,6 +6,7 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -140,6 +141,85 @@ def test_worker_readiness_follows_database_initialization_and_instance_lock(
 
     assert run_worker(database, settings, once=True, poll_interval=0) == 0
     assert notifications == ["READY=1\nSTATUS=Ready; waiting for an encode job"]
+
+
+def test_worker_runs_scan_lane_while_encode_lane_is_occupied(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_root = tmp_path / "storage"
+    source_root.mkdir()
+    settings = Settings(
+        data_root=tmp_path / "encode",
+        source_roots=(source_root,),
+        worker_poll_seconds=0.01,
+    )
+    database = Database(tmp_path / "state.sqlite3")
+    queue = JobQueue(database)
+    encode_job = queue.enqueue(JobCreate(source_path="/storage/first", name="first"))
+    queue.claim_next()
+    queue.advance(encode_job.id, JobState.READY)
+    scan_job = queue.enqueue(JobCreate(source_path="/storage/second", name="second"))
+
+    encode_started = threading.Event()
+    scan_started = threading.Event()
+    stop = threading.Event()
+
+    class CoordinatedWorker:
+        def __init__(
+            self,
+            current_database: Database,
+            _settings: Settings,
+            *,
+            stop_requested: Callable[[], bool],
+            **_kwargs: Any,
+        ) -> None:
+            self.database = current_database
+            self.queue = JobQueue(current_database)
+            self.stop_requested = stop_requested
+
+        def process_job(self, job):
+            if job.state is JobState.ENCODING:
+                encode_started.set()
+                if not scan_started.wait(2):
+                    raise RuntimeError("scan lane did not start beside encode lane")
+                stop.set()
+            elif job.state is JobState.SCANNING:
+                if not encode_started.wait(2):
+                    raise RuntimeError("encode lane did not start")
+                scan_started.set()
+                stop.wait(2)
+            return self.database.get_job(job.id)
+
+    monkeypatch.setattr(worker_module, "PipelineWorker", CoordinatedWorker)
+    monkeypatch.setattr(worker_module, "_maintenance_active", lambda: False)
+    monkeypatch.setattr(worker_module, "_sd_notify", lambda _message: True)
+    results: list[int] = []
+    errors: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            results.append(
+                run_worker(
+                    database,
+                    settings,
+                    poll_interval=0.01,
+                    stop_requested=stop.is_set,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    thread.join(timeout=5)
+    stop.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert results == [0]
+    assert database.encoding_job().id == encode_job.id
+    assert database.preparing_job().id == scan_job.id
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fcntl worker lock is POSIX-only")

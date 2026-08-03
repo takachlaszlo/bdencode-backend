@@ -66,7 +66,7 @@ export function SystemPage() {
           <div className="system-overview-grid">
             <Card className="status-stat-card"><span className="status-stat-card__icon status-stat-card__icon--green"><Server size={22} /></span><div><small>Backend</small><strong>{health.data?.status === "ok" ? "Online" : "Hiba"}</strong><span>API v{capabilities.data?.api_version ?? "—"}</span></div><CheckCircle2 size={18} className="success-icon" /></Card>
             <Card className="status-stat-card"><span className="status-stat-card__icon"><Cpu size={22} /></span><div><small>Processzor</small><strong>{host?.logical_cpus ?? "Ismeretlen"} logikai CPU</strong><span>{cpuPercent === null ? "CPU-keret: Ismeretlen" : `${Math.round(cpuPercent)}% teljes keret`}</span></div><ShieldCheck size={18} /></Card>
-            <Card className="status-stat-card"><span className="status-stat-card__icon"><Database size={22} /></span><div><small>Adatbázis</small><strong>Schema {health.data?.schema_version ?? "—"}</strong><span>{health.data?.active_job_id ? "1 aktív munka" : "Üres munkasor"}</span></div><Gauge size={18} /></Card>
+            <Card className="status-stat-card"><span className="status-stat-card__icon"><Database size={22} /></span><div><small>Adatbázis</small><strong>Schema {health.data?.schema_version ?? "—"}</strong><span>{health.data?.active_job_id ? "1 aktív encode" : `${health.data?.ready_jobs ?? 0} kódolásra kész`}{health.data?.preparing_job_id ? " · scan fut" : ""}</span></div><Gauge size={18} /></Card>
             <Card className="status-stat-card"><span className="status-stat-card__icon"><HardDrive size={22} /></span><div><small>Tárhely</small><strong>{free === null ? "Ismeretlen" : `${formatBytes(free)} szabad`}</strong><span>{dataPath?.path || "Ismeretlen"}</span></div><HardDrive size={18} /></Card>
           </div>
 
@@ -97,6 +97,7 @@ export function SystemPage() {
                 <span className="eyebrow">Biztonsági politika</span><h2>Rögzített korlátok</h2>
                 <ul className="policy-list">
                   <li><CheckCircle2 size={16} /> Egyszerre legfeljebb egy aktív encode</li>
+                  <li><CheckCircle2 size={16} /> Scan és beállítás a futó encode mellett is</li>
                   <li><CheckCircle2 size={16} /> CPU-kapacitás legfeljebb 80%-a</li>
                   <li><CheckCircle2 size={16} /> 3D kimenet tiltva</li>
                   <li><CheckCircle2 size={16} /> Dolby Vision helyett kizárólag HDR10</li>

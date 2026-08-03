@@ -1,6 +1,6 @@
 # Architecture
 
-Az API és a worker külön systemd folyamat. Közös állapotuk SQLite WAL adatbázis, az egyetlen aktív pipeline-t részleges egyedi index is védi, ezért két worker sem tud egyszerre jobot megszerezni.
+Az API és a worker külön systemd folyamat. Közös állapotuk SQLite WAL adatbázis. Két külön részleges egyedi index védi az egyetlen aktív scan sávot és az egyetlen aktív encode sávot, ezért versenyhelyzetben sem indulhat két scan vagy két encode. A két sáv egymás mellett futhat, és ugyanazon systemd CPU-kereten osztozik.
 
 A React/Vite frontend nem külön szerverfolyamat: verziózott statikus release-ként kerül a `/var/www/bdencode/releases/<id>/encoder` könyvtárba. Nginx ugyanazon Basic Auth védelem alatt szolgálja ki a `/encoder/` SPA-t, és a `/encoder/api/` kéréseket a loopback FastAPI felé továbbítja. A `/var/www/bdencode/current` symlink cseréje atomikus, és az app/tool pointerekkel, nginx konfigurációval együtt az installer tartós rollback-snapshotjának része.
 
@@ -12,7 +12,7 @@ COMPLETED ← UPLOADING ← COMPARISON ← QC ←──────────�
 valamennyi aktív szakaszból: NEEDS_REVIEW / FAILED / CANCELLED
 ```
 
-`AWAITING_SELECTION`, `NEEDS_REVIEW` és `UPLOAD_FAILED` szándékosan blokkoló állapot. Egy későbbi job nem előzheti meg a még le nem zárt encode-ot.
+`AWAITING_SELECTION` nem blokkolja a további lemezek scanjét, a `READY` pedig teljesen beállított, kódolásra váró munkát jelent. `NEEDS_REVIEW` és `UPLOAD_FAILED` megtartja a már elfoglalt encode sávot: egy későbbi job nem előzheti meg a még le nem zárt encode-ot.
 
 ## Video evidence
 
@@ -63,8 +63,9 @@ A külön verziózott VapourSynth tool-release és a benne fordított natív lib
 
 Az installer a saját mutációi előtt fix célpontlistás, tartós snapshotot publikál `/var/lib/bdencode/install-transactions` alatt. Ez lefedi az app/tool pointereket, a változó systemd unitokat, a napi updater scriptet, az APT source/pin/drop-in fájlokat, a credential drop-int, a configot és az nginx route-ot; külön megőrzi mindkét natív APT-timer aktív és engedélyezett állapotát is. Az `apt-get` előtt a timerek leállnak, a már futó APT/dpkg oneshot természetesen kifut, és a media pin már a csomagművelet előtt aktív. Az installer minden `apt-get` gyermekét külön `/run/lock/bdencode-installer-apt.lock` alatt futtatja. Recoverykor előbb ez, majd a natív frontend/backend/cache/list lockok szabadulását kell kivárni; félbemaradt konfiguráció javítási kísérlete után a runtime csak üres `dpkg --audit` és sikeres `apt-get check` mellett indulhat. A recovery helperk, a stabil API/worker recovery drop-inek és az install-watchdog a rollbacken kívül maradnak. Az `OBSERVING` fázisban csak az API és a rögzített timerek állhatnak le a queue/APT ellenőrzéséhez, ezért busy queue vagy ekkori crash nem szakítja meg a workert; a teljes célpont-rollback csak a tartós `PREPARED` döntés után engedélyezett. A fájlok visszaállítása vagy a validált candidate commitja után külön `services-pending` marker marad addig, amíg a kívánt service-startok sorba nem kerültek. Normál hiba ugyanazt az idempotens állapotgépet futtatja, SIGKILL után pedig a négy install/runtime/APT markert figyelő `bdencode-install-recovery.path` azonnal, rebootkor a recovery gate folytatja.
 
-A kézi installer kizárólag két tartós operátori szünetet tekint
-telepítésbiztosnak: `AWAITING_SELECTION` és `UPLOAD_FAILED`. Az aktívan futó
-`UPLOADING`, minden számítási szakasz, a `READY` és a `NEEDS_REVIEW` továbbra is
-blokkolja a telepítést. `UPLOAD_FAILED` után az új worker ugyanabból az atomi
+A kézi installer futó `SCANNING`, `UPLOADING`, számítási szakasz vagy
+`NEEDS_REVIEW` alatt nem aktivál új kiadást. A `QUEUED`, `AWAITING_SELECTION` és
+még el nem indított `READY` munkák tartósan telepítésbiztosak; a deployment lock
+megakadályozza, hogy az ellenőrzés és az aktiválás között valamelyik worker-sáv
+új munkát foglaljon. `UPLOAD_FAILED` után az új worker ugyanabból az atomi
 checkpointból csak a feltöltési szakaszt folytathatja.

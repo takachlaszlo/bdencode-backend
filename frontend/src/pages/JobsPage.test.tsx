@@ -25,12 +25,12 @@ describe("JobsPage queue automation", () => {
     });
   });
 
-  it("explains that the first job starts automatically and labels READY as preparation", async () => {
+  it("explains concurrent preparation and labels READY as waiting for encode", async () => {
     renderApp(<JobsPage mode="queue" />, "/queue");
 
-    expect(await screen.findByText("Előkészítés")).toBeInTheDocument();
+    expect(await screen.findByText("Kódolásra vár")).toBeInTheDocument();
     expect(
-      screen.getByText(/külön indítógomb nélkül, automatikusan dolgozza fel/),
+      screen.getByText(/futó encode mellett is elkészülhet/),
     ).toBeInTheDocument();
   });
 });

@@ -52,9 +52,7 @@ def test_runtime_capabilities_is_fresh_and_does_not_prepare_paths(
                 "encoders": sorted(doctor.MANDATORY_FFMPEG_ENCODERS),
                 "filters": sorted(doctor.MANDATORY_FFMPEG_FILTERS),
                 "protocols": sorted(doctor.MANDATORY_FFMPEG_PROTOCOLS),
-                "bitstream_filters": sorted(
-                    doctor.MANDATORY_FFMPEG_BITSTREAM_FILTERS
-                ),
+                "bitstream_filters": sorted(doctor.MANDATORY_FFMPEG_BITSTREAM_FILTERS),
             },
         }
 
@@ -215,9 +213,12 @@ def test_health_capabilities_and_job_flow(tmp_path):
             "dts",
             "omit",
         ]
-        assert capabilities.json()["constraints"]["audio_transcode_presets"]["dts"][
-            "bitrate_kbps"
-        ] == 1536
+        assert (
+            capabilities.json()["constraints"]["audio_transcode_presets"]["dts"][
+                "bitrate_kbps"
+            ]
+            == 1536
+        )
 
         first = client.post(
             "/api/v1/jobs",
@@ -231,7 +232,9 @@ def test_health_capabilities_and_job_flow(tmp_path):
 
         health = client.get("/api/v1/health").json()
         assert health["queued_jobs"] == 2
+        assert health["ready_jobs"] == 0
         assert health["active_job_id"] is None
+        assert health["preparing_job_id"] is None
 
         claimed = client.post("/api/v1/jobs/claim-next").json()
         job = claimed["job"]
@@ -239,6 +242,10 @@ def test_health_capabilities_and_job_flow(tmp_path):
         blocked = client.post("/api/v1/jobs/claim-next").json()
         assert blocked["job"] is None
         assert blocked["blocked_by"]["id"] == job["id"]
+
+        health = client.get("/api/v1/health").json()
+        assert health["active_job_id"] is None
+        assert health["preparing_job_id"] == job["id"]
 
         invalid = client.post(
             f"/api/v1/jobs/{job['id']}/transition", json={"state": "ENCODING"}
@@ -260,9 +267,7 @@ def test_progress_endpoint_honors_expected_state_and_event_control(tmp_path):
             )
             assert response.status_code == 200
         before = len(
-            client.get("/api/v1/events", params={"job_id": job["id"]}).json()[
-                "items"
-            ]
+            client.get("/api/v1/events", params={"job_id": job["id"]}).json()["items"]
         )
 
         updated = client.post(
@@ -277,15 +282,11 @@ def test_progress_endpoint_honors_expected_state_and_event_control(tmp_path):
         assert updated.status_code == 200
         assert updated.json()["progress"] == 0.5
         after = len(
-            client.get("/api/v1/events", params={"job_id": job["id"]}).json()[
-                "items"
-            ]
+            client.get("/api/v1/events", params={"job_id": job["id"]}).json()["items"]
         )
         assert after == before
 
-        client.post(
-            f"/api/v1/jobs/{job['id']}/transition", json={"state": "MUXING"}
-        )
+        client.post(f"/api/v1/jobs/{job['id']}/transition", json={"state": "MUXING"})
         late = client.post(
             f"/api/v1/jobs/{job['id']}/progress",
             json={"progress": 0.9, "expected_state": "ENCODING"},
@@ -329,9 +330,9 @@ def test_failed_job_retry_endpoint_restores_provenance_stage(tmp_path):
         assert retried["finished_at"] is None
         assert retried["version"] == failed["version"] + 1
         assert retried["status_message"] == "retrying failed MUXING stage"
-        events = client.get(
-            "/api/v1/events", params={"job_id": job["id"]}
-        ).json()["items"]
+        events = client.get("/api/v1/events", params={"job_id": job["id"]}).json()[
+            "items"
+        ]
         assert events[-1]["kind"] == "job.retry"
         assert events[-1]["state_from"] == "FAILED"
         assert events[-1]["state_to"] == "MUXING"
@@ -360,6 +361,12 @@ def test_failed_job_retry_endpoint_reports_active_blocker(tmp_path):
         ).json()
         claimed = client.post("/api/v1/jobs/claim-next").json()["job"]
         assert claimed["id"] == blocker["id"]
+        for state in ("READY", "ENCODING"):
+            response = client.post(
+                f"/api/v1/jobs/{blocker['id']}/transition",
+                json={"state": state},
+            )
+            assert response.status_code == 200
 
         response = client.post(f"/api/v1/jobs/{failed_job['id']}/retry")
 
@@ -372,9 +379,7 @@ def test_failed_job_retry_endpoint_reports_active_blocker(tmp_path):
 
 def test_failed_job_retry_endpoint_rejects_unsafe_failure_stage(tmp_path):
     with make_client(tmp_path) as client:
-        job = client.post(
-            "/api/v1/jobs", json={"source_path": "/storage/Film"}
-        ).json()
+        job = client.post("/api/v1/jobs", json={"source_path": "/storage/Film"}).json()
         client.post("/api/v1/jobs/claim-next")
         failed = client.post(
             f"/api/v1/jobs/{job['id']}/transition",

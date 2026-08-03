@@ -1,10 +1,10 @@
 import type { ContentType, Job, JobState } from "./api/types";
 
 export const STATE_LABELS: Record<JobState, string> = {
-  QUEUED: "Várólistán",
+  QUEUED: "Scanre vár",
   SCANNING: "Lemez elemzése",
   AWAITING_SELECTION: "Beállításra vár",
-  READY: "Előkészítés",
+  READY: "Kódolásra vár",
   ENCODING: "Videó kódolása",
   MUXING: "MKV összeállítása",
   QC: "Minőség-ellenőrzés",
@@ -55,7 +55,7 @@ export function stageProgress(job: Job): number {
 }
 
 export function isActiveState(state: JobState): boolean {
-  return !["QUEUED", "COMPLETED", "FAILED", "CANCELLED"].includes(state);
+  return ["ENCODING", "MUXING", "QC", "COMPARISON", "UPLOADING", "NEEDS_REVIEW", "UPLOAD_FAILED"].includes(state);
 }
 
 export function isTerminalState(state: JobState): boolean {

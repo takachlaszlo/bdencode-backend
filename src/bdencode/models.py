@@ -54,9 +54,25 @@ RETRYABLE_FAILED_STAGES = frozenset(
     }
 )
 
-# QUEUED is intentionally not blocking: any number of jobs may wait, while the
-# partial unique index in db.py permits exactly one state from this set.
-BLOCKING_STATES = frozenset(set(JobState) - set(TERMINAL_STATES) - {JobState.QUEUED})
+# Scanning is a lightweight preparation lane. It may run beside the one serial
+# encode pipeline, while only one disc is scanned at a time. Jobs waiting for
+# operator selection and fully configured READY jobs own neither lane.
+PREPARATION_ACTIVE_STATES = frozenset({JobState.SCANNING})
+
+# The database partial unique index permits exactly one job in this set. A
+# NEEDS_REVIEW/UPLOAD_FAILED pause deliberately keeps ownership of the encode
+# lane, so the next encode cannot overtake an unfinished job.
+BLOCKING_STATES = frozenset(
+    {
+        JobState.ENCODING,
+        JobState.MUXING,
+        JobState.QC,
+        JobState.COMPARISON,
+        JobState.UPLOADING,
+        JobState.NEEDS_REVIEW,
+        JobState.UPLOAD_FAILED,
+    }
+)
 
 PIPELINE_STATES = (
     JobState.QUEUED,
@@ -324,6 +340,8 @@ class HealthResponse(StrictModel):
     schema_version: int
     active_job_id: str | None
     blocking_state: JobState | None
+    preparing_job_id: str | None = None
+    ready_jobs: int = 0
     queued_jobs: int
 
 

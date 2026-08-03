@@ -38,7 +38,7 @@ export function DashboardPage() {
 
   const allJobs = jobs.data?.items ?? [];
   const active = findActive(allJobs, health.data?.active_job_id);
-  const queued = allJobs.filter((job) => job.state === "QUEUED");
+  const queued = allJobs.filter((job) => ["QUEUED", "SCANNING", "AWAITING_SELECTION", "READY"].includes(job.state));
   const recent = allJobs.filter((job) => ["COMPLETED", "FAILED", "CANCELLED"].includes(job.state)).slice(0, 4);
   const logicalCpus = nestedNumber(runtime.data, "host", "logical_cpus");
   const freeBytes = nestedNumber(runtime.data, "paths", "data", "free_bytes");
@@ -124,7 +124,7 @@ export function DashboardPage() {
           <div className="section-heading">
             <div>
               <span className="section-heading__icon"><ListOrdered size={19} /></span>
-              <div><h2>Várólista</h2><p>{queued.length} munka várakozik</p></div>
+              <div><h2>Várólista</h2><p>{queued.length} munka előkészítés alatt vagy kódolásra kész</p></div>
             </div>
             <Link to="/queue" className="text-link">Összes megnyitása <ArrowRight size={15} /></Link>
           </div>
@@ -136,7 +136,7 @@ export function DashboardPage() {
             <EmptyState
               icon={<Clock3 size={25} />}
               title="A várólista üres"
-              description="Adj hozzá több filmet; a rendszer egymás után dolgozza fel őket."
+              description="Adj hozzá több filmet; a scan és a beállítás előre elkészülhet, az encode-ok pedig egymás után futnak."
               action={<Link className="button button--secondary" to="/new">Munka hozzáadása</Link>}
             />
           )}

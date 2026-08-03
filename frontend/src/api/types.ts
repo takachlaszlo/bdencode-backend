@@ -26,6 +26,8 @@ export interface HealthResponse {
   schema_version: number;
   active_job_id: string | null;
   blocking_state: JobState | null;
+  preparing_job_id?: string | null;
+  ready_jobs?: number;
   queued_jobs: number;
 }
 
@@ -43,7 +45,10 @@ export interface CapabilitiesResponse {
   audio_actions: TrackAction[];
   constraints: {
     max_active_jobs?: number;
+    max_concurrent_scans?: number;
     queued_jobs_allowed?: boolean;
+    preparation_during_encode?: boolean;
+    ready_queue_requires_selection?: boolean;
     cpu_budget_fraction?: number;
     supports_3d?: boolean;
     dolby_vision_retention?: boolean;

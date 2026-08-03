@@ -176,7 +176,7 @@ Fontos API-k:
 - `GET /api/v1/artifacts?job_id=...`
 - `GET /api/v1/analyze-mkv?path=...`
 
-A job először lemezscanre kerül. Több playlist/edition vagy bizonytalan sáv esetén `AWAITING_SELECTION` / `NEEDS_REVIEW` állapotban blokkolja a sort; a javított selection ugyanazon endpointon újraküldhető, és biztonsági okból a pipeline `READY` állapottól újraellenőriz mindent. A következő encode csak a teljes QC, comparison és feltöltés lezárása után indulhat.
+A job először az önálló előkészítési sávban lemezscanre kerül. Ez a könnyű scan egy már futó encode mellett is dolgozhat, de egyszerre csak egy lemezt vizsgál. A scan után több job is várhat `AWAITING_SELECTION` állapotban; a jóváhagyott paraméterekkel `READY` állapotba kerülnek. A sor első READY munkája csak akkor foglalhatja el az egyetlen encode sávot, amikor az előző encode teljes QC-, comparison- és feltöltési folyamata lezárult. Egy késői `NEEDS_REVIEW` továbbra is megtartja az encode sávot, így egy későbbi munka nem előzheti meg.
 
 ## Gyors videó-comparison
 
@@ -196,11 +196,11 @@ Az APT guard kizárólag a vaultban szereplő helyi csomagokat engedi a `dpkg` e
 
 A telepítő külön, fix célpontlistás rollback-snapshotot tart a változó host unitokról, az APT drop-injeiről, nginx beállításáról és az app/tool release pointereiről. Az `apt-daily` timerek aktív/engedélyezett állapota is a journal része: a telepítő a csomagművelet előtt leállítja őket, kivárja a futó dpkg-t, korán telepíti a media pint, majd pontosan visszaállítja az előállapotot. A telepítő `apt-get` gyermeke külön tartós lockot örököl; a watchdog kivárja ezt és a natív apt/dpkg lockokat, majd tiszta `dpkg --audit` és `apt-get check` nélkül nem indít runtime-ot. A recovery helper, az API/worker stabil recovery drop-inje és az install-watchdog szándékosan a snapshoton kívül marad, így a visszaállítás a régi runtime-unitok visszatérése után is folytatható. A journal két fázist különböztet meg: a queue vizsgálata alatt egy futó encode-ot soha nem állít le, tényleges mutáció után viszont teljes rollbacket végez. Normál hiba esetén azonnal, SIGKILL után a négy install/runtime/APT markert figyelő `bdencode-install-recovery.path`, rebootkor pedig a recovery gate fejezi be; a journal helye `/var/lib/bdencode/install-transactions`.
 
-A telepítő `AWAITING_SELECTION`, illetve tartós `UPLOAD_FAILED` állapotban
-szünetelő job mellett is frissítheti az alkalmazást. Az utóbbinál minden helyi
-eredmény és feltöltési checkpoint lezárt állapotban vár, ezért a frissítés után
-csak a feltöltés folytatódik. `READY`, `NEEDS_REVIEW`, kódolás, mux, QC,
-comparison vagy aktív `UPLOADING` alatt továbbra is fail-closed módon halaszt.
+A telepítő `QUEUED`, `AWAITING_SELECTION` vagy még el nem indított `READY`
+munkák mellett is frissítheti az alkalmazást. Aktív `SCANNING`, `NEEDS_REVIEW`,
+kódolás, mux, QC, comparison vagy `UPLOADING` alatt fail-closed módon halaszt.
+Tartós `UPLOAD_FAILED` állapotban minden helyi eredmény és feltöltési checkpoint
+lezártan vár, ezért frissítés után csak a feltöltés folytatódik.
 
 ## Teszt
 

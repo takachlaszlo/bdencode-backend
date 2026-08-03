@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 from threading import Barrier
 
 import pytest
@@ -70,6 +71,81 @@ def test_serial_queue_allows_backlog_but_only_one_active(database):
     second = queue.claim_next()
     assert second is not None
     assert second.id == low.id
+
+
+def test_configured_backlog_and_scan_progress_beside_active_encode(database):
+    queue = JobQueue(database)
+    first = enqueue(queue, "first")
+    second = enqueue(queue, "second")
+    third = enqueue(queue, "third")
+
+    first_scan = queue.claim_next()
+    assert first_scan is not None and first_scan.id == first.id
+    queue.advance(first.id, JobState.AWAITING_SELECTION)
+    queue.advance(first.id, JobState.READY)
+    active = queue.claim_next_ready()
+    assert active is not None and active.id == first.id
+    assert active.state is JobState.ENCODING
+
+    second_scan = queue.claim_next()
+    assert second_scan is not None and second_scan.id == second.id
+    queue.advance(second.id, JobState.AWAITING_SELECTION)
+    queue.advance(second.id, JobState.READY)
+    third_scan = queue.claim_next()
+    assert third_scan is not None and third_scan.id == third.id
+
+    assert database.encoding_job().id == first.id
+    assert database.preparing_job().id == third.id
+    assert queue.ready_count() == 1
+    assert queue.claim_next_ready() is None
+
+    for state in (
+        JobState.MUXING,
+        JobState.QC,
+        JobState.COMPARISON,
+        JobState.UPLOADING,
+        JobState.COMPLETED,
+    ):
+        queue.advance(first.id, state)
+    next_encode = queue.claim_next_ready()
+    assert next_encode is not None and next_encode.id == second.id
+
+
+def test_schema_one_active_index_is_migrated_without_losing_jobs(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    original = Database(path)
+    original.initialize()
+    queued = JobQueue(original).enqueue(
+        JobCreate(source_path="/storage/legacy", name="legacy")
+    )
+    original.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'"
+        )
+        connection.execute("DROP INDEX ux_jobs_single_scanning")
+        connection.execute("DROP INDEX ux_jobs_single_encoding")
+        connection.execute(
+            "CREATE UNIQUE INDEX ux_jobs_single_active ON jobs ((1)) "
+            "WHERE state != 'QUEUED'"
+        )
+
+    migrated = Database(path)
+    migrated.initialize()
+
+    assert migrated.schema_version() == 1
+    assert migrated.get_job(queued.id).name == "legacy"
+    with sqlite3.connect(path) as connection:
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+    assert "ux_jobs_single_active" not in indexes
+    assert "ux_jobs_single_scanning" in indexes
+    assert "ux_jobs_single_encoding" in indexes
 
 
 def test_state_machine_rejects_skips_and_uses_optimistic_version(database):
@@ -185,7 +261,7 @@ def test_terminal_error_state_preserves_last_progress(database, terminal):
     assert stopped.progress == 0.42
 
 
-def test_needs_review_and_upload_failure_both_block_queue(database):
+def test_needs_review_and_upload_failure_block_encode_but_not_scan_lane(database):
     queue = JobQueue(database)
     first = enqueue(queue, "first")
     enqueue(queue, "second")
@@ -196,7 +272,9 @@ def test_needs_review_and_upload_failure_both_block_queue(database):
     review = queue.needs_review(first.id, message="ambiguous cadence")
     assert review.state is JobState.NEEDS_REVIEW
     assert review.resume_state is JobState.ENCODING
-    assert queue.claim_next() is None
+    preparing = queue.claim_next()
+    assert preparing is not None and preparing.state is JobState.SCANNING
+    assert queue.claim_next_ready() is None
     resumed = queue.resume_review(first.id)
     assert resumed.state is JobState.ENCODING
 
@@ -208,10 +286,11 @@ def test_needs_review_and_upload_failure_both_block_queue(database):
         JobState.UPLOAD_FAILED,
     ):
         queue.advance(first.id, state)
-    assert queue.claim_next() is None
+    assert queue.claim_next_ready() is None
     assert queue.retry_upload(first.id).state is JobState.UPLOADING
     queue.advance(first.id, JobState.COMPLETED)
-    assert queue.claim_next() is not None
+    queue.advance(preparing.id, JobState.READY)
+    assert queue.claim_next_ready() is not None
 
 
 def test_review_selection_can_be_corrected_and_resumes_original_stage(database):
@@ -449,9 +528,7 @@ def test_concurrent_failed_retries_preserve_single_active_guard(database):
     def retry(index: int):
         barrier.wait()
         try:
-            job = JobQueue(retry_databases[index]).retry_failed(
-                failed_jobs[index].id
-            )
+            job = JobQueue(retry_databases[index]).retry_failed(failed_jobs[index].id)
             return "retried", job.id
         except QueueBlockedError as exc:
             assert exc.active_job is not None

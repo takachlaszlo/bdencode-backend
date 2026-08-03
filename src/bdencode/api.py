@@ -138,13 +138,16 @@ def create_app(
 
     @application.get(f"{API_PREFIX}/health", response_model=HealthResponse)
     def health() -> HealthResponse:
-        active = db.active_job()
+        active = db.encoding_job()
+        preparing = db.preparing_job()
         return HealthResponse(
             status="ok",
             database=db.display_path,
             schema_version=db.schema_version(),
             active_job_id=active.id if active else None,
             blocking_state=active.state if active else None,
+            preparing_job_id=preparing.id if preparing else None,
+            ready_jobs=queue.ready_count(),
             queued_jobs=queue.queued_count(),
         )
 
@@ -168,7 +171,10 @@ def create_app(
             audio_actions=list(AUDIO_ACTIONS),
             constraints={
                 "max_active_jobs": 1,
+                "max_concurrent_scans": 1,
                 "queued_jobs_allowed": True,
+                "preparation_during_encode": True,
+                "ready_queue_requires_selection": True,
                 "cpu_budget_fraction": 0.8,
                 "supports_3d": False,
                 "dolby_vision_retention": False,
@@ -422,9 +428,7 @@ def create_app(
         return queue.retry_upload(job_id)
 
     @application.post(f"{API_PREFIX}/jobs/{{job_id}}/retry", response_model=Job)
-    def retry_failed_job(
-        job_id: str, request: JobRetryRequest | None = None
-    ) -> Job:
+    def retry_failed_job(job_id: str, request: JobRetryRequest | None = None) -> Job:
         retry = request or JobRetryRequest()
         return queue.retry_failed(
             job_id,

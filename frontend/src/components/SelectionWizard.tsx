@@ -398,7 +398,7 @@ export function SelectionWizard({
         <div>
           <span className="eyebrow">Scan elkészült</span>
           <h2>Kódolási beállítások</h2>
-          <p>Jóváhagyás után a worker automatikusan elindítja a szerveroldalon ellenőrzött tervet; külön indítógomb nincs.</p>
+          <p>Jóváhagyás után a szerveroldalon ellenőrzött terv kódolásra kész állapotban vár a sorára; külön indítógomb nincs.</p>
         </div>
         <div className="codec-lockup">
           <span>{scan.disc_kind === "uhd" ? "UHD" : "BD"}</span>
@@ -647,7 +647,7 @@ export function SelectionWizard({
             <span className="validation-card__icon">{validation ? <Check size={26} /> : <SlidersHorizontal size={26} />}</span>
             <span className="eyebrow">Szerveroldali planner</span>
             <h3>{validation ? "A terv érvényes" : "Ellenőrzésre vár"}</h3>
-            <p>{validation ? "A tényleges effektív profil elkészült. Jóváhagyás után a worker automatikusan folytatja." : "A backend ugyanazzal a logikával ellenőriz, amelyet a worker kódoláskor használ."}</p>
+            <p>{validation ? "A tényleges effektív profil elkészült. Jóváhagyás után a munka kész paraméterekkel beáll a kódolási sorba." : "A backend ugyanazzal a logikával ellenőriz, amelyet a worker kódoláskor használ."}</p>
             {validation && (
               <>
                 <dl className="summary-list">

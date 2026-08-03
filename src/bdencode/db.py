@@ -1,9 +1,9 @@
 """Small, process-safe SQLite persistence layer for bdencode.
 
 There is intentionally no ORM here.  Every mutating operation uses
-``BEGIN IMMEDIATE`` and the database also has a partial unique index for the
-single-active-job invariant, so separate API and worker processes cannot race
-past the queue guard.
+``BEGIN IMMEDIATE`` and the database also has separate partial unique indexes
+for the one scan lane and the one encode lane, so separate processes cannot
+race past either queue guard.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from .models import (
     BLOCKING_STATES,
+    PREPARATION_ACTIVE_STATES,
     RETRYABLE_FAILED_STAGES,
     TERMINAL_STATES,
     Artifact,
@@ -147,6 +148,20 @@ class Database:
             try:
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.execute("PRAGMA synchronous = FULL")
+                existing_meta = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
+                ).fetchone()
+                existing_version: int | None = None
+                if existing_meta is not None:
+                    version_row = connection.execute(
+                        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+                    ).fetchone()
+                    existing_version = int(version_row["value"]) if version_row else 0
+                    if existing_version not in {1, SCHEMA_VERSION}:
+                        raise PersistenceError(
+                            f"unsupported database schema {existing_version}; "
+                            f"expected 1 or {SCHEMA_VERSION}"
+                        )
                 blocking = ",".join(f"'{state.value}'" for state in BLOCKING_STATES)
                 job_states = ",".join(f"'{state.value}'" for state in JobState)
                 scan_states = ",".join(f"'{state.value}'" for state in ScanState)
@@ -183,7 +198,13 @@ class Database:
                     CREATE INDEX IF NOT EXISTS ix_jobs_queue
                         ON jobs (priority DESC, created_at ASC)
                         WHERE state = 'QUEUED';
-                    CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_single_active
+                    CREATE INDEX IF NOT EXISTS ix_jobs_ready
+                        ON jobs (priority DESC, created_at ASC)
+                        WHERE state = 'READY';
+                    DROP INDEX IF EXISTS ux_jobs_single_active;
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_single_scanning
+                        ON jobs ((1)) WHERE state = 'SCANNING';
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_single_encoding
                         ON jobs ((1)) WHERE state IN ({blocking});
 
                     CREATE TABLE IF NOT EXISTS scans (
@@ -228,7 +249,7 @@ class Database:
                     );
                     CREATE INDEX IF NOT EXISTS ix_events_job_id ON events (job_id, id);
                     INSERT INTO schema_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
-                        ON CONFLICT(key) DO NOTHING;
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
                     COMMIT;
                     """
                 )
@@ -357,6 +378,12 @@ class Database:
         return int(row["count"])
 
     def active_job(self) -> Job | None:
+        """Return any running worker job, preferring the serial encode lane."""
+
+        encoding = self.encoding_job()
+        return encoding if encoding is not None else self.preparing_job()
+
+    def encoding_job(self) -> Job | None:
         placeholders = ",".join("?" for _ in BLOCKING_STATES)
         with self._read() as connection:
             row = connection.execute(
@@ -365,15 +392,24 @@ class Database:
             ).fetchone()
         return self._decode_job(row) if row else None
 
+    def preparing_job(self) -> Job | None:
+        placeholders = ",".join("?" for _ in PREPARATION_ACTIVE_STATES)
+        with self._read() as connection:
+            row = connection.execute(
+                f"SELECT * FROM jobs WHERE state IN ({placeholders}) LIMIT 1",
+                [state.value for state in PREPARATION_ACTIVE_STATES],
+            ).fetchone()
+        return self._decode_job(row) if row else None
+
     def claim_next_job(self) -> Job | None:
-        """Atomically claim the oldest highest-priority job for scanning."""
+        """Atomically claim one queued job for the independent scan lane."""
 
         try:
             with self._write() as connection:
-                placeholders = ",".join("?" for _ in BLOCKING_STATES)
+                placeholders = ",".join("?" for _ in PREPARATION_ACTIVE_STATES)
                 active = connection.execute(
                     f"SELECT id FROM jobs WHERE state IN ({placeholders}) LIMIT 1",
-                    [state.value for state in BLOCKING_STATES],
+                    [state.value for state in PREPARATION_ACTIVE_STATES],
                 ).fetchone()
                 if active:
                     return None
@@ -393,7 +429,37 @@ class Database:
                     details={},
                 )
         except sqlite3.IntegrityError as exc:
-            raise QueueBlockedError(self.active_job()) from exc
+            raise QueueBlockedError(self.preparing_job()) from exc
+
+    def claim_next_ready_job(self) -> Job | None:
+        """Atomically move the first configured job into the serial encode lane."""
+
+        try:
+            with self._write() as connection:
+                placeholders = ",".join("?" for _ in BLOCKING_STATES)
+                active = connection.execute(
+                    f"SELECT id FROM jobs WHERE state IN ({placeholders}) LIMIT 1",
+                    [state.value for state in BLOCKING_STATES],
+                ).fetchone()
+                if active:
+                    return None
+                row = connection.execute(
+                    """
+                    SELECT * FROM jobs WHERE state = 'READY'
+                    ORDER BY priority DESC, created_at ASC LIMIT 1
+                    """
+                ).fetchone()
+                if row is None:
+                    return None
+                return self._transition_in_connection(
+                    connection,
+                    row,
+                    JobState.ENCODING,
+                    message="claimed for serial encode; preparing reference timeline",
+                    details={"queue_lane": "encode"},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise QueueBlockedError(self.encoding_job()) from exc
 
     def transition_job(
         self,
@@ -500,17 +566,18 @@ class Database:
                         current=current,
                     )
 
-                placeholders = ",".join("?" for _ in BLOCKING_STATES)
-                blocker = connection.execute(
-                    f"""
-                    SELECT * FROM jobs
-                    WHERE id != ? AND state IN ({placeholders})
-                    LIMIT 1
-                    """,
-                    (job_id, *(state.value for state in BLOCKING_STATES)),
-                ).fetchone()
-                if blocker is not None:
-                    raise QueueBlockedError(self._decode_job(blocker))
+                if retry_stage is not JobState.READY:
+                    placeholders = ",".join("?" for _ in BLOCKING_STATES)
+                    blocker = connection.execute(
+                        f"""
+                        SELECT * FROM jobs
+                        WHERE id != ? AND state IN ({placeholders})
+                        LIMIT 1
+                        """,
+                        (job_id, *(state.value for state in BLOCKING_STATES)),
+                    ).fetchone()
+                    if blocker is not None:
+                        raise QueueBlockedError(self._decode_job(blocker))
 
                 now = utc_now()
                 retry_message = message or f"retrying failed {retry_stage.value} stage"
@@ -561,7 +628,7 @@ class Database:
                 getattr(exc, "sqlite_errorcode", None)
                 == sqlite3.SQLITE_CONSTRAINT_UNIQUE
             ):
-                blocker = self.active_job()
+                blocker = self.encoding_job()
                 if blocker is not None:
                     raise QueueBlockedError(blocker) from exc
             raise

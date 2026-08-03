@@ -98,14 +98,21 @@ def test_queue_idle_exit_status(tmp_path: Path) -> None:
     )
 
 
-def test_queue_idle_allow_review_only_accepts_awaiting_selection(
+def test_queue_idle_treats_awaiting_selection_as_safe_pause(
     tmp_path: Path,
 ) -> None:
     config, _database, queue = queue_config(tmp_path)
     job_in_state(queue, JobState.AWAITING_SELECTION)
 
-    assert main(["--config", str(config), "queue-idle"]) == 3
+    assert main(["--config", str(config), "queue-idle"]) == 0
     assert main(["--config", str(config), "queue-idle", "--allow-review"]) == 0
+
+
+def test_queue_idle_rejects_an_active_scan(tmp_path: Path) -> None:
+    config, _database, queue = queue_config(tmp_path)
+    job_in_state(queue, JobState.SCANNING)
+
+    assert main(["--config", str(config), "queue-idle"]) == 3
 
 
 def test_queue_idle_install_safe_pause_accepts_upload_failed(tmp_path: Path) -> None:
@@ -164,7 +171,9 @@ def test_installer_loads_only_fixed_encrypted_image_host_credentials() -> None:
     assert 'stat -c %a -- "$credential_path"' in installer
     assert '"$credential_name" "$credential_path"' in installer
     assert "LoadCredentialEncrypted=%s:%s" in installer
-    assert 'assert_path_components_without_symlinks "$credential_directory"' in installer
+    assert (
+        'assert_path_components_without_symlinks "$credential_directory"' in installer
+    )
     assert 'stat -c %u -- "$credential_directory"' in installer
     assert 'stat -c %a -- "$credential_directory"' in installer
 
@@ -241,9 +250,7 @@ def test_installer_isolates_tests_from_live_runtime_configuration() -> None:
     end = installer.index("# Current VapourSynth", start)
     test_command = installer[start:end]
 
-    runtime_variables = {
-        f"BDENCODE_{field.name.upper()}" for field in fields(Settings)
-    }
+    runtime_variables = {f"BDENCODE_{field.name.upper()}" for field in fields(Settings)}
     runtime_variables.update(
         {
             "BDENCODE_CONFIG",
@@ -300,9 +307,7 @@ def test_data_path_uses_required_children_for_runtime_writability(
     assert report["ok"] is True
     assert report["free_bytes"] > 0
     assert report["total_bytes"] > 0
-    assert all(
-        item["ok"] for item in report["required_writable_paths"].values()
-    )
+    assert all(item["ok"] for item in report["required_writable_paths"].values())
 
 
 @pytest.mark.parametrize("failure_mode", ["missing", "unwritable"])

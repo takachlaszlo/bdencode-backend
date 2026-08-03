@@ -17,6 +17,13 @@ Minden endpoint prefixe `/api/v1`. Nginx alatt a külső prefix `/encoder`, teh�
 
 A `source_path` csak a konfigurált source root alatt lehet. `work_path` csak a jobs root, `output_path` csak a completed root alatt engedélyezett.
 
+Az új job `QUEUED` állapotból az egyetlen előkészítési sávban `SCANNING`
+állapotba léphet akkor is, ha egy másik job éppen kódol, muxol, QC-t vagy
+comparisont végez. Több scan eredménye várhat egyszerre `AWAITING_SELECTION`
+állapotban. A jóváhagyott selection `READY` állapotot jelent; innen prioritás,
+majd létrehozási idő szerint kerül az egyetlen soros encode sávba. Új encode
+csak az előző teljes lezárása után indul.
+
 ## Selection
 
 A worker scanje után a `POST /jobs/{id}/selection` payload `selection` objektuma határozza meg a playlistet, szűrést és minden sáv műveletét. A backend nem talál ki nyelvet vagy sávszerepet alacsony confidence esetén.

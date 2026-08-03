@@ -37,7 +37,7 @@ export function JobCard({ job, compact = false }: { job: Job; compact?: boolean 
 export function PipelineSteps({ job }: { job: Job }) {
   const stages = [
     ["SCANNING", "Scan"],
-    ["READY", "Előkészítés"],
+    ["READY", "Sorban áll"],
     ["ENCODING", "Kódolás"],
     ["MUXING", "Mux"],
     ["QC", "QC"],

@@ -1,4 +1,4 @@
-"""Durable, strictly serial pipeline worker.
+"""Durable worker with concurrent scan and strictly serial encode lanes.
 
 The database owns scheduling and the job state is the recovery cursor.  Every
 expensive filesystem stage also has a content-addressed marker, so a service
@@ -17,6 +17,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
@@ -1236,6 +1237,8 @@ class PipelineWorker:
         elif job.state is JobState.READY:
             self._prepare(job, paths)
         elif job.state is JobState.ENCODING:
+            if not self._preparation_is_current(job, paths):
+                self._prepare(job, paths, advance=False)
             self._encode(job, paths)
         elif job.state is JobState.MUXING:
             self._mux(job, paths)
@@ -1632,7 +1635,25 @@ class PipelineWorker:
             ),
         )
 
-    def _prepare(self, job: Job, paths: JobPaths) -> None:
+    def _preparation_inputs(self, job: Job, scan: DiscScan) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "scan_fingerprint": scan.fingerprint,
+            "selection": job.selection,
+        }
+
+    def _preparation_is_current(self, job: Job, paths: JobPaths) -> bool:
+        try:
+            scan, _selection = self._load_scan_and_selection(job, paths)
+        except (OSError, TypeError, ValueError, KeyError):
+            return False
+        return _valid_stage(
+            paths.stages / "pipeline-prepare.json",
+            self._preparation_inputs(job, scan),
+            [paths.reference, paths.script, paths.plan_json],
+        )
+
+    def _prepare(self, job: Job, paths: JobPaths, *, advance: bool = True) -> None:
         scan, selection = self._load_scan_and_selection(job, paths)
         playlist = scan.playlist(selection.playlist_id)
         pcm_bluray_audio_ordinals = tuple(
@@ -1731,9 +1752,15 @@ class PipelineWorker:
             "encode-plan.json",
             mime_type="application/json",
         )
-        self.queue.advance(
-            job.id, JobState.ENCODING, message="reference timeline prepared"
+        _write_stage(
+            paths.stages / "pipeline-prepare.json",
+            self._preparation_inputs(job, scan),
+            [paths.reference, paths.script, paths.plan_json],
         )
+        if advance:
+            self.queue.advance(
+                job.id, JobState.ENCODING, message="reference timeline prepared"
+            )
 
     def _encode(self, job: Job, paths: JobPaths) -> None:
         scan, selection = self._load_scan_and_selection(job, paths)
@@ -2996,9 +3023,7 @@ class PipelineWorker:
             if hdr:
                 reference_sdr = paths.comparison / f"{label}-reference-sdr.png"
                 encoded_sdr = paths.comparison / f"{label}-encode-sdr.png"
-                clean_reference_sdr = (
-                    clean_png_root / f"{label}-reference-sdr.png"
-                )
+                clean_reference_sdr = clean_png_root / f"{label}-reference-sdr.png"
                 clean_encoded_sdr = clean_png_root / f"{label}-encode-sdr.png"
                 sdr_inputs = dict(image_inputs, hdr_native=False)
                 sdr_marker = paths.stages / f"comparison-{label}-sdr-v3.json"
@@ -3132,9 +3157,7 @@ class PipelineWorker:
                     "reference_png": reference_png.name,
                     "encode_png": encoded_png.name,
                     "measurement_input": "unannotated_pixels_before_visual_header",
-                    "reference_measurement_sha256": sha256_file(
-                        clean_reference_png
-                    ),
+                    "reference_measurement_sha256": sha256_file(clean_reference_png),
                     "encode_measurement_sha256": sha256_file(clean_encoded_png),
                     "ssim_all": self._metric_stat(ssim_stats, "All"),
                     "psnr_average_db": self._metric_stat(psnr_stats, "psnr_avg"),
@@ -3279,10 +3302,12 @@ class PipelineWorker:
         try:
             video_manifest = json.loads(video_manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError("video comparison manifest is missing or invalid") from exc
-        if not isinstance(video_manifest, Mapping) or not _has_current_visual_annotations(
-            video_manifest
-        ):
+            raise RuntimeError(
+                "video comparison manifest is missing or invalid"
+            ) from exc
+        if not isinstance(
+            video_manifest, Mapping
+        ) or not _has_current_visual_annotations(video_manifest):
             raise ReviewRequired(
                 "comparison images predate the required visible SOURCE/ENCODE, "
                 "0-based frame index and I/P/B labels; reapprove the selection "
@@ -3746,8 +3771,13 @@ def run_worker(
     settings: Settings,
     once: bool = False,
     poll_interval: float | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> int:
-    """Run the serial worker; ``once`` processes at most one job end-to-end."""
+    """Run one serial encode lane plus one lightweight concurrent scan lane.
+
+    ``once`` remains deterministic for maintenance/tests and processes at most
+    one claimed job without starting the background preparation lane.
+    """
     settings = settings.validate()
     settings.create_directories()
     database.initialize()
@@ -3755,7 +3785,11 @@ def run_worker(
     if interval < 0:
         raise ValueError("poll_interval cannot be negative")
     stopping = False
-    worker = PipelineWorker(database, settings, stop_requested=lambda: stopping)
+
+    def should_stop() -> bool:
+        return stopping or bool(stop_requested and stop_requested())
+
+    worker = PipelineWorker(database, settings, stop_requested=should_stop)
     instance_lock = None
     fcntl_module = None
 
@@ -3784,58 +3818,95 @@ def run_worker(
             previous[number] = signal.signal(number, stop)
         except (ValueError, OSError):
             pass
+
+    idle_sleep = max(interval, 0.05)
+
+    def claim_lane(
+        current: Callable[[], Job | None],
+        claim: Callable[[], Job | None],
+    ) -> Job | None:
+        """Observe or claim one lane while excluding deployment transactions."""
+
+        if _maintenance_active():
+            return None
+        if fcntl_module is None:
+            return current() or claim()
+        deployment_path = settings.state_root / "deployment.lock"
+        with deployment_path.open("a+b") as deployment_lock:
+            os.chmod(deployment_path, 0o640)
+            while not should_stop():
+                try:
+                    fcntl_module.flock(
+                        deployment_lock.fileno(),
+                        fcntl_module.LOCK_SH | fcntl_module.LOCK_NB,
+                    )
+                    break
+                except BlockingIOError:
+                    time.sleep(min(idle_sleep, 0.2))
+            if should_stop():
+                return None
+            try:
+                if _maintenance_active():
+                    return None
+                return current() or claim()
+            finally:
+                fcntl_module.flock(deployment_lock.fileno(), fcntl_module.LOCK_UN)
+
+    preparation_thread: threading.Thread | None = None
     try:
         _sd_notify("READY=1\nSTATUS=Ready; waiting for an encode job")
-        while not stopping:
-            if _maintenance_active():
-                time.sleep(min(interval or 0.2, 0.2))
-                continue
-            if fcntl_module is not None:
-                # The updater/installer takes this lock exclusively before it
-                # checks queue-idle. Holding a shared lock across the atomic DB
-                # claim closes the otherwise tiny maintenance-vs-claim race.
-                deployment_path = settings.state_root / "deployment.lock"
-                with deployment_path.open("a+b") as deployment_lock:
-                    os.chmod(deployment_path, 0o640)
-                    while not stopping:
-                        try:
-                            fcntl_module.flock(
-                                deployment_lock.fileno(),
-                                fcntl_module.LOCK_SH | fcntl_module.LOCK_NB,
-                            )
-                            break
-                        except BlockingIOError:
-                            time.sleep(min(interval or 0.2, 0.2))
-                    if stopping:
-                        return 0
-                    try:
-                        if _maintenance_active():
-                            job = None
-                        else:
-                            job = database.active_job()
-                            if job is None:
-                                job = worker.queue.claim_next()
-                    finally:
-                        fcntl_module.flock(
-                            deployment_lock.fileno(), fcntl_module.LOCK_UN
-                        )
-            else:
-                job = database.active_job()
-                if job is None:
-                    job = worker.queue.claim_next()
+        if once:
+            job = claim_lane(database.encoding_job, worker.queue.claim_next_ready)
             if job is None:
-                if once:
-                    return 0
-                time.sleep(interval)
+                job = claim_lane(database.preparing_job, worker.queue.claim_next)
+            if job is not None:
+                worker.process_job(job)
+            return 0
+
+        preparation_worker = PipelineWorker(
+            database,
+            settings,
+            stop_requested=should_stop,
+        )
+
+        def prepare_jobs() -> None:
+            while not should_stop():
+                try:
+                    job = claim_lane(
+                        database.preparing_job,
+                        preparation_worker.queue.claim_next,
+                    )
+                    if job is None:
+                        time.sleep(idle_sleep)
+                        continue
+                    preparation_worker.process_job(job)
+                except Exception:
+                    LOG.exception(
+                        "preparation lane failed; retrying after poll interval"
+                    )
+                    time.sleep(idle_sleep)
+
+        preparation_thread = threading.Thread(
+            target=prepare_jobs,
+            name="bdencode-preparation",
+            daemon=True,
+        )
+        preparation_thread.start()
+
+        while not should_stop():
+            job = claim_lane(database.encoding_job, worker.queue.claim_next_ready)
+            if job is None:
+                time.sleep(idle_sleep)
                 continue
             worker.process_job(job)
-            if once:
-                return 0
-            # A review/upload pause intentionally blocks the queue.  Polling the
-            # database lets an API action resume it without restarting service.
-            time.sleep(interval)
+            # A processing review/upload pause intentionally keeps the encode
+            # lane. Polling lets an API action resume it without a restart.
+            time.sleep(idle_sleep)
         return 0
     finally:
+        stopping = True
+        if preparation_thread is not None:
+            preparation_thread.join(timeout=min(max(idle_sleep * 2, 0.2), 5.0))
         for number, handler in previous.items():
             signal.signal(number, handler)
         if instance_lock is not None:

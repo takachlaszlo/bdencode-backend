@@ -182,7 +182,7 @@ export function NewEncodePage() {
       <PageHeader
         eyebrow="Új kódolás"
         title={stepTitle}
-        description="A lemez először biztonságos, írásmentes scanen megy át. Kódolás csak a későbbi beállítás-jóváhagyás után indul."
+        description="A lemez először biztonságos, írásmentes scanen megy át, ez egy futó encode mellett is elkészülhet. Kódolás csak a későbbi beállítás-jóváhagyás és a sorra kerülés után indul."
       />
 
       <div className="wizard-steps" aria-label="Lépések">
@@ -336,7 +336,7 @@ export function NewEncodePage() {
               <div><dt>Nézet</dt><dd>{detailOptions.find((item) => item.value === draft.detailLevel)?.title}</dd></div>
               <div><dt>Képfeltöltés</dt><dd>{draft.uploadImages ? imageUploadProviderLabels[draft.imageUploadProvider] : "Kikapcsolva"}</dd></div>
             </dl>
-            <Notice tone="info">A scan nem módosítja a forrást. A playlistet, sávokat és videóbeállításokat az eredmény után hagyod jóvá.</Notice>
+            <Notice tone="info">A scan nem módosítja a forrást, és a futó encode-ot sem állítja le. A playlistet, sávokat és videóbeállításokat az eredmény után hagyod jóvá; ezután a munka kész paraméterekkel kerül a kódolási sorba.</Notice>
             {create.isError && <Notice tone="danger" title="A munka nem hozható létre">{create.error instanceof ApiError ? create.error.detail : create.error.message}</Notice>}
           </Card>
         </div>

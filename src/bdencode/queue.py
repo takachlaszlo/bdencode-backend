@@ -1,4 +1,4 @@
-"""High-level operations for the persistent, strictly serial job queue."""
+"""High-level operations for the persistent preparation and encode queues."""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ from .models import Job, JobCreate, JobState, QueueClaimResponse
 class JobQueue:
     """Facade used by both API handlers and the worker.
 
-    Enqueueing never disturbs the active job.  ``claim_next`` is the only entry
-    into SCANNING and is atomic in SQLite, allowing the service to recover after
-    a reboot without an in-memory lock.
+    Enqueueing never disturbs the active encode. ``claim_next`` atomically owns
+    the one scan lane, while ``claim_next_ready`` atomically owns the one encode
+    lane. Both recover from durable SQLite state after a reboot.
     """
 
     def __init__(self, database: Database) -> None:
@@ -25,8 +25,11 @@ class JobQueue:
     def claim_next(self) -> Job | None:
         return self.database.claim_next_job()
 
+    def claim_next_ready(self) -> Job | None:
+        return self.database.claim_next_ready_job()
+
     def claim_status(self) -> QueueClaimResponse:
-        active = self.database.active_job()
+        active = self.database.preparing_job()
         if active is not None:
             return QueueClaimResponse(job=None, blocked_by=active)
         claimed = self.database.claim_next_job()
@@ -110,10 +113,13 @@ class JobQueue:
         )
 
     def blocker(self) -> Job | None:
-        return self.database.active_job()
+        return self.database.encoding_job()
 
     def queued_count(self) -> int:
         return self.database.count_jobs(states=[JobState.QUEUED])
+
+    def ready_count(self) -> int:
+        return self.database.count_jobs(states=[JobState.READY])
 
 
 # A descriptive alias for callers that prefer the longer service name.
