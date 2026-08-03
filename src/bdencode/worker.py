@@ -1634,10 +1634,17 @@ class PipelineWorker:
 
     def _prepare(self, job: Job, paths: JobPaths) -> None:
         scan, selection = self._load_scan_and_selection(job, paths)
+        playlist = scan.playlist(selection.playlist_id)
+        pcm_bluray_audio_ordinals = tuple(
+            ordinal
+            for ordinal, stream in enumerate(playlist.audio_streams)
+            if stream.codec.casefold() == "pcm_bluray"
+        )
         remux_inputs = {
             "scan_fingerprint": scan.fingerprint,
             "playlist_id": selection.playlist_id,
             "angle": selection.angle,
+            "pcm_bluray_audio_ordinals": list(pcm_bluray_audio_ordinals),
             "source_clips": _playlist_source_snapshot(scan, selection.playlist_id),
         }
         remux_marker = paths.stages / "reference-remux.json"
@@ -1648,6 +1655,7 @@ class PipelineWorker:
                     playlist_id=selection.playlist_id,
                     output_path=paths.reference,
                     angle=selection.angle,
+                    pcm_bluray_audio_ordinals=pcm_bluray_audio_ordinals,
                 )
             )
             self._runner(paths).run(

@@ -589,6 +589,52 @@ def test_prepare_checkpoint_skips_reference_remux_after_transition_crash(
     )
 
 
+def test_prepare_converts_only_bluray_pcm_in_reference_remux(context):
+    database, _settings, scan, scanner, runner, worker = context
+    audio_streams = (
+        MediaStream(
+            id="audio:4352",
+            index=1,
+            pid=4352,
+            kind=StreamKind.AUDIO,
+            codec="ac3",
+        ),
+        MediaStream(
+            id="audio:4353",
+            index=2,
+            pid=4353,
+            kind=StreamKind.AUDIO,
+            codec="pcm_bluray",
+            bit_depth=24,
+        ),
+    )
+    scanner.result = replace(
+        scan,
+        playlists=(
+            replace(
+                scan.playlists[0],
+                streams=(*scan.playlists[0].streams, *audio_streams),
+            ),
+        ),
+    )
+    _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    awaiting_selection = worker.process_one_stage(claimed)
+    ready = database.set_selection(awaiting_selection.id, _selection())
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    command = next(
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg" and "-playlist" in command
+    )
+    assert command[command.index("-c:a:1") + 1] == "pcm_s24le"
+    assert "-c:a:0" not in command
+
+
 def test_video_encode_promotes_only_successful_temporary_output(context):
     database, settings, _scan, _scanner, _runner, worker = context
     job, encoding = _prepare_encoding(context)

@@ -17,19 +17,26 @@ class ReferenceRemuxPlan:
     playlist_id: str
     output_path: Path
     angle: int = 1
+    pcm_bluray_audio_ordinals: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.playlist_id.isdigit():
             raise ValueError("playlist_id must be numeric")
         if self.angle < 1:
             raise ValueError("angle must be at least one")
+        if any(item < 0 for item in self.pcm_bluray_audio_ordinals):
+            raise ValueError("audio stream ordinals must be non-negative")
+        if tuple(sorted(set(self.pcm_bluray_audio_ordinals))) != (
+            self.pcm_bluray_audio_ordinals
+        ):
+            raise ValueError("audio stream ordinals must be sorted and unique")
 
 
 def reference_remux_command(
     plan: ReferenceRemuxPlan, *, ffmpeg: str = "ffmpeg"
 ) -> list[str]:
     """Materialize the selected libbluray timeline without changing media data."""
-    return [
+    command = [
         ffmpeg,
         "-hide_banner",
         "-nostdin",
@@ -49,13 +56,23 @@ def reference_remux_command(
         "0",
         "-c",
         "copy",
-        "-avoid_negative_ts",
-        "make_zero",
-        "-max_interleave_delta",
-        "0",
-        "-y",
-        str(plan.output_path),
     ]
+    # Matroska cannot carry FFmpeg's pcm_bluray codec directly. Convert only
+    # those audio streams to an equivalent lossless, container-native PCM
+    # representation; video, subtitles, and other audio codecs stay bit-exact.
+    for ordinal in plan.pcm_bluray_audio_ordinals:
+        command.extend((f"-c:a:{ordinal}", "pcm_s24le"))
+    command.extend(
+        [
+            "-avoid_negative_ts",
+            "make_zero",
+            "-max_interleave_delta",
+            "0",
+            "-y",
+            str(plan.output_path),
+        ]
+    )
+    return command
 
 
 def encode_pipeline_commands(

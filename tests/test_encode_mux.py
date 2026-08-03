@@ -40,6 +40,35 @@ def test_reference_remux_uses_libbluray_without_shell() -> None:
     assert "-c" in command and "copy" in command
 
 
+def test_reference_remux_converts_only_bluray_pcm_for_matroska() -> None:
+    plan = ReferenceRemuxPlan(
+        Path("/storage/disc"),
+        "00800",
+        Path("reference.mkv"),
+        pcm_bluray_audio_ordinals=(0, 2),
+    )
+
+    command = reference_remux_command(plan)
+
+    assert command[command.index("-c") + 1] == "copy"
+    assert command[command.index("-c:a:0") + 1] == "pcm_s24le"
+    assert command[command.index("-c:a:2") + 1] == "pcm_s24le"
+    assert "-c:a:1" not in command
+
+
+@pytest.mark.parametrize("ordinals", [(-1,), (1, 0), (0, 0)])
+def test_reference_remux_rejects_invalid_audio_ordinals(
+    ordinals: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match="audio stream ordinals"):
+        ReferenceRemuxPlan(
+            Path("/storage/disc"),
+            "00800",
+            Path("reference.mkv"),
+            pcm_bluray_audio_ordinals=ordinals,
+        )
+
+
 def test_vapoursynth_script_is_frame_server_and_crop_auditable(tmp_path: Path) -> None:
     plan = ReferenceScriptPlan(
         Path("source.mkv"),
