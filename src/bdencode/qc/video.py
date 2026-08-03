@@ -7,10 +7,13 @@ import re
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 
 FRAME_TYPES = ("I", "P", "B")
+COMPARISON_FONT_FILE = Path(
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+)
 
 
 class FrameSelectionError(ValueError):
@@ -703,6 +706,75 @@ def extract_png_at_timestamp_command(
         "0",
         "-frames:v",
         "1",
+        "-compression_level",
+        "6",
+        "-y",
+        str(output_path),
+    ]
+
+
+def annotate_comparison_png_command(
+    input_path: Path,
+    output_path: Path,
+    *,
+    image_role: Literal["SOURCE", "ENCODE"],
+    presentation_index: int,
+    pict_type: str,
+    matched_to_type: bool = False,
+    ffmpeg: str = "ffmpeg",
+    font_file: Path = COMPARISON_FONT_FILE,
+) -> list[str]:
+    """Add a lossless header without covering any source-frame pixels.
+
+    The comparison metrics intentionally use the unannotated input PNG.  This
+    command produces the operator/BBCode image by extending the canvas upward,
+    so the label neither hides picture detail nor changes the measured pixels.
+    """
+
+    if image_role not in {"SOURCE", "ENCODE"}:
+        raise ValueError("image_role must be SOURCE or ENCODE")
+    if presentation_index < 0:
+        raise ValueError("presentation_index cannot be negative")
+    if pict_type not in FRAME_TYPES:
+        raise ValueError(f"unsupported frame type: {pict_type}")
+    if matched_to_type and image_role != "SOURCE":
+        raise ValueError("matched_to_type is valid only for SOURCE images")
+    if input_path == output_path:
+        raise ValueError("annotated PNG output must differ from its input")
+
+    font = _escape_filter_path(font_file)
+    type_text = (
+        f"MATCHED TO {pict_type}-FRAME" if matched_to_type else f"{pict_type}-FRAME"
+    )
+    text = f"{image_role} | 0-BASED INDEX {presentation_index:09d} | {type_text}"
+    filters = (
+        "pad=iw:ih+max(40\\,ih/16):0:max(40\\,ih/16):color=black,"
+        f"drawtext=fontfile='{font}':text='{text}':expansion=none:"
+        "fontcolor=white:fontsize=max(10\\,min(h/34\\,w/44)):"
+        "x=max(10\\,w/80):y=(max(40\\,h/17)-text_h)/2,"
+        "format=rgb48be"
+    )
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "warning",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        filters,
+        "-frames:v",
+        "1",
+        "-c:v",
+        "png",
+        "-pix_fmt",
+        "rgb48be",
         "-compression_level",
         "6",
         "-y",

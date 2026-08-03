@@ -23,6 +23,7 @@ from bdencode.qc.video import (
     FrameRecord,
     FrameSelectionError,
     VapourSynthInfo,
+    annotate_comparison_png_command,
     extract_png_command,
     extract_png_at_timestamp_command,
     ffprobe_frame_origin_command,
@@ -375,6 +376,58 @@ def test_timestamp_png_extraction_seeks_before_input_without_global_frame_scan()
     assert "format=gbrp16le" in filters
     assert command[command.index("-frames:v") + 1] == "1"
     assert command[-1] == "frame.png"
+
+
+@pytest.mark.parametrize(
+    ("image_role", "pict_type"),
+    [("SOURCE", "I"), ("ENCODE", "P"), ("ENCODE", "B")],
+)
+def test_comparison_png_annotation_has_lossless_external_metadata_header(
+    image_role: str, pict_type: str
+) -> None:
+    command = annotate_comparison_png_command(
+        Path("clean.png"),
+        Path("comparison.png"),
+        image_role=image_role,  # type: ignore[arg-type]
+        presentation_index=1234,
+        pict_type=pict_type,
+    )
+
+    filters = command[command.index("-vf") + 1]
+    assert "pad=iw:ih+max(40\\,ih/16)" in filters
+    assert "fontsize=max(10\\,min(h/34\\,w/44))" in filters
+    assert (
+        f"text='{image_role} | 0-BASED INDEX 000001234 | {pict_type}-FRAME'"
+        in filters
+    )
+    assert "format=rgb48be" in filters
+    assert command[command.index("-pix_fmt") + 1] == "rgb48be"
+    assert command[command.index("-c:v") + 1] == "png"
+    assert command[-1] == "comparison.png"
+
+
+def test_transformed_source_annotation_does_not_claim_a_native_picture_type() -> None:
+    command = annotate_comparison_png_command(
+        Path("clean.png"),
+        Path("comparison.png"),
+        image_role="SOURCE",
+        presentation_index=42,
+        pict_type="B",
+        matched_to_type=True,
+    )
+
+    filters = command[command.index("-vf") + 1]
+    assert "SOURCE | 0-BASED INDEX 000000042 | MATCHED TO B-FRAME" in filters
+
+    with pytest.raises(ValueError, match="only for SOURCE"):
+        annotate_comparison_png_command(
+            Path("clean.png"),
+            Path("comparison.png"),
+            image_role="ENCODE",
+            presentation_index=42,
+            pict_type="B",
+            matched_to_type=True,
+        )
 
 
 def test_official_vmaf_cli_plan_uses_y4m_sidecars() -> None:

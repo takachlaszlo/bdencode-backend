@@ -98,6 +98,8 @@ def ffmpeg_features(runner: CommandRunner | None = None) -> dict[str, list[str]]
                 "showspectrumpic",
                 "zscale",
                 "tonemap",
+                "drawtext",
+                "pad",
             ),
             "protocols": ("bluray",),
         }[category]

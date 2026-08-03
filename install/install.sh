@@ -444,7 +444,7 @@ sudo flock -x "$installer_apt_lock" apt-get \
     -o Dir::Etc::preferences=/dev/null \
     -o Dir::Etc::preferencesparts=/dev/null \
     install -y --no-install-recommends --no-upgrade \
-    build-essential ca-certificates curl ffmpeg git libbluray-bin libbluray-dev \
+    build-essential ca-certificates curl ffmpeg fonts-dejavu-core git libbluray-bin libbluray-dev \
     dpkg-repack mediainfo meson mkvtoolnix nasm ninja-build pkg-config python3-pip \
     python3-venv sqlite3 util-linux x264 x265 xxd
 

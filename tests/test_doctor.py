@@ -169,6 +169,25 @@ def test_installer_loads_only_fixed_encrypted_image_host_credentials() -> None:
     assert 'stat -c %a -- "$credential_directory"' in installer
 
 
+def test_installer_and_doctor_require_comparison_annotation_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = (ROOT / "install" / "install.sh").read_text(encoding="utf-8")
+    assert "fonts-dejavu-core" in installer
+    assert {"drawtext", "pad"} <= doctor.MANDATORY_FFMPEG_FILTERS
+
+    font = tmp_path / "DejaVuSans-Bold.ttf"
+    monkeypatch.setattr(doctor, "COMPARISON_FONT_FILE", font)
+    assert doctor._comparison_font_status()["ok"] is False
+
+    font.write_bytes(b"test-font")
+    status = doctor._comparison_font_status()
+    assert status["present"] is True
+    assert status["regular"] is True
+    assert status["readable"] is True
+    assert status["ok"] is True
+
+
 def test_runtime_credential_status_requires_regular_private_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

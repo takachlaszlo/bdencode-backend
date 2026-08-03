@@ -178,9 +178,9 @@ A job először lemezscanre kerül. Több playlist/edition vagy bizonytalan sáv
 
 ## Gyors videó-comparison
 
-A comparison nem pásztázza végig képkockánként a teljes source-ot és a kész MKV-t. Rövid, korlátozott probe-ablakokból választ időben elosztott I-, P- és B-frame-eket, majd az azonos presentation indexű reference/encode képeket veszteségmentes PNG-ként menti. Alapértelmezésben összesen öt képpár készül; a `comparison_pair_count` értéke 3 és 5 között állítható. Mindhárom képtípusból legalább egy pár kötelező.
+A comparison nem pásztázza végig képkockánként a teljes source-ot és a kész MKV-t. Rövid, korlátozott probe-ablakokból választ időben elosztott I-, P- és B-frame-eket, majd az azonos presentation indexű reference/encode képeket veszteségmentes PNG-ként menti. Minden megosztható PNG külön, a képet nem takaró fejlécben jelzi a `SOURCE`/`ENCODE` szerepet, a nullától számozott presentation frame indexet és az I/P/B típust. Időbeli transzformáció után a source fejléc pontosan `MATCHED TO …-FRAME` jelölést használ, mert ott eredeti bitstream-képtípus nem állítható. Alapértelmezésben összesen öt képpár készül; a `comparison_pair_count` értéke 3 és 5 között állítható. Mindhárom képtípusból legalább egy pár kötelező.
 
-Az SSIM és PSNR kizárólag ezeken a kiválasztott PNG-párokon fut, ezért nincs többórás teljes filmes VMAF vagy teljes fájlos SSIM/PSNR menet. A videó-comparison teljes szerveroldali időkerete öt perc; túllépéskor kontrollált ellenőrzést kér, nem folytat korlátlan háttérmunkát. A régi `comparison_frames_per_type` konfigurációs kulcsot a betöltő visszafelé kompatibilitásból továbbra is elfogadja, de az új comparison már nem használja.
+Az SSIM és PSNR a kiválasztott képpárok felirat nélküli, belső pixelmásolatán fut, ezért a különböző `SOURCE`/`ENCODE` fejléc nem torzítja a mérést. Nincs többórás teljes filmes VMAF vagy teljes fájlos SSIM/PSNR menet. A videó-comparison teljes szerveroldali időkerete öt perc; túllépéskor kontrollált ellenőrzést kér, nem folytat korlátlan háttérmunkát. A régi `comparison_frames_per_type` konfigurációs kulcsot a betöltő visszafelé kompatibilitásból továbbra is elfogadja, de az új comparison már nem használja.
 
 ## CPU-korlát
 

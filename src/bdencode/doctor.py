@@ -13,6 +13,7 @@ from typing import Any
 from .capabilities import capability_snapshot
 from .config import Settings
 from .db import Database
+from .qc.video import COMPARISON_FONT_FILE
 
 
 MANDATORY_TOOLS = (
@@ -38,6 +39,8 @@ MANDATORY_FFMPEG_FILTERS = {
     "showspectrumpic",
     "zscale",
     "tonemap",
+    "drawtext",
+    "pad",
 }
 MANDATORY_FFMPEG_PROTOCOLS = {"bluray"}
 
@@ -141,6 +144,28 @@ def _credential_status(name: str) -> dict[str, Any]:
     }
 
 
+def _comparison_font_status() -> dict[str, Any]:
+    try:
+        details = COMPARISON_FONT_FILE.stat()
+    except OSError:
+        return {
+            "path": str(COMPARISON_FONT_FILE),
+            "present": False,
+            "readable": False,
+            "regular": False,
+            "ok": False,
+        }
+    regular = stat.S_ISREG(details.st_mode)
+    readable = os.access(COMPARISON_FONT_FILE, os.R_OK)
+    return {
+        "path": str(COMPARISON_FONT_FILE),
+        "present": True,
+        "readable": readable,
+        "regular": regular,
+        "ok": regular and readable,
+    }
+
+
 def _vapoursynth_plugins() -> dict[str, Any]:
     vspipe = shutil.which("vspipe")
     if not vspipe:
@@ -209,6 +234,7 @@ def build_report(
     data_check = _data_path_check(settings)
     vs = _vapoursynth_plugins()
     ffmpeg = snapshot["ffmpeg"]
+    comparison_font = _comparison_font_status()
     image_upload_credentials = {
         "imgbb": _credential_status("imgbb-api-key"),
         "catbox": _credential_status("catbox-userhash"),
@@ -223,6 +249,8 @@ def build_report(
         )
     if missing_recommended:
         warnings.append("recommended tools missing: " + ", ".join(missing_recommended))
+    if not comparison_font["ok"]:
+        warnings.append("comparison annotation font is missing or unreadable")
     if not image_upload_credentials["imgbb"]["configured"]:
         warnings.append("ImgBB upload credential is not configured")
     if not image_upload_credentials["catbox"]["configured"]:
@@ -242,6 +270,7 @@ def build_report(
         database_available
         and not missing_mandatory
         and not any(missing_ffmpeg.values())
+        and comparison_font["ok"]
         and vs["ok"]
         and data_check["ok"]
         and all(item["ok"] for item in source_checks)
@@ -261,6 +290,7 @@ def build_report(
         "tools": tools,
         "ffmpeg": ffmpeg,
         "missing_ffmpeg_capabilities": missing_ffmpeg,
+        "comparison_annotation": {"font": comparison_font},
         "vapoursynth": vs,
         "image_upload_credentials": image_upload_credentials,
         # Compatibility alias for older frontends and monitoring clients.

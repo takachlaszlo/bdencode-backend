@@ -878,6 +878,28 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
         "ssim_all_mean",
     }
     assert all("reference_sha256" in pair for pair in comparison["pairs"])
+    assert comparison["visual_annotation"] == {
+        "schema_version": 1,
+        "layout": "lossless_png_header_outside_picture_area",
+        "fields": [
+            "image_role",
+            "zero_based_presentation_frame_index",
+            "comparison_frame_type",
+        ],
+        "metrics_use_unannotated_pixels": True,
+    }
+    assert all(
+        pair["visual_label"]
+        == {
+            "reference_role": "SOURCE",
+            "encode_role": "ENCODE",
+            "frame_index": pair["presentation_index"],
+            "frame_index_base": 0,
+            "frame_type": pair["category"],
+            "source_frame_type_mode": "native_bitstream_type",
+        }
+        for pair in comparison["pairs"]
+    )
     metrics = json.loads(
         (completed / "comparison" / "video-metrics.json").read_text(encoding="utf-8")
     )
@@ -918,7 +940,9 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     encoded_png_commands = [
         command
         for command in runner.commands
-        if command[0] == "ffmpeg" and command[-1].endswith("-encode.png")
+        if command[0] == "ffmpeg"
+        and "comparison-metric-frames" in command[-1]
+        and command[-1].endswith("-encode-native.png")
     ]
     assert len(encoded_png_commands) == 5
     assert all(
@@ -926,6 +950,50 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     )
     assert all(
         "select=eq(n" not in " ".join(command) for command in encoded_png_commands
+    )
+    annotation_commands = [
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg"
+        and command[-1].endswith(("-reference.png", "-encode.png"))
+        and "drawtext=" in command[command.index("-vf") + 1]
+    ]
+    assert len(annotation_commands) == 10
+    assert all(
+        "pad=iw:ih+max(40\\,ih/16)" in command[command.index("-vf") + 1]
+        and "format=rgb48be" in command[command.index("-vf") + 1]
+        for command in annotation_commands
+    )
+    for pair in comparison["pairs"]:
+        frame_text = f"0-BASED INDEX {pair['presentation_index']:09d}"
+        reference_command = next(
+            command
+            for command in annotation_commands
+            if command[-1].endswith(pair["reference_png"])
+        )
+        encode_command = next(
+            command
+            for command in annotation_commands
+            if command[-1].endswith(pair["encode_png"])
+        )
+        assert (
+            f"SOURCE | {frame_text} | {pair['category']}-FRAME"
+            in reference_command[reference_command.index("-vf") + 1]
+        )
+        assert (
+            f"ENCODE | {frame_text} | {pair['category']}-FRAME"
+            in encode_command[encode_command.index("-vf") + 1]
+        )
+    metric_commands = [
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg"
+        and any("ssim=stats_file=" in value for value in command)
+    ]
+    assert len(metric_commands) == 5
+    assert all(
+        "comparison-metric-frames" in command[command.index("-i") + 1]
+        for command in metric_commands
     )
     assert not (completed / "comparison" / stale.name).exists()
     assert not (settings.job_root(job.id) / "work").exists()
@@ -973,6 +1041,38 @@ def test_fast_comparison_timeout_requests_review_without_losing_resume_stage(con
     assert result.state is JobState.NEEDS_REVIEW
     assert result.resume_state is JobState.COMPARISON
     assert "bounded" in (result.status_message or "")
+
+
+def test_upload_fails_closed_for_legacy_unannotated_comparison(context):
+    database, settings, scan, _scanner, _runner, worker = context
+    job = _enqueue(database, scan.source)
+    current = JobQueue(database).claim_next()
+    assert current is not None
+    current = worker.process_one_stage(current)
+    current = database.set_selection(current.id, _selection())
+    for _stage in range(8):
+        if current.state is JobState.UPLOADING:
+            break
+        current = worker.process_one_stage(current)
+    assert current.state is JobState.UPLOADING
+
+    paths = JobPaths.create(settings, job.id)
+    manifest_path = paths.comparison / "video-comparison.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 2
+    manifest.pop("visual_annotation", None)
+    for pair in manifest["pairs"]:
+        pair.pop("visual_label", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = worker.process_job(current)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.UPLOADING
+    assert "required visible SOURCE/ENCODE" in (result.status_message or "")
+    assert result.error is None
+    assert paths.work.is_dir()
+    assert not (settings.completed_root / "Movie.Encode").exists()
 
 
 def test_mux_chapters_come_from_reviewed_playlist(context):

@@ -117,6 +117,7 @@ from .qc.imgbb import ImgBBClient
 from .qc.video import (
     FrameRecord,
     FrameSelectionError,
+    annotate_comparison_png_command,
     comparison_manifest,
     extract_png_at_timestamp_command,
     ffprobe_frame_origin_command,
@@ -445,6 +446,36 @@ def _current_comparison_pngs(paths: JobPaths, *, prune: bool = False) -> list[Pa
             if candidate not in selected:
                 candidate.unlink()
     return sorted(selected, key=lambda item: (str(item.parent), item.name))
+
+
+def _has_current_visual_annotations(document: Mapping[str, Any]) -> bool:
+    annotation = document.get("visual_annotation")
+    pairs = document.get("pairs")
+    schema_version = document.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or schema_version < 3
+        or not isinstance(annotation, Mapping)
+        or annotation.get("schema_version") != 1
+        or annotation.get("metrics_use_unannotated_pixels") is not True
+        or not isinstance(pairs, list)
+        or not pairs
+    ):
+        return False
+    for pair in pairs:
+        if not isinstance(pair, Mapping):
+            return False
+        visual_label = pair.get("visual_label")
+        if (
+            not isinstance(visual_label, Mapping)
+            or visual_label.get("reference_role") != "SOURCE"
+            or visual_label.get("encode_role") != "ENCODE"
+            or visual_label.get("frame_index") != pair.get("presentation_index")
+            or visual_label.get("frame_index_base") != 0
+            or visual_label.get("frame_type") != pair.get("category")
+        ):
+            return False
+    return True
 
 
 def _json_hash(value: Any) -> str:
@@ -2720,12 +2751,24 @@ class PipelineWorker:
         assert video is not None
         hdr = selection.settings.hdr10.enabled
         comparison_color = selection.settings.color
+        clean_png_root = paths.work / "comparison-metric-frames"
+        clean_png_root.mkdir(mode=0o750, parents=True, exist_ok=True)
         pngs: list[Path] = []
         metric_sidecars: list[Path] = []
         metric_samples: list[dict[str, Any]] = []
         manifest = comparison_manifest(pairs)
-        manifest["schema_version"] = 2
+        manifest["schema_version"] = 3
         manifest["reference_alignment"] = "same_vapoursynth_output_frame_index"
+        manifest["visual_annotation"] = {
+            "schema_version": 1,
+            "layout": "lossless_png_header_outside_picture_area",
+            "fields": [
+                "image_role",
+                "zero_based_presentation_frame_index",
+                "comparison_frame_type",
+            ],
+            "metrics_use_unannotated_pixels": True,
+        }
         manifest["sampling"] = {
             **sample_plan,
             "requested_pair_count": self.settings.comparison_pair_count,
@@ -2751,29 +2794,49 @@ class PipelineWorker:
             label = f"{number:02d}-{pair.category}-f{pair.presentation_index:09d}"
             reference_png = paths.comparison / f"{label}-reference.png"
             encoded_png = paths.comparison / f"{label}-encode.png"
+            clean_reference_png = clean_png_root / f"{label}-reference-native.png"
+            clean_encoded_png = clean_png_root / f"{label}-encode-native.png"
             encoded_record = next(
                 item
                 for item in encoded
                 if item.presentation_index == pair.presentation_index
             )
             image_inputs = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "script_sha256": script_sha256,
                 "final_mkv_sha256": encoded_sha256,
                 "frame": pair.presentation_index,
                 "encoded_seek_pts_seconds": str(encoded_record.seek_pts_seconds),
                 "extraction": "accurate_timestamp_seek",
                 "hdr_native": True,
+                "visual_annotation": {
+                    "schema_version": 1,
+                    "source_label": "SOURCE",
+                    "encode_label": "ENCODE",
+                    "frame_type": pair.category,
+                    "source_frame_type_mode": (
+                        "native_bitstream_type"
+                        if pair.source_pict_type is not None
+                        else "matched_to_encode_frame_type"
+                    ),
+                },
             }
-            image_marker = paths.stages / f"comparison-{label}-native-v2.json"
+            image_marker = paths.stages / f"comparison-{label}-native-v3.json"
             if not _valid_stage(
-                image_marker, image_inputs, [reference_png, encoded_png]
+                image_marker,
+                image_inputs,
+                [
+                    clean_reference_png,
+                    clean_encoded_png,
+                    reference_png,
+                    encoded_png,
+                ],
             ):
                 self._runner(paths).run_pipeline(
                     self._reference_png_pipeline(
                         paths.script,
                         pair.presentation_index,
-                        reference_png,
+                        clean_reference_png,
                         hdr_native=True,
                         source_hdr10=hdr,
                         color=comparison_color,
@@ -2789,7 +2852,7 @@ class PipelineWorker:
                     extract_png_at_timestamp_command(
                         encoded_input,
                         encoded_record.seek_pts_seconds,
-                        encoded_png,
+                        clean_encoded_png,
                         hdr_native=True,
                         source_hdr10=hdr,
                         color_primaries=comparison_color.primaries,
@@ -2801,13 +2864,61 @@ class PipelineWorker:
                     stderr_path=paths.logs / f"{label}-encode-png.log",
                     timeout=remaining_timeout(60),
                 )
-                _write_stage(image_marker, image_inputs, [reference_png, encoded_png])
+                self._runner(paths).run(
+                    annotate_comparison_png_command(
+                        clean_reference_png,
+                        reference_png,
+                        image_role="SOURCE",
+                        presentation_index=pair.presentation_index,
+                        pict_type=pair.source_pict_type or pair.category,
+                        matched_to_type=pair.source_pict_type is None,
+                    ),
+                    cwd=paths.work,
+                    stderr_path=paths.logs / f"{label}-reference-label.log",
+                    timeout=remaining_timeout(30),
+                )
+                self._runner(paths).run(
+                    annotate_comparison_png_command(
+                        clean_encoded_png,
+                        encoded_png,
+                        image_role="ENCODE",
+                        presentation_index=pair.presentation_index,
+                        pict_type=pair.category,
+                    ),
+                    cwd=paths.work,
+                    stderr_path=paths.logs / f"{label}-encode-label.log",
+                    timeout=remaining_timeout(30),
+                )
+                _write_stage(
+                    image_marker,
+                    image_inputs,
+                    [
+                        clean_reference_png,
+                        clean_encoded_png,
+                        reference_png,
+                        encoded_png,
+                    ],
+                )
+            inspect_png(clean_reference_png, require_high_bit_depth=hdr)
+            inspect_png(clean_encoded_png, require_high_bit_depth=hdr)
             inspect_png(reference_png, require_high_bit_depth=hdr)
             inspect_png(encoded_png, require_high_bit_depth=hdr)
             pngs.extend((reference_png, encoded_png))
             pair_value = manifest["pairs"][number - 1]
             pair_value["reference_png"] = reference_png.name
             pair_value["encode_png"] = encoded_png.name
+            pair_value["visual_label"] = {
+                "reference_role": "SOURCE",
+                "encode_role": "ENCODE",
+                "frame_index": pair.presentation_index,
+                "frame_index_base": 0,
+                "frame_type": pair.category,
+                "source_frame_type_mode": (
+                    "native_bitstream_type"
+                    if pair.source_pict_type is not None
+                    else "matched_to_encode_frame_type"
+                ),
+            }
             pair_value["encoded_seek_pts_seconds"] = str(
                 encoded_record.seek_pts_seconds
             )
@@ -2820,16 +2931,27 @@ class PipelineWorker:
             if hdr:
                 reference_sdr = paths.comparison / f"{label}-reference-sdr.png"
                 encoded_sdr = paths.comparison / f"{label}-encode-sdr.png"
+                clean_reference_sdr = (
+                    clean_png_root / f"{label}-reference-sdr.png"
+                )
+                clean_encoded_sdr = clean_png_root / f"{label}-encode-sdr.png"
                 sdr_inputs = dict(image_inputs, hdr_native=False)
-                sdr_marker = paths.stages / f"comparison-{label}-sdr-v2.json"
+                sdr_marker = paths.stages / f"comparison-{label}-sdr-v3.json"
                 if not _valid_stage(
-                    sdr_marker, sdr_inputs, [reference_sdr, encoded_sdr]
+                    sdr_marker,
+                    sdr_inputs,
+                    [
+                        clean_reference_sdr,
+                        clean_encoded_sdr,
+                        reference_sdr,
+                        encoded_sdr,
+                    ],
                 ):
                     self._runner(paths).run_pipeline(
                         self._reference_png_pipeline(
                             paths.script,
                             pair.presentation_index,
-                            reference_sdr,
+                            clean_reference_sdr,
                             hdr_native=False,
                             source_hdr10=True,
                             color=comparison_color,
@@ -2845,7 +2967,7 @@ class PipelineWorker:
                         extract_png_at_timestamp_command(
                             encoded_input,
                             encoded_record.seek_pts_seconds,
-                            encoded_sdr,
+                            clean_encoded_sdr,
                             hdr_native=False,
                             source_hdr10=True,
                             color_primaries=comparison_color.primaries,
@@ -2857,7 +2979,43 @@ class PipelineWorker:
                         stderr_path=paths.logs / f"{label}-encode-sdr-png.log",
                         timeout=remaining_timeout(60),
                     )
-                    _write_stage(sdr_marker, sdr_inputs, [reference_sdr, encoded_sdr])
+                    self._runner(paths).run(
+                        annotate_comparison_png_command(
+                            clean_reference_sdr,
+                            reference_sdr,
+                            image_role="SOURCE",
+                            presentation_index=pair.presentation_index,
+                            pict_type=pair.source_pict_type or pair.category,
+                            matched_to_type=pair.source_pict_type is None,
+                        ),
+                        cwd=paths.work,
+                        stderr_path=paths.logs / f"{label}-reference-sdr-label.log",
+                        timeout=remaining_timeout(30),
+                    )
+                    self._runner(paths).run(
+                        annotate_comparison_png_command(
+                            clean_encoded_sdr,
+                            encoded_sdr,
+                            image_role="ENCODE",
+                            presentation_index=pair.presentation_index,
+                            pict_type=pair.category,
+                        ),
+                        cwd=paths.work,
+                        stderr_path=paths.logs / f"{label}-encode-sdr-label.log",
+                        timeout=remaining_timeout(30),
+                    )
+                    _write_stage(
+                        sdr_marker,
+                        sdr_inputs,
+                        [
+                            clean_reference_sdr,
+                            clean_encoded_sdr,
+                            reference_sdr,
+                            encoded_sdr,
+                        ],
+                    )
+                inspect_png(clean_reference_sdr)
+                inspect_png(clean_encoded_sdr)
                 inspect_png(reference_sdr)
                 inspect_png(encoded_sdr)
                 pngs.extend((reference_sdr, encoded_sdr))
@@ -2869,12 +3027,12 @@ class PipelineWorker:
             ssim_stats = paths.comparison / f"{label}.ssim.log"
             psnr_stats = paths.comparison / f"{label}.psnr.log"
             sample_metric_inputs = {
-                "schema_version": 2,
-                "reference_png_sha256": sha256_file(reference_png),
-                "encode_png_sha256": sha256_file(encoded_png),
-                "scope": "single_selected_native_png_pair",
+                "schema_version": 3,
+                "reference_png_sha256": sha256_file(clean_reference_png),
+                "encode_png_sha256": sha256_file(clean_encoded_png),
+                "scope": "single_selected_unannotated_native_png_pair",
             }
-            sample_metric_marker = paths.stages / f"comparison-{label}-metrics-v2.json"
+            sample_metric_marker = paths.stages / f"comparison-{label}-metrics-v3.json"
             if not _valid_stage(
                 sample_metric_marker,
                 sample_metric_inputs,
@@ -2882,8 +3040,8 @@ class PipelineWorker:
             ):
                 self._runner(paths).run_pipeline(
                     self._sample_metric_pipeline(
-                        reference_png,
-                        encoded_png,
+                        clean_reference_png,
+                        clean_encoded_png,
                         ssim_stats,
                         psnr_stats,
                     ),
@@ -2908,6 +3066,11 @@ class PipelineWorker:
                     "presentation_index": pair.presentation_index,
                     "reference_png": reference_png.name,
                     "encode_png": encoded_png.name,
+                    "measurement_input": "unannotated_pixels_before_visual_header",
+                    "reference_measurement_sha256": sha256_file(
+                        clean_reference_png
+                    ),
+                    "encode_measurement_sha256": sha256_file(clean_encoded_png),
                     "ssim_all": self._metric_stat(ssim_stats, "All"),
                     "psnr_average_db": self._metric_stat(psnr_stats, "psnr_avg"),
                     "ssim_stats": {
@@ -2943,7 +3106,7 @@ class PipelineWorker:
         ]
         metrics = paths.comparison / "video-metrics.json"
         metric_document = {
-            "schema_version": 2,
+            "schema_version": 3,
             "backend": "ffmpeg-sampled-ssim-psnr",
             "scope": "selected_ipb_native_png_pairs",
             "full_title_measurement": False,
@@ -2993,6 +3156,7 @@ class PipelineWorker:
                 "pairs": [item.to_dict() for item in pairs],
                 "pair_count": self.settings.comparison_pair_count,
                 "sampling_schema_version": 2,
+                "visual_annotation_schema_version": 1,
                 "hdr": hdr,
             },
             comparison_outputs,
@@ -3031,6 +3195,9 @@ class PipelineWorker:
             paths.stages / "comparison-metrics.json",
             *paths.stages.glob("comparison-*-native.json"),
             *paths.stages.glob("comparison-*-sdr.json"),
+            *paths.stages.glob("comparison-*-native-v2.json"),
+            *paths.stages.glob("comparison-*-sdr-v2.json"),
+            *paths.stages.glob("comparison-*-metrics-v2.json"),
         ]
         for legacy_marker in legacy_stage_markers:
             legacy_marker.unlink(missing_ok=True)
@@ -3043,6 +3210,24 @@ class PipelineWorker:
 
     def _upload_and_finalize(self, job: Job, paths: JobPaths) -> None:
         _scan, selection = self._load_scan_and_selection(job, paths)
+        video_manifest_path = paths.comparison / "video-comparison.json"
+        try:
+            video_manifest = json.loads(video_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("video comparison manifest is missing or invalid") from exc
+        if not isinstance(video_manifest, Mapping) or not _has_current_visual_annotations(
+            video_manifest
+        ):
+            raise ReviewRequired(
+                "comparison images predate the required visible SOURCE/ENCODE, "
+                "0-based frame index and I/P/B labels; reapprove the selection "
+                "to rebuild the comparison before upload",
+                details={
+                    "action": "reapprove_selection",
+                    "required_video_comparison_schema": 3,
+                    "required_visual_annotation_schema": 1,
+                },
+            )
         pngs = _current_comparison_pngs(paths, prune=True)
         allowed_names = {path.name for path in pngs}
         if len(allowed_names) != len(pngs):
