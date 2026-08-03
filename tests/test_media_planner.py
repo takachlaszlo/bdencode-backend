@@ -156,6 +156,7 @@ def test_bd_plan_uses_x264_flac_pgs_and_shell_free_argv(tmp_path: Path) -> None:
     assert ("-c:s", "copy") == subtitle[
         subtitle.index("-c:s") : subtitle.index("-c:s") + 2
     ]
+    assert subtitle[-3:-1] == ("-f", "matroska")
     assert "comparison" not in " ".join(plan.commands[-1].argv).lower()
     assert plan.needs_review  # object metadata is intentionally lost by FLAC
 

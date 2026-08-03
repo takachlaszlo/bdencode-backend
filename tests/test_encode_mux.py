@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from bdencode.encode import (
     ReferenceRemuxPlan,
     encode_pipeline_commands,
     reference_remux_command,
+    subtitle_track_command,
 )
 from bdencode.media.profiles import VideoEncoder, recommended_profile
 from bdencode.mux import (
@@ -57,6 +63,85 @@ def test_encode_pipeline_has_no_shell_syntax() -> None:
     assert commands[0][-1] == "-"
     assert "pipe:0" in commands[1]
     assert all("|" not in argument for command in commands for argument in command)
+
+
+def test_subtitle_sidecar_forces_matroska_muxer() -> None:
+    command = subtitle_track_command(
+        Path("reference.mkv"), 3, Path("track-03-subtitle.mks")
+    )
+
+    assert command[command.index("-c:s") + 1] == "copy"
+    assert command[-4:] == [
+        "-f",
+        "matroska",
+        "-y",
+        "track-03-subtitle.mks",
+    ]
+
+
+def test_ffmpeg_can_write_mks_sidecar_with_explicit_matroska_muxer(
+    tmp_path: Path,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg and ffprobe are required for the subtitle muxer smoke test")
+
+    subtitle = tmp_path / "subtitle.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nBDEncode smoke test\n",
+        encoding="utf-8",
+    )
+    reference = tmp_path / "reference.mkv"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-nostdin",
+            "-v",
+            "error",
+            "-i",
+            str(subtitle),
+            "-map",
+            "0:s:0",
+            "-c:s",
+            "copy",
+            "-f",
+            "matroska",
+            "-y",
+            str(reference),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    sidecar = tmp_path / "track-01-subtitle.mks"
+    subprocess.run(
+        subtitle_track_command(reference, 0, sidecar, ffmpeg=ffmpeg),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    probe = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name",
+            "-of",
+            "json",
+            str(sidecar),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(probe.stdout)["streams"] == [
+        {"codec_name": "subrip", "codec_type": "subtitle"}
+    ]
 
 
 def test_full_decode_treats_decoder_errors_as_fatal() -> None:

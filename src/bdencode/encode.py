@@ -171,6 +171,8 @@ def subtitle_track_command(
         "-1",
         "-map_chapters",
         "-1",
+        "-f",
+        "matroska",
         "-y",
         str(output_path),
     ]

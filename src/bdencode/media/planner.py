@@ -293,7 +293,7 @@ class EncodePlanner:
                 "-dn",
             ]
             if stream.kind is StreamKind.SUBTITLE:
-                argv.extend(("-an", "-c:s", "copy"))
+                argv.extend(("-an", "-c:s", "copy", "-f", "matroska"))
             elif selection.action is TrackAction.FLAC:
                 argv.extend(("-sn", "-c:a", "flac", "-compression_level", "8"))
                 if stream.object_audio:
