@@ -103,6 +103,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ expected_version: expectedVersion }),
     }),
+  restartJob: (id: string, expectedVersion: number) =>
+    apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/restart`, {
+      method: "POST",
+      body: JSON.stringify({ expected_version: expectedVersion }),
+    }),
+  purgeJob: (id: string, expectedVersion: number) =>
+    apiFetch<void>(
+      `/jobs/${encodeURIComponent(id)}/purge?expected_version=${expectedVersion}`,
+      { method: "DELETE" },
+    ),
   resumeJob: (id: string) =>
     apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/resume`, { method: "POST" }),
   retryUpload: (id: string) =>

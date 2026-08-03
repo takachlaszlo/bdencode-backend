@@ -112,6 +112,19 @@ class JobQueue:
             expected_version=expected_version,
         )
 
+    def restart_cancelled(
+        self,
+        job_id: str,
+        *,
+        message: str | None = None,
+        expected_version: int | None = None,
+    ) -> Job:
+        return self.database.restart_cancelled_job(
+            job_id,
+            message=message,
+            expected_version=expected_version,
+        )
+
     def blocker(self) -> Job | None:
         return self.database.encoding_job()
 

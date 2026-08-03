@@ -23,6 +23,7 @@ import {
   Settings2,
   ShieldCheck,
   StopCircle,
+  Trash2,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router";
@@ -71,6 +72,8 @@ export function JobDetailPage() {
   const [tab, setTab] = useState<Tab>(requestedTab && tabs.some((item) => item.value === requestedTab) ? requestedTab : "overview");
   const [cancelOpen, setCancelOpen] = useState(false);
   const [retryOpen, setRetryOpen] = useState(false);
+  const [restartOpen, setRestartOpen] = useState(false);
+  const [purgeOpen, setPurgeOpen] = useState(false);
   const queryClient = useQueryClient();
   const jobQuery = useQuery({ queryKey: ["job", jobId], queryFn: () => api.job(jobId), refetchInterval: 4000 });
   const scansQuery = useQuery({ queryKey: ["scans", jobId], queryFn: () => api.scans(jobId), refetchInterval: 5000 });
@@ -102,6 +105,31 @@ export function JobDetailPage() {
         replace: true,
         state: { retryStarted: true } satisfies JobDetailLocationState,
       });
+    },
+  });
+  const restartJob = useMutation({
+    mutationFn: (expectedVersion: number) => api.restartJob(jobId, expectedVersion),
+    onSuccess: (restartedJob) => {
+      setRestartOpen(false);
+      queryClient.setQueryData(["job", jobId], restartedJob);
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["job", jobId] }),
+        queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+        queryClient.invalidateQueries({ queryKey: ["events", jobId] }),
+      ]);
+      navigate(`/jobs/${encodeURIComponent(jobId)}`, {
+        replace: true,
+        state: { retryStarted: true } satisfies JobDetailLocationState,
+      });
+    },
+  });
+  const purgeJob = useMutation({
+    mutationFn: (expectedVersion: number) => api.purgeJob(jobId, expectedVersion),
+    onSuccess: () => {
+      setPurgeOpen(false);
+      queryClient.removeQueries({ queryKey: ["job", jobId] });
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      navigate("/archive", { replace: true });
     },
   });
   const resumeComparison = useMutation({
@@ -166,6 +194,8 @@ export function JobDetailPage() {
             <Badge tone={stateTone(job.state)}>{STATE_LABELS[job.state]}</Badge>
             {!terminal && <Button variant="danger" icon={<StopCircle size={17} />} onClick={() => setCancelOpen(true)}>Megszakítás kérése</Button>}
             {retryableFailure && <Button icon={<RotateCcw size={17} />} onClick={openRetryConfirmation}>Folytatás a hibától</Button>}
+            {job.state === "CANCELLED" && <Button icon={<RotateCcw size={17} />} onClick={() => { restartJob.reset(); setRestartOpen(true); }}>Újraindítás</Button>}
+            {["FAILED", "CANCELLED"].includes(job.state) && <Button variant="danger" icon={<Trash2 size={17} />} onClick={() => { purgeJob.reset(); setPurgeOpen(true); }}>Munka törlése</Button>}
             {job.state === "UPLOAD_FAILED" && <Button variant="secondary" icon={<RotateCcw size={17} />} loading={retryUpload.isPending} onClick={() => retryUpload.mutate()}>Feltöltés újra</Button>}
           </div>
         }
@@ -259,6 +289,30 @@ export function JobDetailPage() {
           Az újraindítás az érvényes szakasz-checkpointokat és a már elkészült munkafájlokat újrahasználja. A worker az első hiányzó vagy érvénytelen szakasztól folytatja, a hibás szakaszt pedig szükség szerint újrafuttatja.
         </Notice>
         {retryJob.isError && <Notice tone="danger" title="A folytatás nem indítható">{retryJob.error instanceof ApiError ? retryJob.error.detail : retryJob.error.message}</Notice>}
+      </Modal>
+
+      <Modal
+        open={restartOpen}
+        title="Újraindítod a megszakított munkát?"
+        onClose={() => { if (!restartJob.isPending) setRestartOpen(false); }}
+        footer={<><Button variant="ghost" disabled={restartJob.isPending} onClick={() => setRestartOpen(false)}>Mégse</Button><Button icon={<RotateCcw size={17} />} loading={restartJob.isPending} onClick={() => restartJob.mutate(job.version)}>Újraindítás</Button></>}
+      >
+        <Notice tone="info" title="A korábbi beállítások megmaradnak">
+          Ha a scan és a jóváhagyott beállítások már elkészültek, a munka kész paraméterekkel visszakerül a várólistára és felhasználja az érvényes checkpointokat. Korábbi megszakításnál a scan indul újra.
+        </Notice>
+        {restartJob.isError && <Notice tone="danger" title="A munka nem indítható újra">{restartJob.error instanceof ApiError ? restartJob.error.detail : restartJob.error.message}</Notice>}
+      </Modal>
+
+      <Modal
+        open={purgeOpen}
+        title="Végleg törlöd ezt a munkát?"
+        onClose={() => { if (!purgeJob.isPending) setPurgeOpen(false); }}
+        footer={<><Button variant="ghost" disabled={purgeJob.isPending} onClick={() => setPurgeOpen(false)}>Mégse</Button><Button variant="danger" icon={<Trash2 size={17} />} loading={purgeJob.isPending} onClick={() => purgeJob.mutate(job.version)}>Munka végleges törlése</Button></>}
+      >
+        <Notice tone="danger" title="Ez nem vonható vissza">
+          A munka teljes <code>~/encode/jobs/{job.id}</code> mappája törlődik az ideiglenes videókkal, cache-sel, checkpointokkal, logokkal, elemzésekkel és comparison fájlokkal együtt. A forráslemezhez és a completed mappához a rendszer nem nyúl.
+        </Notice>
+        {purgeJob.isError && <Notice tone="danger" title="A munka nem törölhető">{purgeJob.error instanceof ApiError ? purgeJob.error.detail : purgeJob.error.message}</Notice>}
       </Modal>
     </div>
   );

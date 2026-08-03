@@ -6,7 +6,7 @@ from threading import Barrier
 
 import pytest
 
-from bdencode.db import Database, QueueBlockedError, StateConflictError
+from bdencode.db import Database, NotFoundError, QueueBlockedError, StateConflictError
 from bdencode.models import (
     ArtifactCreate,
     ArtifactKind,
@@ -512,6 +512,96 @@ def test_failed_retry_rejects_non_failed_terminal_jobs(database):
         with pytest.raises(StateConflictError, match="only FAILED") as error:
             queue.retry_failed(job_id)
         assert error.value.current is state
+
+
+def test_cancelled_restart_returns_to_safest_queue_boundary(database):
+    queue = JobQueue(database)
+
+    unscanned = enqueue(queue, "restart-unscanned")
+    cancelled_unscanned = queue.cancel(unscanned.id)
+    restarted_unscanned = queue.restart_cancelled(
+        unscanned.id, expected_version=cancelled_unscanned.version
+    )
+    assert restarted_unscanned.state is JobState.QUEUED
+    assert restarted_unscanned.progress == pipeline_progress_baseline(JobState.QUEUED)
+    assert restarted_unscanned.started_at is None
+    queue.cancel(restarted_unscanned.id)
+
+    scanned = enqueue(queue, "restart-scanned")
+    assert queue.claim_next().id == scanned.id
+    scan = database.create_scan(ScanCreate(job_id=scanned.id))
+    database.update_scan(
+        scan.id,
+        ScanUpdate(status=ScanState.AWAITING_SELECTION, result={"playlists": []}),
+    )
+    queue.cancel(scanned.id)
+    restarted_scanned = queue.restart_cancelled(scanned.id)
+    assert restarted_scanned.state is JobState.AWAITING_SELECTION
+    assert restarted_scanned.error is None
+    assert restarted_scanned.finished_at is None
+
+    configured = database.set_selection(
+        scanned.id, {"playlist_id": "00001", "tracks": []}
+    )
+    queue.cancel(configured.id)
+    restarted_configured = queue.restart_cancelled(configured.id)
+    assert restarted_configured.state is JobState.READY
+    event = database.list_events(job_id=configured.id)[-1]
+    assert event.kind == "job.restart"
+    assert event.state_from is JobState.CANCELLED
+    assert event.state_to is JobState.READY
+    assert event.payload["reused_selection"] is True
+
+
+def test_terminal_delete_runs_cleanup_and_cascades_database_rows(database):
+    queue = JobQueue(database)
+    job = enqueue(queue, "delete-cancelled")
+    cancelled = queue.cancel(job.id)
+    cleanup_calls: list[str] = []
+
+    database.delete_terminal_job(
+        job.id,
+        expected_version=cancelled.version,
+        cleanup=lambda: cleanup_calls.append(job.id),
+    )
+
+    assert cleanup_calls == [job.id]
+    with pytest.raises(NotFoundError, match="job not found"):
+        database.get_job(job.id)
+
+
+def test_terminal_delete_preserves_record_when_cleanup_fails(database):
+    queue = JobQueue(database)
+    job = enqueue(queue, "delete-failure")
+    cancelled = queue.cancel(job.id)
+
+    def fail_cleanup() -> None:
+        raise OSError("filesystem busy")
+
+    with pytest.raises(OSError, match="filesystem busy"):
+        database.delete_terminal_job(
+            job.id,
+            expected_version=cancelled.version,
+            cleanup=fail_cleanup,
+        )
+    assert database.get_job(job.id).state is JobState.CANCELLED
+
+
+def test_restart_and_delete_reject_wrong_states_and_stale_versions(database):
+    queue = JobQueue(database)
+    queued = enqueue(queue, "protected")
+    with pytest.raises(StateConflictError, match="only CANCELLED"):
+        queue.restart_cancelled(queued.id)
+    with pytest.raises(StateConflictError, match="only FAILED or CANCELLED"):
+        database.delete_terminal_job(queued.id)
+
+    cancelled = queue.cancel(queued.id)
+    with pytest.raises(StateConflictError, match="expected"):
+        queue.restart_cancelled(queued.id, expected_version=cancelled.version + 1)
+    with pytest.raises(StateConflictError, match="expected"):
+        database.delete_terminal_job(
+            queued.id, expected_version=cancelled.version + 1
+        )
 
 
 def test_concurrent_failed_retries_preserve_single_active_guard(database):

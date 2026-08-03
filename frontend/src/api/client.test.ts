@@ -79,6 +79,29 @@ describe("API client", () => {
     );
   });
 
+  it("restarts and permanently deletes a cancelled job with version guards", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ id: "job/1", state: "READY" }))
+      .mockResolvedValueOnce(mockResponse(null, 204));
+
+    await api.restartJob("job/1", 8);
+    await api.purgeJob("job/1", 9);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/encoder/api/v1/jobs/job%2F1/restart",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ expected_version: 8 }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/encoder/api/v1/jobs/job%2F1/purge?expected_version=9",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
   it("preserves a plain-text proxy error after reading the response body once", async () => {
     fetchMock.mockResolvedValue(
       new Response("A backend átmenetileg nem érhető el", {

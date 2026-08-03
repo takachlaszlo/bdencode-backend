@@ -19,6 +19,8 @@ vi.mock("../api/client", async (importOriginal) => {
       events: vi.fn(),
       cancelJob: vi.fn(),
       retryJob: vi.fn(),
+      restartJob: vi.fn(),
+      purgeJob: vi.fn(),
       retryUpload: vi.fn(),
       resumeJob: vi.fn(),
     },
@@ -122,6 +124,44 @@ describe("JobDetailPage failed-job retry", () => {
     expect(await screen.findByRole("link", { name: /Vissza az archívumhoz/ })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Folytatás a hibától" })).not.toBeInTheDocument();
     expect(screen.queryByText("A munkafájlok a biztonságos folytatáshoz megmaradtak")).not.toBeInTheDocument();
+  });
+
+  it("offers restart and destructive workspace deletion for a cancelled job", async () => {
+    const user = userEvent.setup();
+    const cancelled = makeJob({
+      state: "CANCELLED",
+      status_message: "cancelled",
+      error: null,
+      resume_state: null,
+      version: 6,
+    });
+    const restarted = makeJob({
+      state: "READY",
+      status_message: "cancelled job restored to the configured queue",
+      error: null,
+      resume_state: null,
+      version: 7,
+    });
+    vi.mocked(api.job).mockResolvedValue(cancelled);
+    vi.mocked(api.restartJob).mockResolvedValue(restarted);
+    vi.mocked(api.purgeJob).mockResolvedValue(undefined);
+    const first = renderFailedJob();
+
+    await user.click(await screen.findByRole("button", { name: "Újraindítás" }));
+    const restartDialog = screen.getByRole("dialog", { name: "Újraindítod a megszakított munkát?" });
+    expect(within(restartDialog).getByText("A korábbi beállítások megmaradnak")).toBeInTheDocument();
+    await user.click(within(restartDialog).getByRole("button", { name: "Újraindítás" }));
+    await waitFor(() => expect(api.restartJob).toHaveBeenCalledWith("job-1", 6));
+    first.unmount();
+
+    vi.mocked(api.job).mockResolvedValue(cancelled);
+    const second = renderFailedJob();
+    await user.click(await screen.findByRole("button", { name: "Munka törlése" }));
+    const purgeDialog = screen.getByRole("dialog", { name: "Végleg törlöd ezt a munkát?" });
+    expect(within(purgeDialog).getByText(/A forráslemezhez és a completed mappához/)).toBeInTheDocument();
+    await user.click(within(purgeDialog).getByRole("button", { name: "Munka végleges törlése" }));
+    await waitFor(() => expect(api.purgeJob).toHaveBeenCalledWith("job-1", 6));
+    second.unmount();
   });
 
   it("offers a dedicated comparison continuation instead of the selection wizard", async () => {

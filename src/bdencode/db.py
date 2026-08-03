@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 from uuid import uuid4
 
 from .models import (
@@ -632,6 +632,127 @@ class Database:
                 if blocker is not None:
                     raise QueueBlockedError(blocker) from exc
             raise
+
+    def restart_cancelled_job(
+        self,
+        job_id: str,
+        *,
+        message: str | None = None,
+        expected_version: int | None = None,
+    ) -> Job:
+        """Restore a cancelled job to the safest non-running queue boundary.
+
+        A configured job returns to READY and can reuse its validated stage
+        markers.  A successfully scanned but unconfigured job returns to the
+        selection screen.  Earlier cancellations return to QUEUED for a fresh
+        scan attempt.  None of these targets takes ownership of the serial
+        encode lane inside this request.
+        """
+
+        with self._write() as connection:
+            row = self._job_row(connection, job_id)
+            current = JobState(row["state"])
+            if current is not JobState.CANCELLED:
+                raise StateConflictError(
+                    "only CANCELLED jobs can be restarted",
+                    current=current,
+                )
+            if expected_version is not None and row["version"] != expected_version:
+                raise StateConflictError(
+                    f"job version is {row['version']}, expected {expected_version}",
+                    current=current,
+                )
+
+            successful_scan = connection.execute(
+                """
+                SELECT id, status FROM scans
+                WHERE job_id = ? AND status IN ('AWAITING_SELECTION', 'COMPLETED')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            has_selection = row["selection_json"] not in {None, "", "null"}
+            if successful_scan is not None and has_selection:
+                target = JobState.READY
+                default_message = "cancelled job restored to the configured queue"
+            elif successful_scan is not None:
+                target = JobState.AWAITING_SELECTION
+                default_message = "cancelled job restored for operator selection"
+            else:
+                target = JobState.QUEUED
+                default_message = "cancelled job queued for a new scan attempt"
+
+            now = utc_now()
+            restart_message = message or default_message
+            progress = pipeline_progress_baseline(target)
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET state = ?, status_message = ?, error = NULL,
+                    resume_state = NULL, progress = ?, finished_at = NULL,
+                    started_at = CASE WHEN ? = 'QUEUED' THEN NULL ELSE started_at END,
+                    updated_at = ?, version = version + 1
+                WHERE id = ? AND state = ? AND version = ?
+                """,
+                (
+                    target.value,
+                    restart_message,
+                    progress,
+                    target.value,
+                    now,
+                    job_id,
+                    JobState.CANCELLED.value,
+                    row["version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflictError("job changed concurrently", current=current)
+            self._insert_event(
+                connection,
+                job_id=job_id,
+                kind="job.restart",
+                state_from=current,
+                state_to=target,
+                message=restart_message,
+                payload={
+                    "restart_target": target.value,
+                    "reused_successful_scan": successful_scan is not None,
+                    "reused_selection": has_selection and successful_scan is not None,
+                    "previous_version": int(row["version"]),
+                    "new_version": int(row["version"]) + 1,
+                },
+            )
+            return self._decode_job(self._job_row(connection, job_id))
+
+    def delete_terminal_job(
+        self,
+        job_id: str,
+        *,
+        expected_version: int | None = None,
+        cleanup: Callable[[], None] | None = None,
+    ) -> None:
+        """Delete a failed/cancelled job after its workspace cleanup succeeds."""
+
+        with self._write() as connection:
+            row = self._job_row(connection, job_id)
+            current = JobState(row["state"])
+            if current not in {JobState.FAILED, JobState.CANCELLED}:
+                raise StateConflictError(
+                    "only FAILED or CANCELLED jobs can be permanently deleted",
+                    current=current,
+                )
+            if expected_version is not None and row["version"] != expected_version:
+                raise StateConflictError(
+                    f"job version is {row['version']}, expected {expected_version}",
+                    current=current,
+                )
+            if cleanup is not None:
+                cleanup()
+            cursor = connection.execute(
+                "DELETE FROM jobs WHERE id = ? AND state = ? AND version = ?",
+                (job_id, current.value, row["version"]),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflictError("job changed concurrently", current=current)
 
     def set_selection(
         self,

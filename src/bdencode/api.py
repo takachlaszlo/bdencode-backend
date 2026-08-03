@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import FastAPI, Query, Request, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .audio import AUDIO_ACTIONS, audio_presets_payload
 from .db import (
@@ -175,6 +176,8 @@ def create_app(
                 "queued_jobs_allowed": True,
                 "preparation_during_encode": True,
                 "ready_queue_requires_selection": True,
+                "cancelled_job_restart": True,
+                "failed_cancelled_job_purge": True,
                 "cpu_budget_fraction": 0.8,
                 "supports_3d": False,
                 "dolby_vision_retention": False,
@@ -435,6 +438,63 @@ def create_app(
             message=retry.message,
             expected_version=retry.expected_version,
         )
+
+    @application.post(f"{API_PREFIX}/jobs/{{job_id}}/restart", response_model=Job)
+    def restart_cancelled_job(
+        job_id: str, request: JobRetryRequest | None = None
+    ) -> Job:
+        restart = request or JobRetryRequest()
+        return queue.restart_cancelled(
+            job_id,
+            message=restart.message,
+            expected_version=restart.expected_version,
+        )
+
+    @application.delete(
+        f"{API_PREFIX}/jobs/{{job_id}}/purge",
+        status_code=status.HTTP_204_NO_CONTENT,
+        response_class=Response,
+    )
+    def purge_terminal_job(
+        job_id: str,
+        expected_version: Annotated[int | None, Query(ge=1)] = None,
+    ) -> Response:
+        if settings is None:
+            raise ConfigurationError(
+                "permanent job deletion requires configured workspace roots"
+            )
+        job = db.get_job(job_id)
+        jobs_root = settings.jobs_root.resolve(strict=True)
+        workspace = settings.job_root(job.id)
+
+        def cleanup_workspace() -> None:
+            # Check immediately before deletion so neither a symlink nor an
+            # unexpected file can redirect a recursive operation into source
+            # or completed media.
+            if not os.path.lexists(workspace):
+                return
+            if workspace.is_symlink() or not workspace.is_dir():
+                raise ConfigurationError(
+                    "job workspace is not a safe directory; refusing deletion"
+                )
+            resolved = workspace.resolve(strict=True)
+            if resolved.parent != jobs_root or resolved.name != job.id:
+                raise ConfigurationError(
+                    "job workspace escaped the configured jobs root"
+                )
+            try:
+                shutil.rmtree(resolved)
+            except OSError as exc:
+                raise ConfigurationError(
+                    f"job workspace could not be completely deleted: {exc}"
+                ) from exc
+
+        db.delete_terminal_job(
+            job.id,
+            expected_version=expected_version,
+            cleanup=cleanup_workspace,
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.delete(f"{API_PREFIX}/jobs/{{job_id}}", response_model=Job)
     def cancel_job(job_id: str) -> Job:

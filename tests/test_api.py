@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from bdencode import doctor
 from bdencode.api import create_app
 from bdencode.config import Settings
-from bdencode.db import Database
+from bdencode.db import Database, NotFoundError
 
 
 def make_client(tmp_path) -> TestClient:
@@ -392,6 +393,53 @@ def test_failed_job_retry_endpoint_rejects_unsafe_failure_stage(tmp_path):
         assert response.status_code == 409
         assert response.json()["current_state"] == "FAILED"
         assert "not safely retryable" in response.json()["detail"]
+
+
+def test_cancelled_restart_and_permanent_delete_remove_entire_workspace(tmp_path):
+    source_root = tmp_path / "storage"
+    source = source_root / "Film"
+    source.mkdir(parents=True)
+    settings = Settings(
+        data_root=tmp_path / "encode",
+        source_roots=(source_root,),
+    ).validate()
+    settings.create_directories()
+    database = Database(settings.resolved_database_path)
+
+    with TestClient(create_app(database, settings=settings)) as client:
+        job = client.post(
+            "/api/v1/jobs", json={"source_path": str(source), "name": "Film"}
+        ).json()
+        cancelled = client.delete(f"/api/v1/jobs/{job['id']}").json()
+        restarted = client.post(
+            f"/api/v1/jobs/{job['id']}/restart",
+            json={"expected_version": cancelled["version"]},
+        )
+        assert restarted.status_code == 200
+        assert restarted.json()["state"] == "QUEUED"
+
+        cancelled_again = client.delete(f"/api/v1/jobs/{job['id']}").json()
+        workspace = settings.job_root(job["id"])
+        (workspace / "work" / "cache").mkdir(parents=True)
+        (workspace / "logs").mkdir()
+        (workspace / "work" / "cache" / "partial.bin").write_bytes(b"temporary")
+        (workspace / "logs" / "encode.log").write_text("log", encoding="utf-8")
+
+        stale = client.delete(
+            f"/api/v1/jobs/{job['id']}/purge",
+            params={"expected_version": cancelled_again["version"] + 1},
+        )
+        assert stale.status_code == 409
+        assert workspace.exists()
+
+        deleted = client.delete(
+            f"/api/v1/jobs/{job['id']}/purge",
+            params={"expected_version": cancelled_again["version"]},
+        )
+        assert deleted.status_code == 204
+        assert not workspace.exists()
+        with pytest.raises(NotFoundError):
+            database.get_job(job["id"])
 
 
 def test_scan_selection_artifact_and_event_endpoints(tmp_path):
