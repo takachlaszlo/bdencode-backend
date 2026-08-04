@@ -462,7 +462,12 @@ class FakeRunner:
 
 
 @pytest.fixture
-def context(tmp_path: Path):
+def context(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        worker_module,
+        "capability_snapshot",
+        lambda _names: {"host": {"hostname": "test"}, "tools": {}},
+    )
     source_root = tmp_path / "storage"
     source = source_root / "Movie"
     source.mkdir(parents=True)
