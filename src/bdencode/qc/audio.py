@@ -68,11 +68,13 @@ class AudioVerification:
     timing_within_tolerance: bool
     duration_within_tolerance: bool
     timing_tolerance_seconds: Decimal
+    duration_tolerance_seconds: Decimal
     passed: bool
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["timing_tolerance_seconds"] = str(self.timing_tolerance_seconds)
+        value["duration_tolerance_seconds"] = str(self.duration_tolerance_seconds)
         return value
 
 
@@ -97,11 +99,19 @@ def verify_audio_output(
     sample_rate_match = encode.sample_rate == expected_sample_rate
     channels_match = encode.channels == expected_channels
     if policy.pcm_match_required:
+        # Some Blu-ray PCM streams do not carry a channel-layout label even
+        # though their channel count and decoded samples are unambiguous.  A
+        # missing source label must not make an otherwise bit-identical FLAC
+        # transcode fail.  When the source does declare a layout, keep
+        # requiring the encoded track to preserve it.
+        channel_layout_compatible = (
+            source.channel_layout is None or comparison.channel_layout_match
+        )
         target_structure_match = (
             codec_match
             and comparison.sample_rate_match
             and comparison.channels_match
-            and comparison.channel_layout_match
+            and channel_layout_compatible
         )
     else:
         target_structure_match = (
@@ -113,9 +123,15 @@ def verify_audio_output(
         else audio_timing_tolerance(policy.action, expected_sample_rate)
     )
     timing_match = abs(comparison.delay_seconds) <= tolerance
+    # Lossy source and target codecs can independently round their container
+    # endpoints by one codec frame.  Allow two target frames for the duration
+    # delta while retaining the stricter one-frame start-time check.
+    duration_tolerance = (
+        tolerance if policy.pcm_match_required else tolerance * Decimal(2)
+    )
     duration_match = (
         comparison.duration_delta_seconds is not None
-        and abs(comparison.duration_delta_seconds) <= tolerance
+        and abs(comparison.duration_delta_seconds) <= duration_tolerance
     )
     pcm_gate = (
         decoded_pcm_sha256_match is True
@@ -143,6 +159,7 @@ def verify_audio_output(
         timing_within_tolerance=timing_match,
         duration_within_tolerance=duration_match,
         timing_tolerance_seconds=tolerance,
+        duration_tolerance_seconds=duration_tolerance,
         passed=passed,
     )
 

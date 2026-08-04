@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -106,6 +107,92 @@ def test_lossy_qc_accepts_codec_padding_without_requiring_pcm_hash() -> None:
     assert verification.decoded_pcm_sha256_required is False
     assert verification.target_structure_match
     assert verification.duration_within_tolerance
+
+
+def test_lossy_qc_allows_two_codec_frames_of_container_duration_rounding() -> None:
+    source = AudioProbe(
+        "dts",
+        48_000,
+        6,
+        "5.1(side)",
+        None,
+        Decimal("0.042"),
+        Decimal("6479.557"),
+        24,
+        profile="DTS-HD MA",
+    )
+    encode = AudioProbe(
+        "eac3",
+        48_000,
+        6,
+        "5.1(side)",
+        None,
+        Decimal("0.037"),
+        Decimal("6479.515"),
+        None,
+        bit_rate=1_024_000,
+    )
+    policy = effective_audio_policy(
+        "eac3",
+        source_codec="dts",
+        source_profile="DTS-HD MA",
+        source_channels=6,
+        source_sample_rate=48_000,
+    )
+
+    verification = verify_audio_output(
+        source, encode, policy, decoded_pcm_sha256_match=None
+    )
+
+    assert verification.passed
+    assert verification.timing_tolerance_seconds == Decimal("0.032")
+    assert verification.duration_tolerance_seconds == Decimal("0.064")
+
+
+def test_lossless_qc_accepts_missing_source_layout_when_pcm_is_identical() -> None:
+    source = AudioProbe(
+        "pcm_s24le",
+        48_000,
+        2,
+        None,
+        None,
+        Decimal("0.042"),
+        Decimal("6807.847"),
+        24,
+    )
+    encode = AudioProbe(
+        "flac",
+        48_000,
+        2,
+        "stereo",
+        None,
+        Decimal("0.042"),
+        Decimal("6807.847"),
+        24,
+    )
+    policy = effective_audio_policy(
+        "flac",
+        source_codec="pcm_s24le",
+        source_channels=2,
+        source_sample_rate=48_000,
+    )
+
+    verification = verify_audio_output(
+        source, encode, policy, decoded_pcm_sha256_match=True
+    )
+
+    assert verification.passed
+    assert verification.target_structure_match
+    assert verification.decoded_pcm_sha256_match is True
+
+    declared_layout = replace(source, channel_layout="stereo")
+    wrong_layout = replace(encode, channel_layout="2.0")
+    assert not verify_audio_output(
+        declared_layout,
+        wrong_layout,
+        policy,
+        decoded_pcm_sha256_match=True,
+    ).passed
 
 
 def test_lossy_qc_rejects_wrong_bitrate_and_lossless_qc_still_requires_pcm() -> None:
