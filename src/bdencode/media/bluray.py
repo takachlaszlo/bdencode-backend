@@ -379,6 +379,7 @@ class BluRayScanner:
         self.source_root = source_root
         self.max_playlists = max_playlists
         self.languages = LanguageResolver()
+        self._hdr_static_cache: dict[Path, HdrStaticMetadata] = {}
 
     def scan(
         self,
@@ -406,6 +407,12 @@ class BluRayScanner:
                 metadata = native_by_id.get(playlist_id, {})
                 if probe is None and not metadata:
                     continue
+                if probe is not None:
+                    probe = self._with_hdr_static_metadata(
+                        root,
+                        probe,
+                        metadata,
+                    )
                 playlists.append(
                     self._playlist_from_payload(playlist_id, probe or {}, metadata)
                 )
@@ -494,6 +501,224 @@ class BluRayScanner:
         payload = _json_object(getattr(completed, "stdout", ""))
         return payload if payload else None
 
+    def _with_hdr_static_metadata(
+        self,
+        root: Path,
+        probe: Mapping[str, Any],
+        native: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Enrich an HDR10 video stream from a directly referenced M2TS clip.
+
+        Normal ``ffprobe -show_streams`` output often contains the BT.2020/PQ
+        colour description but not mastering-display or content-light metadata.
+        Those values are commonly exposed as decoded-frame side data.
+
+        Frame probing the complete ``bluray:`` input is deliberately avoided:
+        some libbluray/FFmpeg combinations crash on malformed or obfuscated
+        playlists.  A representative M2TS clip is probed directly instead.
+        """
+
+        raw_streams = probe.get("streams", ())
+        if not isinstance(raw_streams, (list, tuple)):
+            return probe
+
+        video_index: int | None = None
+        video_stream: Mapping[str, Any] | None = None
+
+        for index, candidate in enumerate(raw_streams):
+            if not isinstance(candidate, Mapping):
+                continue
+            if str(
+                candidate.get("codec_type", candidate.get("type", ""))
+            ).lower() == "video":
+                video_index = index
+                video_stream = candidate
+                break
+
+        if video_index is None or video_stream is None:
+            return probe
+
+        native_video: Mapping[str, Any] = {}
+        first_native_video: Mapping[str, Any] | None = None
+        probe_key = _stream_match_key(video_stream)
+        native_streams = native.get("streams", ())
+
+        if isinstance(native_streams, (list, tuple)):
+            for candidate in native_streams:
+                if not isinstance(candidate, Mapping):
+                    continue
+                if str(
+                    candidate.get("codec_type", candidate.get("type", ""))
+                ).lower() != "video":
+                    continue
+
+                if first_native_video is None:
+                    first_native_video = candidate
+
+                if _stream_match_key(candidate) == probe_key:
+                    native_video = candidate
+                    break
+
+        if not native_video and first_native_video is not None:
+            native_video = first_native_video
+
+        transfer = _optional_str(video_stream.get("color_transfer"))
+        if transfer is None:
+            transfer = _optional_str(native_video.get("color_transfer"))
+
+        primaries = _optional_str(video_stream.get("color_primaries"))
+        if primaries is None:
+            primaries = _optional_str(native_video.get("color_primaries"))
+
+        hdr10 = bool(
+            native_video.get(
+                "hdr10",
+                transfer == "smpte2084" and primaries == "bt2020",
+            )
+        )
+
+        if not hdr10:
+            return probe
+
+        existing_mastering = _optional_str(
+            video_stream.get("mastering_display")
+        )
+        if existing_mastering is None:
+            existing_mastering = _optional_str(
+                native_video.get("mastering_display")
+            )
+
+        existing_max_cll = _int(video_stream.get("max_cll"), None)
+        if existing_max_cll is None:
+            existing_max_cll = _int(native_video.get("max_cll"), None)
+
+        existing_max_fall = _int(video_stream.get("max_fall"), None)
+        if existing_max_fall is None:
+            existing_max_fall = _int(native_video.get("max_fall"), None)
+
+        existing = HdrStaticMetadata(
+            mastering_display=existing_mastering,
+            max_cll=existing_max_cll,
+            max_fall=existing_max_fall,
+        )
+
+        if existing.complete:
+            return probe
+
+        clip = _representative_clip_path(root, native)
+        if clip is None:
+            return probe
+
+        detected = self._probe_clip_hdr_static(clip)
+
+        # Ha a már meglévő és az újonnan detektált értékek ellentmondanak
+        # egymásnak, fail-closed maradunk: nem gyártunk vegyes metaadatot.
+        if (
+            existing.mastering_display is not None
+            and detected.mastering_display is not None
+            and existing.mastering_display != detected.mastering_display
+        ):
+            return probe
+
+        if (
+            existing.max_cll is not None
+            and detected.max_cll is not None
+            and existing.max_cll != detected.max_cll
+        ):
+            return probe
+
+        if (
+            existing.max_fall is not None
+            and detected.max_fall is not None
+            and existing.max_fall != detected.max_fall
+        ):
+            return probe
+
+        merged = HdrStaticMetadata(
+            mastering_display=(
+                existing.mastering_display
+                if existing.mastering_display is not None
+                else detected.mastering_display
+            ),
+            max_cll=(
+                existing.max_cll
+                if existing.max_cll is not None
+                else detected.max_cll
+            ),
+            max_fall=(
+                existing.max_fall
+                if existing.max_fall is not None
+                else detected.max_fall
+            ),
+        )
+
+        if (
+            merged.mastering_display is None
+            and merged.max_cll is None
+            and merged.max_fall is None
+        ):
+            return probe
+
+        enriched_video = dict(video_stream)
+
+        if merged.mastering_display is not None:
+            enriched_video["mastering_display"] = merged.mastering_display
+        if merged.max_cll is not None:
+            enriched_video["max_cll"] = merged.max_cll
+        if merged.max_fall is not None:
+            enriched_video["max_fall"] = merged.max_fall
+
+        enriched_streams = list(raw_streams)
+        enriched_streams[video_index] = enriched_video
+
+        enriched_probe = dict(probe)
+        enriched_probe["streams"] = enriched_streams
+        return enriched_probe
+
+    def _probe_clip_hdr_static(
+        self,
+        clip: Path,
+    ) -> HdrStaticMetadata:
+        cached = self._hdr_static_cache.get(clip)
+        if cached is not None:
+            return cached
+
+        ffprobe = self.capabilities.ffprobe
+        if not ffprobe:
+            result = HdrStaticMetadata()
+            self._hdr_static_cache[clip] = result
+            return result
+
+        completed = self.runner.capture(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-read_intervals",
+                "%+3",
+                "-show_frames",
+                "-show_entries",
+                "frame=side_data_list",
+                "-of",
+                "json",
+                os.fspath(clip),
+            ],
+            timeout=90,
+            check=False,
+        )
+
+        if getattr(completed, "returncode", 1) != 0:
+            result = HdrStaticMetadata()
+            self._hdr_static_cache[clip] = result
+            return result
+
+        payload = _json_object(getattr(completed, "stdout", ""))
+        result = _hdr_static_from_frame_payload(payload)
+        self._hdr_static_cache[clip] = result
+        return result
+
     def _fallback_largest_clip(self, root: Path) -> PlaylistCandidate | None:
         clips = sorted(
             (root / "BDMV" / "STREAM").glob("*.m2ts"),
@@ -558,6 +783,8 @@ class BluRayScanner:
                 }
             ],
         }
+        if payload:
+            payload = self._with_hdr_static_metadata(root, payload, metadata)
         return self._playlist_from_payload("00000", payload, metadata)
 
     def _playlist_from_payload(
@@ -767,6 +994,231 @@ class BluRayScanner:
         ]
 
 
+
+def _representative_clip_path(
+    root: Path,
+    native: Mapping[str, Any],
+) -> Path | None:
+    """Choose the clip contributing the largest duration to the playlist."""
+
+    segments = native.get("segments", ())
+    if not isinstance(segments, (list, tuple)):
+        return None
+
+    durations: dict[str, float] = {}
+    packets: dict[str, int] = {}
+
+    for segment in segments:
+        if not isinstance(segment, Mapping):
+            continue
+
+        raw_clip_id = segment.get("clip_id", segment.get("clip"))
+        if raw_clip_id in (None, ""):
+            continue
+
+        clip_id = Path(str(raw_clip_id)).stem
+
+        if not clip_id.isdigit() or len(clip_id) > 5:
+            continue
+
+        clip_id = clip_id.zfill(5)
+
+        duration = _float(segment.get("duration"), None)
+        if duration is None:
+            in_time = (
+                _float(
+                    segment.get(
+                        "in_time",
+                        segment.get("in_time_seconds"),
+                    ),
+                    0.0,
+                )
+                or 0.0
+            )
+            out_time = _float(
+                segment.get(
+                    "out_time",
+                    segment.get("out_time_seconds"),
+                ),
+                None,
+            )
+            duration = (
+                max(out_time - in_time, 0.0)
+                if out_time is not None
+                else 0.0
+            )
+
+        durations[clip_id] = durations.get(clip_id, 0.0) + max(
+            duration or 0.0,
+            0.0,
+        )
+        packets[clip_id] = packets.get(clip_id, 0) + (
+            _int(segment.get("packet_count"), 0) or 0
+        )
+
+    stream_directory = root / "BDMV" / "STREAM"
+    ranked: list[tuple[float, int, int, str, Path]] = []
+
+    for clip_id, duration in durations.items():
+        lower = stream_directory / f"{clip_id}.m2ts"
+        upper = stream_directory / f"{clip_id}.M2TS"
+
+        if lower.is_file():
+            candidate = lower
+        elif upper.is_file():
+            candidate = upper
+        else:
+            continue
+
+        try:
+            size = candidate.stat().st_size
+        except OSError:
+            continue
+
+        ranked.append(
+            (
+                duration,
+                packets.get(clip_id, 0),
+                size,
+                clip_id,
+                candidate,
+            )
+        )
+
+    if not ranked:
+        return None
+
+    return max(ranked, key=lambda item: item[:4])[4]
+
+
+def _scaled_hdr_value(value: Any, scale: int) -> int | None:
+    try:
+        scaled = Fraction(str(value)) * scale
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+    if scaled.denominator != 1 or scaled.numerator < 0:
+        return None
+
+    return scaled.numerator
+
+
+def _mastering_display_from_side_data(
+    side_data: Mapping[str, Any],
+) -> str | None:
+    red_x = _scaled_hdr_value(side_data.get("red_x"), 50000)
+    red_y = _scaled_hdr_value(side_data.get("red_y"), 50000)
+    green_x = _scaled_hdr_value(side_data.get("green_x"), 50000)
+    green_y = _scaled_hdr_value(side_data.get("green_y"), 50000)
+    blue_x = _scaled_hdr_value(side_data.get("blue_x"), 50000)
+    blue_y = _scaled_hdr_value(side_data.get("blue_y"), 50000)
+    white_x = _scaled_hdr_value(
+        side_data.get("white_point_x"),
+        50000,
+    )
+    white_y = _scaled_hdr_value(
+        side_data.get("white_point_y"),
+        50000,
+    )
+    max_luminance = _scaled_hdr_value(
+        side_data.get("max_luminance"),
+        10000,
+    )
+    min_luminance = _scaled_hdr_value(
+        side_data.get("min_luminance"),
+        10000,
+    )
+
+    values = (
+        red_x,
+        red_y,
+        green_x,
+        green_y,
+        blue_x,
+        blue_y,
+        white_x,
+        white_y,
+        max_luminance,
+        min_luminance,
+    )
+
+    if any(value is None for value in values):
+        return None
+
+    return (
+        f"G({green_x},{green_y})"
+        f"B({blue_x},{blue_y})"
+        f"R({red_x},{red_y})"
+        f"WP({white_x},{white_y})"
+        f"L({max_luminance},{min_luminance})"
+    )
+
+
+def _hdr_static_from_frame_payload(
+    payload: Mapping[str, Any],
+) -> HdrStaticMetadata:
+    """Extract only unambiguous, complete HDR10 frame-side metadata."""
+
+    raw_frames = payload.get("frames", ())
+    if not isinstance(raw_frames, (list, tuple)):
+        return HdrStaticMetadata()
+
+    mastering_values: set[str] = set()
+    cll_pairs: set[tuple[int, int]] = set()
+
+    for frame in raw_frames:
+        if not isinstance(frame, Mapping):
+            continue
+
+        raw_side_data = frame.get("side_data_list", ())
+        if not isinstance(raw_side_data, (list, tuple)):
+            continue
+
+        for side_data in raw_side_data:
+            if not isinstance(side_data, Mapping):
+                continue
+
+            side_type = str(
+                side_data.get("side_data_type", "")
+            ).lower()
+
+            if "mastering display metadata" in side_type:
+                mastering = _mastering_display_from_side_data(side_data)
+                if mastering is not None:
+                    mastering_values.add(mastering)
+
+            elif "content light level metadata" in side_type:
+                max_cll = _int(side_data.get("max_content"), None)
+                max_fall = _int(side_data.get("max_average"), None)
+
+                if (
+                    max_cll is not None
+                    and max_fall is not None
+                    and max_cll >= 0
+                    and max_fall >= 0
+                ):
+                    cll_pairs.add((max_cll, max_fall))
+
+    # Több különböző érték esetén nem választunk önkényesen:
+    # a planner továbbra is blokkol, amíg nincs ellenőrzött adat.
+    mastering = (
+        next(iter(mastering_values))
+        if len(mastering_values) == 1
+        else None
+    )
+    cll_pair = (
+        next(iter(cll_pairs))
+        if len(cll_pairs) == 1
+        else None
+    )
+
+    return HdrStaticMetadata(
+        mastering_display=mastering,
+        max_cll=cll_pair[0] if cll_pair is not None else None,
+        max_fall=cll_pair[1] if cll_pair is not None else None,
+    )
+
+
 def _video_properties(
     item: Mapping[str, Any], native: Mapping[str, Any]
 ) -> VideoProperties:
@@ -805,9 +1257,17 @@ def _video_properties(
     )
     matrix = _optional_str(item.get("color_space", native.get("color_matrix")))
     hdr10 = bool(native.get("hdr10", transfer == "smpte2084" and primaries == "bt2020"))
-    mastering = _optional_str(native.get("mastering_display"))
-    max_cll = _int(native.get("max_cll"), None)
-    max_fall = _int(native.get("max_fall"), None)
+    mastering = _optional_str(item.get("mastering_display"))
+    if mastering is None:
+        mastering = _optional_str(native.get("mastering_display"))
+
+    max_cll = _int(item.get("max_cll"), None)
+    if max_cll is None:
+        max_cll = _int(native.get("max_cll"), None)
+
+    max_fall = _int(item.get("max_fall"), None)
+    if max_fall is None:
+        max_fall = _int(native.get("max_fall"), None)
     return VideoProperties(
         codec=codec,
         width=_int(item.get("width", native.get("width")), None),
