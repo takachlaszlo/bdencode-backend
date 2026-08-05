@@ -48,6 +48,7 @@ def reference_remux_command(
         str(plan.angle),
         "-i",
         f"bluray:{plan.disc_root.as_posix()}",
+        "-ignore_unknown",
         "-map",
         "0",
         "-map_metadata",
