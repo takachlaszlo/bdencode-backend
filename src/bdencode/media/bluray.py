@@ -842,7 +842,7 @@ class BluRayScanner:
             or sum(segment.duration_seconds for segment in segments),
             chapters=chapters,
             segments=segments,
-            streams=tuple(streams),
+            streams=_unique_stream_ids(streams),
             angle_count=int(native.get("angle_count", 1)),
             seamless_branching=bool(
                 native.get("seamless_branching", len(segments) > 1)
@@ -1217,6 +1217,63 @@ def _hdr_static_from_frame_payload(
         max_cll=cll_pair[0] if cll_pair is not None else None,
         max_fall=cll_pair[1] if cll_pair is not None else None,
     )
+
+
+
+def _stream_id_token(value: str) -> str:
+    """Return a stable, URL/JSON-friendly stream-ID component."""
+
+    token = "".join(
+        character if character.isalnum() else "-"
+        for character in value.casefold()
+    )
+    token = "-".join(part for part in token.split("-") if part)
+    return token or "unknown"
+
+
+def _unique_stream_ids(
+    streams: Sequence[MediaStream],
+) -> tuple[MediaStream, ...]:
+    """Disambiguate logical streams sharing the same Blu-ray PID.
+
+    Blu-ray TrueHD may expose the lossless stream and its embedded AC-3
+    compatibility core as separate FFmpeg streams with the same PID.  The
+    ordinary ``kind:pid`` identifier is preserved when unique; collisions gain
+    a codec suffix and, only if still necessary, the FFmpeg stream index.
+    """
+
+    from dataclasses import replace
+
+    counts: dict[str, int] = {}
+
+    for stream in streams:
+        counts[stream.id] = counts.get(stream.id, 0) + 1
+
+    result: list[MediaStream] = []
+    used: set[str] = set()
+
+    for stream in streams:
+        identifier = stream.id
+
+        if counts[stream.id] > 1:
+            identifier = (
+                f"{stream.id}:{_stream_id_token(stream.codec)}"
+            )
+
+            if identifier in used:
+                identifier = f"{identifier}:{stream.index}"
+
+        if identifier in used:
+            identifier = f"{identifier}:{stream.index}"
+
+        result.append(
+            stream
+            if identifier == stream.id
+            else replace(stream, id=identifier)
+        )
+        used.add(identifier)
+
+    return tuple(result)
 
 
 def _video_properties(

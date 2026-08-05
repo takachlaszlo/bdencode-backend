@@ -216,3 +216,65 @@ def test_scanner_enriches_hdr10_from_representative_clip(
     assert len(runner.calls) == 1
     assert "-show_frames" in runner.calls[0]
     assert str(clip) in runner.calls[0]
+
+
+
+def test_truehd_and_embedded_ac3_core_receive_unique_ids(
+    tmp_path: Path,
+) -> None:
+    scanner = BluRayScanner(
+        capabilities=ToolCapabilities(),
+        source_root=tmp_path,
+    )
+
+    probe = {
+        "streams": [
+            {
+                "index": 2,
+                "id": "0x1100",
+                "codec_type": "audio",
+                "codec_name": "truehd",
+                "channels": 8,
+                "sample_rate": "48000",
+                "tags": {"language": "eng"},
+            },
+            {
+                "index": 3,
+                "id": "0x1100",
+                "codec_type": "audio",
+                "codec_name": "ac3",
+                "channels": 6,
+                "sample_rate": "48000",
+                "tags": {"language": "eng"},
+            },
+            {
+                "index": 4,
+                "id": "0x1101",
+                "codec_type": "audio",
+                "codec_name": "ac3",
+                "channels": 6,
+                "sample_rate": "48000",
+                "tags": {"language": "spa"},
+            },
+        ],
+        "format": {"duration": "6120.489356"},
+    }
+
+    playlist = scanner._playlist_from_payload(
+        "00803",
+        probe,
+        {
+            "duration": 6120.489356,
+            "segments": [],
+        },
+    )
+
+    assert [stream.id for stream in playlist.audio_streams] == [
+        "audio:4352:truehd",
+        "audio:4352:ac3",
+        "audio:4353",
+    ]
+
+    assert len(
+        {stream.id for stream in playlist.audio_streams}
+    ) == len(playlist.audio_streams)
