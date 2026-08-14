@@ -36,6 +36,24 @@ if [[ ! "$cpu_percent" =~ ^[0-9]+$ ]] || ((cpu_percent < 1 || cpu_percent > 100)
 fi
 cpu_quota="$((logical_cpus * cpu_percent))%"
 
+if [[ ! -r /etc/os-release ]]; then
+    echo "Cannot identify the Linux distribution: /etc/os-release is missing" >&2
+    exit 2
+fi
+# shellcheck disable=SC1091
+. /etc/os-release
+if [[ "${ID:-}" != "debian" ]]; then
+    echo "BDEncode requires Debian (detected: ${ID:-unknown})" >&2
+    exit 2
+fi
+case "${VERSION_CODENAME:-}" in
+    bookworm|trixie) media_suite="$VERSION_CODENAME" ;;
+    *)
+        echo "Unsupported Debian release: ${VERSION_CODENAME:-unknown}; expected bookworm or trixie" >&2
+        exit 2
+        ;;
+esac
+
 assert_path_components_without_symlinks() {
     local candidate="$1"
     local component current=/
@@ -429,8 +447,17 @@ sudo install -d -m 0755 /etc/bdencode /etc/apt/preferences.d \
     /etc/systemd/system/apt-daily.service.d \
     /etc/systemd/system/apt-daily-upgrade.service.d
 sudo install -d -m 0711 /var/lib/bdencode/apt-transactions
-atomic_root_install "$repo_root/install/media-apt.sources.list" \
+rendered_media_sources="$(mktemp)"
+sed "s|@SUITE@|$media_suite|g" \
+    "$repo_root/install/media-apt.sources.list" >"$rendered_media_sources"
+if grep -Fq '@SUITE@' "$rendered_media_sources"; then
+    echo "Media APT source template was not fully rendered" >&2
+    rm -f -- "$rendered_media_sources"
+    exit 1
+fi
+atomic_root_install "$rendered_media_sources" \
     /etc/bdencode/media-apt.sources.list 0644
+rm -f -- "$rendered_media_sources"
 atomic_root_install "$repo_root/install/bdencode-media.pref" \
     /etc/apt/preferences.d/bdencode-media 0644
 for apt_unit in apt-daily.service apt-daily-upgrade.service; do

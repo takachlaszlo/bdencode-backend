@@ -40,7 +40,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 ReadWritePaths=@DATA_ROOT@/state @DATA_ROOT@/jobs @DATA_ROOT@/completed @DATA_ROOT@/cache @DATA_ROOT@/updates
-ReadOnlyPaths=@SOURCE_ROOT@
+ReadOnlyPaths="@SOURCE_ROOT@"
 
 [Install]
 WantedBy=multi-user.target

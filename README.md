@@ -1,6 +1,6 @@
 # BDEncode
 
-Tartós Blu-ray/UHD Blu-ray kódoló rendszer x264/x265 kimenethez, headless backenddel és a Swizzin nginx mögött futó, reszponzív webes kezelőfelülettel.
+Tartós Blu-ray/UHD Blu-ray kódoló rendszer x264/x265 kimenethez, headless backenddel és reszponzív webes kezelőfelülettel. Szerveren Swizzin nginx mögött, Windows alatt helyi WSL2 szolgáltatásként fut.
 
 ## Fő tulajdonságok
 
@@ -27,9 +27,54 @@ Tartós Blu-ray/UHD Blu-ray kódoló rendszer x264/x265 kimenethez, headless bac
 - csempés webes kezelőfelület forrásböngészővel, várólistával, kezdő/haladó/profi beállításokkal, szerveroldali tervellenőrzéssel, log- és artifact-nézettel;
 - interaktív I/P/B PNG comparison (csúszka, A/B, villogó és difference nézet), audio-spektrum párok és BBCode-másolás.
 
+## Windows 10/11 telepítés
+
+A Windows-változat WSL2-ben futtatja ugyanazt a Debian backendet és média-
+toolchaint, ezért nincs külön, eltérően viselkedő Windows encoder. A webes
+felületet a normál Windows böngészőben használod; videokártya továbbra sem
+szükséges.
+
+Feltételek:
+
+- 64 bites Windows 10 2004 vagy újabb, illetve Windows 11;
+- bekapcsolható hardveres virtualizáció és rendszergazdai jogosultság;
+- legalább 100 GB szabad hely ajánlott a WSL virtuális lemezén;
+- a BDMV forrás egy helyi, meghajtóbetűjeles Windows-mappában legyen.
+
+Telepítés:
+
+1. töltsd le vagy klónozd ezt a repót;
+2. kattints duplán az `install/windows-install.cmd` fájlra;
+3. engedélyezd a rendszergazdai kérést, majd válaszd ki a BDMV-ket tartalmazó
+   mappát vagy meghajtót;
+4. ha a WSL még nincs telepítve, a gép egyszeri újraindítása szükséges; a
+   telepítő a következő bejelentkezéskor automatikusan folytatódik.
+
+A telepítő létrehozza a `BDEncode` webes és az `BDEncode elkészült filmek`
+asztali parancsikont. A felület alapértelmezett címe:
+
+```text
+http://localhost:8787/encoder/
+```
+
+A forrás a Windows-meghajtón marad és a worker csak olvassa. A gyors, sok
+apró fájlt használó munkaterület a WSL Linux-fájlrendszerébe kerül; a kész
+fájlok Windowsból a létrehozott parancsikonnal vagy ezen az útvonalon érhetők
+el:
+
+```text
+\\wsl.localhost\Debian\home\<felhasználó>\encode\completed
+```
+
+A helyi webkiszolgáló kizárólag `127.0.0.1:8787` címen figyel, ezért az otthoni
+hálózat felől nem nyit portot. Ne készíts hozzá routeres porttovábbítást. UNC
+és közvetlen hálózati megosztás jelenleg nem választható forrásnak; azt előbb
+Windows-meghajtóbetűjelhez kell csatlakoztatni. Meglévő, nem a BDEncode által
+kezelt `Debian` WSL-disztribúciót a telepítő alapból nem módosít.
+
 ## Szervertelepítés
 
-Debian 12 alatt, a célfelhasználóként:
+Debian 12 vagy 13 alatt, a célfelhasználóként:
 
 ```bash
 bash install/install.sh
