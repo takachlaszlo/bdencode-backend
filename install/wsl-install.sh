@@ -32,7 +32,7 @@ fi
 
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    nginx curl ca-certificates
+    nginx curl ca-certificates python3
 
 BDENCODE_SOURCE_ROOT="$BDENCODE_SOURCE_ROOT" \
 BDENCODE_CPU_PERCENT="${BDENCODE_CPU_PERCENT:-80}" \

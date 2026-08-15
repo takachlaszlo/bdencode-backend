@@ -224,7 +224,7 @@ $rootBootstrap = @"
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends sudo git ca-certificates curl
+apt-get install -y --no-install-recommends sudo git ca-certificates curl python3
 if ! id -u '$LinuxUser' >/dev/null 2>&1; then
     useradd --create-home --shell /bin/bash '$LinuxUser'
 fi

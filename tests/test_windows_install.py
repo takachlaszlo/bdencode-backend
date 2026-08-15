@@ -24,6 +24,7 @@ def test_windows_bootstrap_is_wsl2_scoped_and_non_destructive() -> None:
     assert '$Script -replace "`r`n", "`n"' in script
     assert "/bin/sleep infinity" in script
     assert "http://localhost:$Port/encoder/" in script
+    assert "curl python3" in script
 
 
 def test_windows_bootstrap_keeps_work_in_linux_and_exposes_completed_folder() -> None:
@@ -43,6 +44,7 @@ def test_wsl_installer_uses_local_only_standalone_web_server() -> None:
     ).read_text(encoding="utf-8")
 
     assert "grep -qi microsoft /proc/sys/kernel/osrelease" in installer
+    assert "nginx curl ca-certificates python3" in installer
     assert 'bash "$repo_root/install/install.sh"' in installer
     assert "/etc/nginx/conf.d/bdencode-wsl.conf" in installer
     assert "listen 127.0.0.1:@LISTEN_PORT@;" in nginx
