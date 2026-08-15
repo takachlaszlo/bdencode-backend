@@ -70,3 +70,4 @@ def test_media_sources_render_for_supported_debian_releases() -> None:
     assert "@SUITE@-security" in sources
     assert 'ReadOnlyPaths="@SOURCE_ROOT@"' in api_unit
     assert 'ReadOnlyPaths="@SOURCE_ROOT@"' in worker_unit
+    assert "dpkg-repack man-db mediainfo" in installer
