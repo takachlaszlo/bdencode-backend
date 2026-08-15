@@ -69,6 +69,41 @@ function Get-InstalledDistros {
     return @($lines | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ })
 }
 
+function Get-DistroVersion {
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $lines = & wsl.exe --list --verbose 2>$null
+        $listExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
+    }
+    if ($listExitCode -ne 0) { return $null }
+
+    $escapedName = [regex]::Escape($DistroName)
+    foreach ($line in $lines) {
+        $clean = ($line -replace "`0", "").Trim()
+        if ($clean -match "^\*?\s*$escapedName\s+.+\s+([12])\s*$") {
+            return [int]$Matches[1]
+        }
+    }
+    return $null
+}
+
+function Wait-DistroVersion {
+    param(
+        [Parameter(Mandatory)] [int]$ExpectedVersion,
+        [int]$TimeoutSeconds = 120
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if ((Get-DistroVersion) -eq $ExpectedVersion) { return $true }
+        Start-Sleep -Seconds 2
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
 function Register-ContinuationAfterRestart {
     $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $command = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $powerShell, $PSCommandPath
@@ -142,16 +177,34 @@ $newDistro = $DistroName -notin $installed
 if ($newDistro) {
     Write-Host "$DistroName WSL2 környezet telepítése…" -ForegroundColor Yellow
     New-Item -ItemType Directory -Path $WslLocation -Force | Out-Null
+    & wsl.exe --set-default-version 2
+    if ($LASTEXITCODE -ne 0) {
+        throw "A WSL2 nem állítható be alapértelmezettként."
+    }
     & wsl.exe --install --distribution $DistroName --no-launch --location $WslLocation
     if ($LASTEXITCODE -ne 0) {
         throw "$DistroName telepítése nem sikerült (exit=$LASTEXITCODE)."
     }
-    & wsl.exe --set-version $DistroName 2
-    if ($LASTEXITCODE -ne 0) { throw "A disztribúció nem állítható WSL2 módba." }
-} elseif (-not $AllowExistingDistro) {
+}
+
+if (-not $newDistro -and -not $AllowExistingDistro) {
     & wsl.exe --distribution $DistroName --user root --exec /usr/bin/test -f /etc/bdencode/windows-managed
-    if ($LASTEXITCODE -ne 0) {
+    $hasManagedMarker = $LASTEXITCODE -eq 0
+    $hasInstallerDisk = Test-Path -LiteralPath (Join-Path $WslLocation "ext4.vhdx")
+    if (-not $hasManagedMarker -and -not $hasInstallerDisk) {
         throw "A '$DistroName' disztribúció már létezik és nem a BDEncode kezelése alatt áll. Használd a -AllowExistingDistro kapcsolót, ha tudatosan ebbe szeretnél telepíteni."
+    }
+    if (-not $hasManagedMarker) {
+        Write-Host "A korábban félbeszakadt BDEncode Debian telepítés folytatása…" -ForegroundColor Yellow
+    }
+}
+
+$distroVersion = Get-DistroVersion
+if ($distroVersion -ne 2) {
+    & wsl.exe --set-version $DistroName 2
+    $setVersionExitCode = $LASTEXITCODE
+    if (-not (Wait-DistroVersion -ExpectedVersion 2)) {
+        throw "A disztribúció nem állítható WSL2 módba (exit=$setVersionExitCode)."
     }
 }
 

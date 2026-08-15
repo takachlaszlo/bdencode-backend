@@ -10,11 +10,15 @@ def test_windows_bootstrap_is_wsl2_scoped_and_non_destructive() -> None:
     script = (ROOT / "install" / "windows.ps1").read_text(encoding="utf-8")
 
     assert "wsl.exe --install --no-distribution" in script
-    assert "--set-version $DistroName 2" in script
+    assert "--set-default-version 2" in script
+    assert "Get-DistroVersion" in script
+    assert "Wait-DistroVersion -ExpectedVersion 2" in script
     assert "systemd=true" in script
     assert "/etc/bdencode/windows-managed" in script
     assert "AllowExistingDistro" in script
     assert "wsl.exe --unregister" not in script
+    assert 'Join-Path $WslLocation "ext4.vhdx"' in script
+    assert "félbeszakadt BDEncode Debian telepítés folytatása" in script
     assert "BDENCODE_SOURCE_ROOT=$wslSource" in script
     assert "BDENCODE_CPU_PERCENT=80" in script
     assert "/bin/sleep infinity" in script
