@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$SourcePath,
     [ValidateRange(1024, 65535)]
@@ -57,8 +57,15 @@ function Invoke-WslScript {
 }
 
 function Get-InstalledDistros {
-    $lines = & wsl.exe --list --quiet 2>$null
-    if ($LASTEXITCODE -ne 0) { return @() }
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $lines = & wsl.exe --list --quiet 2>$null
+        $listExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
+    }
+    if ($listExitCode -ne 0) { return @() }
     return @($lines | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ })
 }
 
@@ -105,8 +112,15 @@ trap {
 Write-Host "BDEncode Windows telepítő" -ForegroundColor Cyan
 Write-Host "A kódoló WSL2/Debian alatt fut, a kezelőfelület Windowsból nyílik meg."
 
-& wsl.exe --status *> $null
-if ($LASTEXITCODE -ne 0) {
+$previousErrorPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = "Continue"
+    & wsl.exe --status *> $null
+    $wslStatusExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousErrorPreference
+}
+if ($wslStatusExitCode -ne 0) {
     Write-Host "WSL2 telepítése…" -ForegroundColor Yellow
     & wsl.exe --install --no-distribution
     if ($LASTEXITCODE -ne 0) {
