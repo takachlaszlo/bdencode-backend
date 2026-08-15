@@ -21,6 +21,7 @@ def test_windows_bootstrap_is_wsl2_scoped_and_non_destructive() -> None:
     assert "félbeszakadt BDEncode Debian telepítés folytatása" in script
     assert "BDENCODE_SOURCE_ROOT=$wslSource" in script
     assert "BDENCODE_CPU_PERCENT=80" in script
+    assert '$Script -replace "`r`n", "`n"' in script
     assert "/bin/sleep infinity" in script
     assert "http://localhost:$Port/encoder/" in script
 

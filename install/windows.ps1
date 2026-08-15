@@ -49,7 +49,10 @@ function Invoke-WslScript {
         [Parameter(Mandatory)] [string]$User,
         [Parameter(Mandatory)] [string]$Script
     )
-    $bytes = [Text.Encoding]::UTF8.GetBytes($Script)
+    # A PowerShell here-string Windows alatt CRLF-fel készül, a bash viszont
+    # a sorvégi CR karaktert a parancs részének tekintené.
+    $normalizedScript = $Script -replace "`r`n", "`n" -replace "`r", "`n"
+    $bytes = [Text.Encoding]::UTF8.GetBytes($normalizedScript)
     $payload = [Convert]::ToBase64String($bytes)
     Invoke-Wsl -User $User -Command @(
         "/bin/bash", "-lc", "printf '%s' '$payload' | base64 -d | /bin/bash"
