@@ -15,6 +15,18 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+$script:InstallLog = Join-Path $env:LOCALAPPDATA "BDEncode\install.log"
+
+function Wait-BeforeExit {
+    param([string]$Prompt = "Nyomj Entert a bezáráshoz")
+
+    try {
+        [void](Read-Host $Prompt)
+    } catch {
+        # Nincs interaktív konzol (például automatizált futtatásnál).
+    }
+}
+
 function Test-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -60,8 +72,34 @@ function Register-ContinuationAfterRestart {
 
 if (-not (Test-Administrator)) {
     $argumentLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $argumentLine
-    exit 0
+    try {
+        $elevated = Start-Process powershell.exe -Verb RunAs -ArgumentList $argumentLine -PassThru -Wait
+        exit $elevated.ExitCode
+    } catch {
+        Write-Host "`nA rendszergazdai indítás nem történt meg." -ForegroundColor Red
+        Write-Host "A Windows kérdésénél válaszd az Igen lehetőséget."
+        Write-Host "Részletek: $($_.Exception.Message)"
+        Wait-BeforeExit
+        exit 1
+    }
+}
+
+$logDirectory = Split-Path -Parent $script:InstallLog
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+try {
+    Start-Transcript -Path $script:InstallLog -Append -Force | Out-Null
+} catch {
+    # A telepítést a transcript esetleges hibája nem állíthatja meg.
+}
+
+trap {
+    Write-Host "`nA BDEncode telepítése hibával leállt." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host "`nA részletes napló itt található:"
+    Write-Host $script:InstallLog -ForegroundColor Yellow
+    try { Stop-Transcript | Out-Null } catch { }
+    Wait-BeforeExit
+    exit 1
 }
 
 Write-Host "BDEncode Windows telepítő" -ForegroundColor Cyan
@@ -76,8 +114,8 @@ if ($LASTEXITCODE -ne 0) {
     }
     Register-ContinuationAfterRestart
     Write-Host "A WSL Windows-összetevői elkészültek. Indítsd újra a gépet; a telepítő bejelentkezés után automatikusan folytatódik." -ForegroundColor Green
-    Read-Host "Nyomj Entert a bezáráshoz"
-    exit 3010
+    Wait-BeforeExit
+    exit 0
 }
 
 & wsl.exe --update
@@ -224,4 +262,5 @@ Write-Host "Weboldal: $url"
 Write-Host "Forrás: $sourceFull -> $wslSource"
 Write-Host "Kész fájlok: \\wsl.localhost\$DistroName\home\$LinuxUser\encode\completed"
 Start-Process $url
-Read-Host "Nyomj Entert a bezáráshoz"
+try { Stop-Transcript | Out-Null } catch { }
+Wait-BeforeExit
