@@ -107,6 +107,26 @@ function Wait-DistroVersion {
     return $false
 }
 
+function Test-LocalHealth {
+    param([Parameter(Mandatory)] [string]$Uri)
+
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.UseProxy = $false
+    $client = [Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(3)
+    try {
+        $body = $client.GetStringAsync($Uri).GetAwaiter().GetResult()
+        $health = $body | ConvertFrom-Json
+        return $health.status -eq "ok"
+    } catch {
+        return $false
+    } finally {
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
 function Register-ContinuationAfterRestart {
     $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $command = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $powerShell, $PSCommandPath
@@ -299,11 +319,56 @@ try {
 }
 
 $startup = [Environment]::GetFolderPath("Startup")
-$keepAlivePath = Join-Path $startup "BDEncode-WSL.vbs"
-$keepAliveCommand = 'wsl.exe --distribution "{0}" --user "{1}" --exec /bin/sleep infinity' -f $DistroName, $LinuxUser
-$vbs = 'CreateObject("WScript.Shell").Run "{0}", 0, False' -f ($keepAliveCommand -replace '"', '""')
-[IO.File]::WriteAllText($keepAlivePath, $vbs, [Text.Encoding]::ASCII)
-Start-Process wscript.exe -ArgumentList ('"{0}"' -f $keepAlivePath) -WindowStyle Hidden
+$legacyKeepAlivePath = Join-Path $startup "BDEncode-WSL.vbs"
+Remove-Item -LiteralPath $legacyKeepAlivePath -Force -ErrorAction SilentlyContinue
+
+$taskName = "BDEncode WSL"
+$taskUser = "$env:USERDOMAIN\$env:USERNAME"
+$keepAliveScriptPath = Join-Path $logDirectory "keepalive.ps1"
+$safeDistroLiteral = $DistroName.Replace("'", "''")
+$safeUserLiteral = $LinuxUser.Replace("'", "''")
+$keepAliveScriptTemplate = @'
+$arguments = @(
+    '--distribution', '@DISTRO@',
+    '--user', '@LINUX_USER@',
+    '--exec', '/bin/sleep', 'infinity'
+)
+while ($true) {
+    $process = Start-Process `
+        -FilePath "$env:SystemRoot\System32\wsl.exe" `
+        -ArgumentList $arguments `
+        -WindowStyle Hidden `
+        -PassThru
+    $process.WaitForExit()
+    Start-Sleep -Seconds 2
+}
+'@
+$keepAliveScript = $keepAliveScriptTemplate.Replace("@DISTRO@", $safeDistroLiteral).Replace("@LINUX_USER@", $safeUserLiteral)
+[IO.File]::WriteAllText($keepAliveScriptPath, $keepAliveScript, [Text.UTF8Encoding]::new($true))
+$taskArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $keepAliveScriptPath
+$taskAction = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $taskArguments
+$taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
+$taskPrincipal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
+$taskSettingsParameters = @{
+    AllowStartIfOnBatteries = $true
+    DontStopIfGoingOnBatteries = $true
+    ExecutionTimeLimit = [TimeSpan]::Zero
+    MultipleInstances = "IgnoreNew"
+    RestartCount = 3
+    RestartInterval = New-TimeSpan -Minutes 1
+}
+$taskSettings = New-ScheduledTaskSettingsSet @taskSettingsParameters
+$registerTaskParameters = @{
+    TaskName = $taskName
+    Action = $taskAction
+    Trigger = $taskTrigger
+    Principal = $taskPrincipal
+    Settings = $taskSettings
+    Description = "Keeps the local BDEncode WSL services available while the user is signed in."
+    Force = $true
+}
+Register-ScheduledTask @registerTaskParameters | Out-Null
+Start-ScheduledTask -TaskName $taskName
 
 $desktop = [Environment]::GetFolderPath("Desktop")
 $urlPath = Join-Path $desktop "BDEncode.url"
@@ -318,12 +383,11 @@ $completedShortcut.Save()
 
 $healthy = $false
 for ($attempt = 0; $attempt -lt 30; $attempt++) {
-    try {
-        $health = Invoke-RestMethod -Uri "http://localhost:$Port/encoder/api/v1/health" -TimeoutSec 2
-        if ($health.status -eq "ok") { $healthy = $true; break }
-    } catch {
-        Start-Sleep -Seconds 1
+    if (Test-LocalHealth -Uri "http://127.0.0.1:$Port/encoder/api/v1/health") {
+        $healthy = $true
+        break
     }
+    Start-Sleep -Seconds 1
 }
 if (-not $healthy) { throw "A telepítés elkészült, de a Windows felől nem érhető el a helyi weboldal." }
 
