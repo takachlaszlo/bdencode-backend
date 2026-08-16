@@ -554,8 +554,8 @@ export interface TrackSelection {
   language: string | null;
   name: string | null;
   default: boolean;
-  forced: boolean;
-  subtitle_kind: "unknown" | "full" | "forced" | null;
+  forced?: boolean | null;
+  subtitle_kind?: "unknown" | "full" | "forced" | null;
   order: number;
 }
 

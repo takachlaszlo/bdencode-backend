@@ -138,6 +138,9 @@ describe("SelectionWizard", () => {
       }),
       1,
     );
+    const submittedTracks = vi.mocked(api.validateSelection).mock.calls[0][1].tracks;
+    expect(submittedTracks[0]).not.toHaveProperty("forced");
+    expect(submittedTracks[0]).not.toHaveProperty("subtitle_kind");
 
     await user.click(
       screen.getByRole("button", { name: "Jóváhagyás és automatikus indítás" }),
@@ -293,5 +296,50 @@ describe("SelectionWizard", () => {
 
     await user.click(view.getByRole("button", { name: "Feliratok megnyitása" }));
     expect(view.getByRole("heading", { name: "Feliratok" })).toBeInTheDocument();
+  });
+
+  it("repairs the legacy audio-only subtitle fields and retries validation", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.validateSelection).mockRejectedValueOnce(new ApiError(
+      422,
+      "selection cannot be planned safely: audio tracks cannot define forced or subtitle_kind fields",
+      { detail: "selection cannot be planned safely: audio tracks cannot define forced or subtitle_kind fields" },
+    ));
+    const view = renderApp(
+      <SelectionWizard
+        job={makeJob({
+          state: "AWAITING_SELECTION",
+          selection: {
+            playlist_id: "00001",
+            tracks: [{
+              stream_id: "audio:4352",
+              action: "copy",
+              default: true,
+              forced: false,
+              subtitle_kind: null,
+              order: 0,
+            }],
+          },
+        })}
+        scan={makeScan()}
+        onComplete={vi.fn()}
+      />,
+    );
+
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Terv ellenőrzése" }));
+
+    expect(await view.findByText("A hangsáv hibás feliratjelölést tartalmazott")).toBeInTheDocument();
+    expect(view.queryByText(/audio tracks cannot define/i)).not.toBeInTheDocument();
+
+    const firstPayload = vi.mocked(api.validateSelection).mock.calls[0][1];
+    expect(firstPayload.tracks[0]).not.toHaveProperty("forced");
+    expect(firstPayload.tracks[0]).not.toHaveProperty("subtitle_kind");
+
+    await user.click(view.getByRole("button", { name: "Terv újraellenőrzése" }));
+    expect(await view.findByText("A terv érvényes")).toBeInTheDocument();
+    expect(api.validateSelection).toHaveBeenCalledTimes(2);
   });
 });

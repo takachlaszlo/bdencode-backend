@@ -217,6 +217,24 @@ function isSubtitleClassificationError(error: unknown): boolean {
     && /full\s*\/\s*forced|full.*forced/i.test(error.detail);
 }
 
+function isAudioSubtitleFieldsError(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false;
+  return /audio tracks?/i.test(error.detail)
+    && /forced/i.test(error.detail)
+    && /subtitle_kind/i.test(error.detail);
+}
+
+function tracksForPayload(tracks: TrackSelection[], playlist: Playlist | undefined): TrackSelection[] {
+  const subtitleIds = new Set(
+    playlist?.streams.filter((stream) => stream.kind === "subtitle").map((stream) => stream.id) ?? [],
+  );
+  return tracks.map((track) => {
+    if (subtitleIds.has(track.stream_id)) return track;
+    const { forced: _forced, subtitle_kind: _subtitleKind, ...audioTrack } = track;
+    return audioTrack;
+  });
+}
+
 export function SelectionWizard({
   job,
   scan,
@@ -302,11 +320,11 @@ export function SelectionWizard({
       crop,
       settings,
     },
-    tracks,
+    tracks: tracksForPayload(tracks, playlist),
     upload_images: uploadImages,
     image_upload_provider: selectedImageProvider,
     dual_type_match: true,
-  }), [angle, crop, detailLevel, outputName, playlistId, selectedImageProvider, settings, temporalFilter, tracks, uploadImages]);
+  }), [angle, crop, detailLevel, outputName, playlist, playlistId, selectedImageProvider, settings, temporalFilter, tracks, uploadImages]);
 
   const validate = useMutation({
     mutationFn: () => api.validateSelection(job.id, payload, job.version),
@@ -392,6 +410,7 @@ export function SelectionWizard({
     ? sourceColorIssueFromPayload(validate.error.payload)
     : null;
   const subtitleClassificationApiIssue = isSubtitleClassificationError(validate.error);
+  const audioSubtitleFieldsApiIssue = isAudioSubtitleFieldsError(validate.error);
   const needsColorConfirmation = blockingSourceColorFields(videoStream?.video).length > 0
     || Boolean(colorApiIssue);
   const safeColorRecommendation = hasSafeSourceColorRecommendation(videoStream?.video, scan.disc_kind);
@@ -663,7 +682,7 @@ export function SelectionWizard({
                   : <Button variant="secondary" icon={<Palette size={17} />} onClick={() => setStep(3)}>Színadatok kézi megadása</Button>}
               </Notice>
             )}
-            {validate.isError && !colorApiIssue && !subtitleClassificationApiIssue && <Notice tone="danger" title="A terv nem indítható">{validate.error instanceof ApiError ? validate.error.detail : validate.error.message}</Notice>}
+            {validate.isError && !colorApiIssue && !subtitleClassificationApiIssue && !audioSubtitleFieldsApiIssue && <Notice tone="danger" title="A terv nem indítható">{validate.error instanceof ApiError ? validate.error.detail : validate.error.message}</Notice>}
             {validate.isError && colorApiIssue && (
               <Notice tone="danger" title="Hiányos forrás-színinformáció">
                 <p>A kódolás biztonsága érdekében erősítsd meg ezeket: {reportedMissingColorFields.map((field) => SOURCE_COLOR_FIELD_LABELS[field]).join(", ")}.</p>
@@ -674,6 +693,12 @@ export function SelectionWizard({
               <Notice tone="danger" title="Hiányzik egy megtartott felirat típusa">
                 <p>A megtartott feliratok egyikénél sincs megengedve az „Ellenőrizendő” állapot. Mindegyiket sorold be „Teljes felirat” vagy „Forced / signs” típusba, illetve hagyd ki, ha nincs rá szükség.</p>
                 <Button variant="secondary" onClick={() => setStep(2)}>Feliratok megnyitása</Button>
+              </Notice>
+            )}
+            {validate.isError && audioSubtitleFieldsApiIssue && (
+              <Notice tone="danger" title="A hangsáv hibás feliratjelölést tartalmazott">
+                <p>A „forced” és a felirattípus csak feliratokhoz használható. A felület ezeket most automatikusan eltávolítja a hangsávokból.</p>
+                <Button variant="secondary" onClick={() => validate.mutate()} loading={validate.isPending}>Terv újraellenőrzése</Button>
               </Notice>
             )}
             {save.isError && <Notice tone="danger" title="A jóváhagyás nem menthető">{save.error instanceof ApiError ? save.error.detail : save.error.message}</Notice>}
