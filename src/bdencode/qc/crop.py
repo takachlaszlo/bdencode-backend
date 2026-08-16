@@ -524,11 +524,42 @@ def validate_operator_crop(
     )
 
 
+def automatic_crop(
+    evidence: CropDetectionEvidence,
+    *,
+    substantial_border_pixels: int = DEFAULT_SUBSTANTIAL_BORDER_PIXELS,
+) -> CropMargins:
+    """Choose the conservative sampled crop without trimming thin edge noise.
+
+    ``safe_crop`` is the largest active canvas observed across the sampled
+    title, so it protects variable-aspect material.  Borders below the policy
+    threshold remain untouched because removing a few dark edge pixels is
+    riskier than preserving them.
+    """
+
+    if substantial_border_pixels < 1:
+        raise ValueError("substantial crop border must be positive")
+    release_safe = evidence.safe_crop or evidence.crop
+    selected = CropMargins(
+        **{
+            edge: (
+                getattr(release_safe, edge)
+                if getattr(release_safe, edge) >= substantial_border_pixels
+                else 0
+            )
+            for edge in ("left", "top", "right", "bottom")
+        }
+    )
+    selected.validate_subsampled()
+    return selected
+
+
 __all__ = [
     "CropDetectInterval",
     "CropDetectionEvidence",
     "CropPolicyDecision",
     "CropPolicyError",
+    "automatic_crop",
     "cropdetect_commands",
     "distributed_cropdetect_commands",
     "full_title_cropdetect_command",

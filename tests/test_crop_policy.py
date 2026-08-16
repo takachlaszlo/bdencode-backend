@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from bdencode.qc.crop import (
+    automatic_crop,
     CropDetectionEvidence,
     CropPolicyError,
     distributed_cropdetect_commands,
@@ -146,6 +147,14 @@ def test_crop_policy_allows_no_crop_when_no_bar_is_detected() -> None:
     assert decision.status == "accepted"
     assert decision.requested == CropMargins()
     assert decision.residual == CropMargins()
+
+
+def test_automatic_crop_uses_release_safe_borders_and_preserves_thin_noise() -> None:
+    letterbox = _evidence(CropMargins(top=138, bottom=138))
+    assert automatic_crop(letterbox) == CropMargins(top=138, bottom=138)
+
+    thin = _evidence(CropMargins(left=6, right=6))
+    assert automatic_crop(thin) == CropMargins()
 
 
 def test_crop_policy_allows_thin_noise_and_conservative_safety_margin() -> None:

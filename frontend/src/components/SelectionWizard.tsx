@@ -599,6 +599,9 @@ export function SelectionWizard({
                 <div><span className="section-heading__icon"><ScanLine size={19} /></span><div><h3>Képkocka-kezelés és crop</h3><p>{videoStream?.video?.width}×{videoStream?.video?.height} · {videoStream?.video?.field_order || "ismeretlen mezősorrend"}</p></div></div>
               </div>
               {sourceInterlaced && <Notice tone="warning">A scan váltottsoros forrást jelzett. Ellenőrizd, hogy IVTC vagy deinterlace szükséges-e; ezt nem biztonságos teljesen automatikusan eldönteni.</Notice>}
+              <Notice tone="info" title="Automatikus crop">
+                Ha mind a négy érték 0, a worker a teljes film képkockáit átvizsgálja, és automatikusan alkalmazza a biztonságosan kimutatható fekete sávok levágását. Kézzel csak akkor állítsd, ha szándékosan felül akarod írni az automatikus döntést.
+              </Notice>
               <label className="field">
                 <span>Időbeli szűrés</span>
                 <select value={temporalFilter} onChange={(event) => { setTemporalFilter(event.target.value); setValidation(null); }}>
@@ -1133,7 +1136,7 @@ function CropEditor({
           );
         })}
       </div>
-      <small className="field-help">A crop értékek páros pixelekre állnak. A backend a forrásméretet és a kimeneti kompatibilitást ismét ellenőrzi.</small>
+      <small className="field-help">0 / 0 / 0 / 0 = automatikus crop. A kézi értékek páros pixelekre állnak; a backend minden esetben ellenőrzi a forrásméretet és a kimeneti kompatibilitást.</small>
     </div>
   );
 }

@@ -2006,6 +2006,57 @@ def test_parse_selection_rejects_coerced_track_order(context, value: object) -> 
         parse_selection(job, scan)
 
 
+def test_prepare_automatically_applies_stable_letterbox_crop(context) -> None:
+    database, settings, scan, _scanner, runner, worker = context
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    real_run = runner.run
+
+    def run_with_letterbox_crop(*args: Any, **kwargs: Any) -> None:
+        real_run(*args, **kwargs)
+        command = tuple(os.fspath(item) for item in args[0])
+        stderr_path = kwargs.get("stderr_path")
+        if stderr_path is not None and any("cropdetect=" in item for item in command):
+            runner._write(
+                stderr_path,
+                "\n".join(
+                    "[Parsed_cropdetect_0] crop=1920:804:0:138"
+                    for _ in range(30)
+                )
+                + "\n",
+            )
+
+    runner.run = run_with_letterbox_crop  # type: ignore[method-assign]
+    paths = JobPaths.create(settings, job.id)
+    worker._prepare(ready, paths, advance=False)
+
+    report = json.loads(
+        (paths.analysis / "crop-policy.json").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "passed"
+    assert report["selection_mode"] == "automatic"
+    assert report["decision"]["requested"] == {
+        "left": 0,
+        "top": 138,
+        "right": 0,
+        "bottom": 138,
+    }
+    assert "left=0, top=138, right=0, bottom=138" in paths.script.read_text(
+        encoding="utf-8"
+    )
+    auto_crop_events = [
+        event
+        for event in database.list_events(job_id=job.id)
+        if event.kind == "worker.auto-crop"
+    ]
+    assert len(auto_crop_events) == 1
+    assert auto_crop_events[0].payload["crop"] == report["decision"]["requested"]
+
+
 def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     database, settings, scan, _scanner, runner, worker = context
     job = _enqueue(database, scan.source)

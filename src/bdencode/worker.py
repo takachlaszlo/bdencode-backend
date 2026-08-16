@@ -154,6 +154,7 @@ from .qc.audio import (
 )
 from .qc.catbox import CatboxClient
 from .qc.crop import (
+    automatic_crop,
     CropPolicyError,
     full_title_cropdetect_command,
     parse_stable_cropdetect,
@@ -2770,7 +2771,7 @@ class PipelineWorker:
         integrity_log = paths.logs / "source-video-integrity.log"
         integrity_progress = paths.analysis / "source-video-integrity-progress.txt"
         integrity_inputs = {
-            "policy_schema_version": 2,
+            "policy_schema_version": 3,
             "reference_sha256": sha256_file(paths.reference),
             "context": "source",
             "decode_mode": "full-pixel-decode",
@@ -2904,8 +2905,9 @@ class PipelineWorker:
             )
         crop_report = paths.analysis / "crop-policy.json"
         crop_inputs = {
-            "policy_schema_version": 2,
+            "policy_schema_version": 3,
             "strategy": "full-title-sequential-1fps",
+            "selection_mode": "automatic-when-zero",
             "reference_sha256": sha256_file(paths.reference),
             "duration_seconds": playlist.duration_seconds,
             "source_width": source_video.width,
@@ -2927,15 +2929,17 @@ class PipelineWorker:
                     source_width=source_video.width,
                     source_height=source_video.height,
                 )
-                crop_decision = validate_operator_crop(
-                    ActiveCropMargins(
-                        left=selection.crop.left,
-                        top=selection.crop.top,
-                        right=selection.crop.right,
-                        bottom=selection.crop.bottom,
-                    ),
-                    crop_evidence,
+                requested_crop = ActiveCropMargins(
+                    left=selection.crop.left,
+                    top=selection.crop.top,
+                    right=selection.crop.right,
+                    bottom=selection.crop.bottom,
                 )
+                automatic = not any(asdict(requested_crop).values())
+                effective_crop = (
+                    automatic_crop(crop_evidence) if automatic else requested_crop
+                )
+                crop_decision = validate_operator_crop(effective_crop, crop_evidence)
             except CropPolicyError as exc:
                 atomic_write_json(
                     crop_report,
@@ -2955,11 +2959,29 @@ class PipelineWorker:
                 {
                     "schema_version": 1,
                     "status": "passed",
+                    "selection_mode": "automatic" if automatic else "manual",
                     "evidence": crop_evidence.to_dict(),
                     "decision": crop_decision.to_dict(),
                 },
             )
             _write_stage(crop_marker, crop_inputs, [crop_report])
+
+        try:
+            crop_document = json.loads(crop_report.read_text(encoding="utf-8"))
+            effective_crop_raw = crop_document["decision"]["requested"]
+            effective_crop = VapourSynthCrop(**effective_crop_raw)
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewRequired(f"automatic crop report is invalid: {exc}") from exc
+        if effective_crop != selection.crop:
+            selection = replace(selection, crop=effective_crop)
+            self.database.add_event(
+                EventCreate(
+                    job_id=job.id,
+                    kind="worker.auto-crop",
+                    message="automatic crop applied from full-title evidence",
+                    payload={"crop": asdict(effective_crop)},
+                )
+            )
 
         # Resolve uncertain retained audio tracks now: this avoids discovering
         # a language problem only after a multi-hour video encode. Manual track

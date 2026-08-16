@@ -321,3 +321,23 @@ def test_media_diagnostics_distinguish_corruption_from_sample_seek_noise() -> No
     assert final[0].category is DiagnosticCategory.DECODE_INTEGRITY
     assert final[0].severity is DiagnosticSeverity.ERROR
     assert final[0].requires_review
+
+
+def test_source_diagnostics_ignore_bdj_runtime_and_corrected_output_timestamps() -> None:
+    diagnostics = classify_media_diagnostics(
+        "\n".join(
+            (
+                "bdj.c:795: BD-J check: Failed to load JVM library",
+                "[matroska] Non-monotonous DTS in output stream 0:0; changing to 83",
+                "[null] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 2 >= 2",
+            )
+        ),
+        context="source",
+    )
+
+    assert {item.code for item in diagnostics} == {
+        "bdj_runtime_unavailable",
+        "output_timestamp_corrected",
+    }
+    assert all(item.severity is DiagnosticSeverity.WARNING for item in diagnostics)
+    assert not any(item.requires_review for item in diagnostics)

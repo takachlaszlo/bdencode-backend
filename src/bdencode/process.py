@@ -213,6 +213,21 @@ _DIAGNOSTIC_RULES: tuple[
         ),
     ),
     (
+        "bdj_runtime_unavailable",
+        DiagnosticCategory.ENVIRONMENT,
+        DiagnosticSeverity.WARNING,
+        re.compile(r"(?i)BD-J check:\s*Failed to load JVM library"),
+    ),
+    (
+        "output_timestamp_corrected",
+        DiagnosticCategory.TIMESTAMP,
+        DiagnosticSeverity.WARNING,
+        re.compile(
+            r"(?i)(?:Non-monotonous DTS in output stream|"
+            r"Application provided invalid, non monotonically increasing dts to muxer)"
+        ),
+    ),
+    (
         "timestamp_discontinuity",
         DiagnosticCategory.TIMESTAMP,
         DiagnosticSeverity.WARNING,
@@ -288,7 +303,11 @@ def classify_media_diagnostics(
 
     results = []
     for code, (category, severity, examples, count) in grouped.items():
-        requires_review = not (
+        known_source_advisory = context == "source" and code in {
+            "bdj_runtime_unavailable",
+            "output_timestamp_corrected",
+        }
+        requires_review = not known_source_advisory and not (
             category is DiagnosticCategory.OPEN_GOP_SEEK and context == "sampled"
         )
         results.append(
