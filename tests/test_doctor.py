@@ -197,6 +197,62 @@ def test_installer_and_doctor_require_comparison_annotation_runtime(
     assert status["ok"] is True
 
 
+def test_doctor_data_contract_includes_private_release_kits(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    settings = Settings(
+        data_root=tmp_path / "data",
+        source_roots=(source,),
+    ).validate()
+    settings.create_directories()
+
+    status = doctor._data_path_check(settings)
+
+    release_kits = status["required_writable_paths"]["release_kits"]
+    assert release_kits["path"] == str(settings.release_kits_root)
+    assert release_kits["ok"] is True
+
+
+def test_doctor_parses_release_profiles_without_echoing_invalid_input(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    profiles = tmp_path / "release-profiles.json"
+    settings = Settings(
+        data_root=tmp_path / "data",
+        source_roots=(source,),
+        release_profiles_path=profiles,
+    ).validate()
+    profiles.write_text(
+        '{"schema_version":1,"profiles":[]}',
+        encoding="utf-8",
+    )
+
+    valid = doctor._release_profiles_status(settings)
+    assert valid == {
+        "path": str(profiles),
+        "present": True,
+        "valid": True,
+        "configured": False,
+        "profile_count": 0,
+        "error_code": None,
+    }
+
+    profiles.write_text(
+        '{"schema_version":1,"profiles":[],"secret":"do-not-echo"}',
+        encoding="utf-8",
+    )
+    invalid = doctor._release_profiles_status(settings)
+    assert invalid["present"] is True
+    assert invalid["valid"] is False
+    assert invalid["configured"] is False
+    assert invalid["error_code"] == "release_profile_configuration_invalid"
+    assert "do-not-echo" not in repr(invalid)
+
+
 def test_runtime_credential_status_requires_regular_private_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -285,6 +341,7 @@ def test_data_path_uses_required_children_for_runtime_writability(
         settings.state_root,
         settings.jobs_root,
         settings.completed_root,
+        settings.release_kits_root,
         settings.cache_root,
         settings.updates_root,
     )

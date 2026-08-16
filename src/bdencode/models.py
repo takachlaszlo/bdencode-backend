@@ -11,7 +11,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 
 JsonObject = dict[str, Any]
@@ -38,6 +38,32 @@ class JobState(StrEnum):
     UPLOAD_FAILED = "UPLOAD_FAILED"
 
 
+class JobControlState(StrEnum):
+    """Durable operator control, deliberately independent from pipeline state.
+
+    ``RUNNING`` means that the job is not held; it does not imply that a
+    subprocess currently exists.  Requests remain durable until the worker has
+    reached a safe boundary and acknowledged them.
+    """
+
+    RUNNING = "RUNNING"
+    PAUSE_REQUESTED = "PAUSE_REQUESTED"
+    PAUSED = "PAUSED"
+    CANCEL_REQUESTED = "CANCEL_REQUESTED"
+
+
+class JobOperation(StrEnum):
+    PAUSE = "pause"
+    RESUME = "resume"
+    CANCEL = "cancel"
+    RETRY_FAILED = "retry_failed"
+    RESTART_CANCELLED = "restart_cancelled"
+    CLEANUP = "cleanup"
+    DELETE = "delete"
+    PREPARE_RELEASE = "prepare_release"
+    DELETE_RELEASE = "delete_release"
+
+
 TERMINAL_STATES = frozenset({JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED})
 
 # A FAILED job may only be restored into local media stages guarded by durable,
@@ -59,9 +85,9 @@ RETRYABLE_FAILED_STAGES = frozenset(
 # operator selection and fully configured READY jobs own neither lane.
 PREPARATION_ACTIVE_STATES = frozenset({JobState.SCANNING})
 
-# The database partial unique index permits exactly one job in this set. A
-# NEEDS_REVIEW/UPLOAD_FAILED pause deliberately keeps ownership of the encode
-# lane, so the next encode cannot overtake an unfinished job.
+# The database partial unique index permits exactly one RUNNING job in this
+# set. A PAUSED control state releases the lane deliberately; resuming later is
+# a guarded operation and returns a conflict while another job owns the lane.
 BLOCKING_STATES = frozenset(
     {
         JobState.ENCODING,
@@ -206,11 +232,50 @@ class Job(StrictModel):
     status_message: str | None
     error: str | None
     resume_state: JobState | None
+    control_state: JobControlState = JobControlState.RUNNING
+    control_revision: int = Field(default=1, ge=1)
+    control_requested_at: datetime | None = None
+    control_message: str | None = None
     version: int = Field(ge=1)
     created_at: datetime
     updated_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+
+    @computed_field
+    @property
+    def allowed_operations(self) -> list[JobOperation]:
+        """Actions that are safe for the current durable state.
+
+        This is intentionally derived by the backend so API clients do not
+        duplicate state-machine rules.  Lane availability is checked again in
+        the transaction when a paused job is resumed.
+        """
+
+        if self.state is JobState.COMPLETED:
+            return [
+                JobOperation.CLEANUP,
+                JobOperation.DELETE,
+                JobOperation.PREPARE_RELEASE,
+                JobOperation.DELETE_RELEASE,
+            ]
+        if self.state is JobState.FAILED:
+            return [
+                JobOperation.RETRY_FAILED,
+                JobOperation.DELETE,
+            ]
+        if self.state is JobState.CANCELLED:
+            return [
+                JobOperation.RESTART_CANCELLED,
+                JobOperation.DELETE,
+            ]
+        if self.control_state is JobControlState.CANCEL_REQUESTED:
+            return []
+        if self.control_state is JobControlState.PAUSE_REQUESTED:
+            return [JobOperation.CANCEL]
+        if self.control_state is JobControlState.PAUSED:
+            return [JobOperation.RESUME, JobOperation.CANCEL]
+        return [JobOperation.PAUSE, JobOperation.CANCEL]
 
 
 class JobTransitionRequest(StrictModel):

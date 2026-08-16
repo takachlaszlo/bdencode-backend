@@ -33,6 +33,11 @@ from bdencode.media.bluray import (
     VideoProperties,
 )
 from bdencode.media.profiles import ColorMetadata
+from bdencode.maintenance import (
+    MaintenanceJournal,
+    MaintenancePhase,
+    MaintenanceSafetyError,
+)
 from bdencode.models import (
     ArtifactKind,
     ContentType,
@@ -58,10 +63,37 @@ from bdencode.worker import (
     _current_comparison_pngs,
     _ensure_contained_directory,
     _public_diagnostic_summary,
+    _remove_owned_completed_child,
     _sticky_source_diagnostics,
     parse_selection,
     run_worker,
 )
+
+
+def test_completed_sidecar_cleanup_retains_unsafe_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    completed = tmp_path / "completed"
+    child = completed / "comparison"
+    child.mkdir(parents=True)
+    sentinel = child / "outside.txt"
+    sentinel.write_bytes(b"must remain")
+    rmtree_calls: list[Path] = []
+
+    def reject_unsafe_tree(path: Path) -> tuple[int, int]:
+        raise MaintenanceSafetyError(f"unsafe mounted sidecar: {path.name}")
+
+    def record_rmtree(path: Path) -> None:
+        rmtree_calls.append(Path(path))
+
+    monkeypatch.setattr(worker_module, "safe_tree_usage", reject_unsafe_tree)
+    monkeypatch.setattr(worker_module.shutil, "rmtree", record_rmtree)
+
+    with pytest.raises(MaintenanceSafetyError, match="unsafe mounted sidecar"):
+        _remove_owned_completed_child(completed, child)
+
+    assert sentinel.read_bytes() == b"must remain"
+    assert rmtree_calls == []
 
 
 def test_sd_notify_is_noop_outside_systemd(monkeypatch) -> None:
@@ -1162,6 +1194,8 @@ def test_scan_failure_atomically_fails_job_instead_of_looping(context):
 def test_completed_job_stays_completed_when_work_cleanup_fails(context, monkeypatch):
     database, settings, scan, _scanner, _runner, worker = context
 
+    real_rmtree = shutil.rmtree
+
     def fail_cleanup(_path):
         raise OSError("simulated cleanup failure")
 
@@ -1180,7 +1214,32 @@ def test_completed_job_stays_completed_when_work_cleanup_fails(context, monkeypa
         / "Movie.2026.1080p.BluRay.x264"
         / "Movie.2026.1080p.BluRay.x264.mkv"
     ).is_file()
-    assert (settings.job_root(job.id) / "work").is_dir()
+    assert not (settings.job_root(job.id) / "work").exists()
+    with database._read() as connection:
+        operation_row = connection.execute(
+            "SELECT id FROM maintenance_operations "
+            "WHERE kind = 'completed-workspace-cleanup' AND subject_id = ?",
+            (job.id,),
+        ).fetchone()
+    assert operation_row is not None
+    operation_id = str(operation_row["id"])
+    assert (
+        MaintenanceJournal(database, settings).operation(operation_id).phase
+        is MaintenancePhase.COMMITTED
+    )
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    # Simulate a new process instance taking over at startup.  A second journal
+    # in this same pytest PID must otherwise respect the still-live owner lease.
+    with database._write() as connection:
+        connection.execute(
+            "UPDATE maintenance_operations SET lease_process_token = ? WHERE id = ?",
+            ("terminated-worker-instance", operation_id),
+        )
+    MaintenanceJournal(database, settings).recover()
+    assert (
+        MaintenanceJournal(database, settings).operation(operation_id).phase
+        is MaintenancePhase.FINALIZED
+    )
     warnings = [
         item
         for item in database.list_events(job_id=job.id, limit=1000)

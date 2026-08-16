@@ -1,0 +1,39 @@
+{
+  "profiles": [
+    {
+      "network": {
+        "allowed_hosts": [
+          "tracker.example"
+        ],
+        "dupe_check_endpoint": "https://tracker.example/api/bdencode/dupe-check",
+        "publish_endpoint": "https://tracker.example/api/bdencode/upload"
+      },
+      "qbittorrent": {
+        "allowed_hosts": [
+          "127.0.0.1"
+        ],
+        "base_url": "http://127.0.0.1:8080",
+        "password_credential": "qbittorrent-password",
+        "username_credential": "qbittorrent-username"
+      },
+      "tracker": {
+        "announce_urls": [
+          "https://tracker.example/announce"
+        ],
+        "credential_name": "tracker-example-api-token",
+        "display_name": "Example tracker",
+        "piece_size_default": 1048576,
+        "piece_size_max": 16777216,
+        "piece_size_min": 262144,
+        "profile_id": "example",
+        "schema_version": 1,
+        "screenshot_maximum": 8,
+        "screenshot_minimum": 3,
+        "target_piece_count_max": 2000,
+        "target_piece_count_min": 1000,
+        "torrent_source": "EXAMPLE"
+      }
+    }
+  ],
+  "schema_version": 1
+}

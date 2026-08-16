@@ -14,6 +14,23 @@ export type JobState =
   | "NEEDS_REVIEW"
   | "UPLOAD_FAILED";
 
+export type JobControlState =
+  | "RUNNING"
+  | "PAUSE_REQUESTED"
+  | "PAUSED"
+  | "CANCEL_REQUESTED";
+
+export type JobOperation =
+  | "pause"
+  | "resume"
+  | "cancel"
+  | "retry_failed"
+  | "restart_cancelled"
+  | "cleanup"
+  | "delete"
+  | "prepare_release"
+  | "delete_release";
+
 export type DiscType = "AUTO" | "BD" | "UHD";
 export type ContentType = "FILM" | "CONCERT" | "ANIME" | "SERIES";
 export type DetailLevel = "beginner" | "advanced" | "pro";
@@ -170,11 +187,148 @@ export interface Job {
   status_message: string | null;
   error: string | null;
   resume_state: JobState | null;
+  /** Optional for rolling upgrades from pre-2.1 backends. */
+  control_state?: JobControlState;
+  control_revision?: number;
+  control_requested_at?: string | null;
+  control_message?: string | null;
+  allowed_operations?: Array<JobOperation | string>;
   version: number;
   created_at: string;
   updated_at: string;
   started_at: string | null;
   finished_at: string | null;
+}
+
+export interface JobStorageCategory {
+  name: string;
+  bytes: number;
+  file_count: number;
+  reclaimable: boolean;
+  present: boolean;
+}
+
+export interface JobStorageReport {
+  workspace_bytes: number;
+  reclaimable_bytes: number;
+  completed_release_bytes: number;
+  categories: JobStorageCategory[];
+  workspace_status?: "AVAILABLE" | "CLEANED" | string;
+  cleanup_allowed?: boolean;
+  release_present?: boolean;
+  bytes_removed?: number;
+}
+
+export interface TrackerReleaseProfile {
+  schema_version?: number;
+  profile_id: string;
+  display_name: string;
+  torrent_source?: string;
+  piece_size_min?: number;
+  piece_size_max?: number;
+  piece_size_default?: number;
+  target_piece_count_min?: number;
+  target_piece_count_max?: number;
+  screenshot_minimum?: number;
+  screenshot_maximum?: number;
+  supports_dupe_check?: boolean;
+  supports_publish?: boolean;
+  supports_qbittorrent?: boolean;
+  profile_digest?: string;
+  [key: string]: unknown;
+}
+
+export interface ReleaseProfileList {
+  items?: TrackerReleaseProfile[];
+  profiles?: TrackerReleaseProfile[];
+  count?: number;
+  [key: string]: unknown;
+}
+
+export type ReleasePreparationState =
+  | "NOT_PREPARED"
+  | "PREPARING"
+  | "NEEDS_REVIEW"
+  | "READY"
+  | "SEEDING_CHECK"
+  | "SEEDING"
+  | "READY_TO_PUBLISH"
+  | "PUBLISHING"
+  | "PUBLISHED"
+  | "FAILED"
+  | "UNKNOWN";
+
+export interface ReleaseMetadataPayload {
+  schema_version: 1;
+  release_name: string;
+  title: string;
+  year: number;
+  edition: string | null;
+  imdb_id: string | null;
+  tmdb_id: number | null;
+  category: string;
+  source_media: string;
+  resolution: string;
+  video_codec: string;
+  audio_codecs: string[];
+  languages: string[];
+}
+
+/**
+ * Release integrations are deliberately forward compatible: tracker adapters
+ * may add public preview/receipt fields without requiring a frontend release.
+ */
+export interface ReleasePreparation {
+  id?: string;
+  preparation_id?: string;
+  job_id?: string;
+  profile_id?: string;
+  profile_digest?: string;
+  state?: ReleasePreparationState | string;
+  status?: ReleasePreparationState | string;
+  version?: number;
+  metadata?: Partial<ReleaseMetadataPayload> & Record<string, unknown>;
+  payload_path?: string;
+  payload_size?: number;
+  payload_sha256?: string;
+  kit_ready?: boolean;
+  manifest_sha256?: string | null;
+  torrent_infohash?: string | null;
+  torrent_sha256?: string | null;
+  receipts?: Record<string, unknown> | unknown[] | null;
+  dupe_receipt?: Record<string, unknown> | null;
+  qbittorrent_receipt?: Record<string, unknown> | null;
+  publication_receipt?: Record<string, unknown> | null;
+  preflight?: unknown;
+  validation?: unknown;
+  preview?: unknown;
+  manifest?: Record<string, unknown> | null;
+  error?: string | null;
+  warnings?: string[];
+  created_at?: string;
+  updated_at?: string;
+  completed_at?: string | null;
+  [key: string]: unknown;
+}
+
+export interface ReleaseValidationResult {
+  valid: boolean;
+  failures: string[];
+  payload: {
+    path: string;
+    size: number;
+    sha256: string;
+  };
+  screenshots: number;
+  profile_digest: string;
+  manifest_sha256: string | null;
+  [key: string]: unknown;
+}
+
+export interface ReleasePreparationList {
+  items?: ReleasePreparation[];
+  preparations?: ReleasePreparation[];
+  [key: string]: unknown;
 }
 
 export interface ListMeta {

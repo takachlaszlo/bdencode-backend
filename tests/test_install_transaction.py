@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import closing
 import json
 import os
+import sqlite3
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +15,7 @@ import pytest
 
 
 MODULE_PATH = Path(__file__).parents[1] / "install" / "install_transaction.py"
+INSTALLER_PATH = Path(__file__).parents[1] / "install" / "install.sh"
 SPEC = importlib.util.spec_from_file_location("bdencode_install_transaction", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 install_transaction = importlib.util.module_from_spec(SPEC)
@@ -32,6 +36,17 @@ def test_system_target_allowlist_covers_apt_recovery_dropins() -> None:
         in targets
     )
     assert "/var/www/bdencode/current" in targets
+
+
+def test_installer_prepares_database_rollback_before_live_migration() -> None:
+    installer = INSTALLER_PATH.read_text(encoding="utf-8")
+    begin = installer.index("bdencode-install-transaction begin")
+    worker_stopped = installer.index('worker_state="$(sudo systemctl show', begin)
+    prepare = installer.index("bdencode-install-transaction prepare", worker_stopped)
+    migration = installer.index('"$app_root/current/venv/bin/bdencode" init-db', prepare)
+
+    assert '--database-path "$database_path"' in installer[begin:worker_stopped]
+    assert begin < worker_stopped < prepare < migration
 
 
 def test_stable_recovery_bootstrap_is_outside_rollback_allowlist() -> None:
@@ -63,6 +78,23 @@ def helper(
     )
     transaction.initialize()
     return transaction, app_root, existing, absent
+
+
+def create_v1_database(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO schema_meta VALUES ('schema_version', '1')"
+        )
+        connection.execute(
+            "CREATE TABLE payload (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO payload(value) VALUES ('before-upgrade')")
+        connection.commit()
 
 
 def test_transaction_id_is_strictly_scoped(
@@ -104,6 +136,180 @@ def test_recovery_restores_files_and_removes_new_targets(
     assert not tools_pointer.exists()
     assert not transaction.active_file.exists()
     assert transaction.state(transaction.transaction_dir(TRANSACTION_ID)) == "RESTORED"
+
+
+def test_recovery_accepts_legacy_manifest_without_database_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transaction, app_root, _existing, _absent = helper(tmp_path, monkeypatch)
+    transaction.begin(TRANSACTION_ID, app_root)
+    transaction_dir = transaction.transaction_dir(TRANSACTION_ID)
+    manifest = transaction.load_manifest(transaction_dir)
+    manifest["schema"] = 1
+    manifest.pop("database")
+    transaction.write_manifest(transaction_dir, manifest)
+
+    assert transaction.recover() is True
+    assert not transaction.active_file.exists()
+    assert transaction.state(transaction_dir) == "RESTORED"
+
+
+def test_recovery_restores_database_before_old_release_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transaction, app_root, existing, _absent = helper(tmp_path, monkeypatch)
+    database = app_root.parent / "state" / "encoder.sqlite3"
+    create_v1_database(database)
+    old_pointer = app_root / "current"
+    old_pointer.write_text("old release", encoding="utf-8")
+
+    transaction.begin(
+        TRANSACTION_ID,
+        app_root,
+        database_path=database,
+    )
+    transaction.prepare_mutation()
+    transaction_dir = transaction.transaction_dir(TRANSACTION_ID)
+    manifest = transaction.load_manifest(transaction_dir)
+    assert manifest["database"]["kind"] == "file"
+    assert manifest["database"]["schema_version"] == 1
+
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute(
+            "UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'"
+        )
+        connection.execute("UPDATE payload SET value = 'after-upgrade'")
+        connection.execute("CREATE TABLE release_preparations (id TEXT PRIMARY KEY)")
+        connection.commit()
+    Path(f"{database}-wal").write_bytes(b"stale migrated WAL")
+    Path(f"{database}-shm").write_bytes(b"stale migrated SHM")
+    existing.write_text("candidate config", encoding="utf-8")
+    old_pointer.write_text("new release", encoding="utf-8")
+
+    observations: list[tuple[int, str]] = []
+    restore_targets = transaction.restore
+
+    def observe_database_first(
+        directory: Path, current_manifest: dict[str, object]
+    ) -> None:
+        with closing(
+            sqlite3.connect(transaction.sqlite_readonly_uri(database), uri=True)
+        ) as connection:
+            schema = int(
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+                ).fetchone()[0]
+            )
+            value = str(connection.execute("SELECT value FROM payload").fetchone()[0])
+        observations.append((schema, value))
+        restore_targets(directory, current_manifest)
+
+    monkeypatch.setattr(transaction, "restore", observe_database_first)
+
+    assert transaction.recover() is True
+    assert observations == [(1, "before-upgrade")]
+    assert old_pointer.read_text(encoding="utf-8") == "old release"
+    assert not Path(f"{database}-wal").exists()
+    assert not Path(f"{database}-shm").exists()
+    assert transaction.recover() is False
+
+
+def test_database_snapshot_includes_committed_wal_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transaction, app_root, _existing, _absent = helper(tmp_path, monkeypatch)
+    database = app_root.parent / "state" / "encoder.sqlite3"
+    database.parent.mkdir()
+    child = """
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode = WAL")
+connection.execute("PRAGMA wal_autocheckpoint = 0")
+connection.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+connection.execute("INSERT INTO schema_meta VALUES ('schema_version', '1')")
+connection.execute("CREATE TABLE payload (value TEXT NOT NULL)")
+connection.execute("INSERT INTO payload VALUES ('committed-in-wal')")
+connection.commit()
+os._exit(0)
+"""
+    subprocess.run([sys.executable, "-c", child, str(database)], check=True)
+    assert Path(f"{database}-wal").is_file()
+
+    transaction.begin(
+        TRANSACTION_ID,
+        app_root,
+        database_path=database,
+    )
+    transaction.prepare_mutation()
+    manifest = transaction.load_manifest(transaction.transaction_dir(TRANSACTION_ID))
+    backup = transaction.transaction_dir(TRANSACTION_ID) / manifest["database"][
+        "backup"
+    ]
+
+    with closing(
+        sqlite3.connect(transaction.sqlite_readonly_uri(backup), uri=True)
+    ) as connection:
+        value = connection.execute("SELECT value FROM payload").fetchone()[0]
+    assert value == "committed-in-wal"
+
+
+def test_first_install_recovery_removes_new_database_and_sidecars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transaction, app_root, _existing, _absent = helper(tmp_path, monkeypatch)
+    state_root = app_root.parent / "state"
+    state_root.mkdir()
+    database = state_root / "encoder.sqlite3"
+
+    transaction.begin(
+        TRANSACTION_ID,
+        app_root,
+        database_path=database,
+    )
+    transaction.prepare_mutation()
+    manifest = transaction.load_manifest(transaction.transaction_dir(TRANSACTION_ID))
+    assert manifest["database"] == {"kind": "absent", "path": str(database)}
+
+    create_v1_database(database)
+    Path(f"{database}-wal").write_bytes(b"new WAL")
+    Path(f"{database}-shm").write_bytes(b"new SHM")
+
+    assert transaction.recover() is True
+    assert not database.exists()
+    assert not Path(f"{database}-wal").exists()
+    assert not Path(f"{database}-shm").exists()
+
+
+def test_corrupt_database_backup_does_not_remove_live_wal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transaction, app_root, _existing, _absent = helper(tmp_path, monkeypatch)
+    database = app_root.parent / "state" / "encoder.sqlite3"
+    create_v1_database(database)
+    transaction.begin(
+        TRANSACTION_ID,
+        app_root,
+        database_path=database,
+    )
+    transaction.prepare_mutation()
+    transaction_dir = transaction.transaction_dir(TRANSACTION_ID)
+    manifest = transaction.load_manifest(transaction_dir)
+    backup = transaction_dir / manifest["database"]["backup"]
+    backup.write_bytes(b"corrupt backup")
+    live_wal = Path(f"{database}-wal")
+    live_wal.write_bytes(b"keep until backup validation succeeds")
+
+    with pytest.raises(
+        install_transaction.InstallTransactionError,
+        match="integrity failure",
+    ):
+        transaction.recover()
+
+    assert live_wal.read_bytes() == b"keep until backup validation succeeds"
+    assert transaction.state(transaction_dir) == "RECOVERY_REQUIRED"
 
 
 def test_rollback_clears_mutation_marker_before_runtime_restart(

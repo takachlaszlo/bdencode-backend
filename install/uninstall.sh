@@ -9,15 +9,16 @@ Usage:
   bash install/uninstall.sh [options]
 
 Remove the BDEncode application and its host integration. Blu-ray sources are
-never modified. Queue/job/output data and image-host credentials are preserved
-unless their dedicated purge options are supplied.
+never modified. Queue/job/output data and encrypted BDEncode credentials are
+preserved unless their dedicated purge options are supplied.
 
 Options:
   --data-root PATH          Installed work/data root
   --source-root PATH        Blu-ray source root (repeatable)
   --purge-data              Also remove the complete data root
   --confirm-data-root PATH  Required exact confirmation for --purge-data
-  --purge-credentials       Remove the three fixed image-host credentials
+  --purge-credentials       Remove all six fixed BDEncode credentials:
+                            image hosts, qBittorrent login and Aither token
   --purge-credential        Legacy option: remove only the ImgBB credential
   -h, --help                Show this help
 
@@ -413,7 +414,14 @@ else
 fi
 
 credential_directory="$task_home/.config/bdencode"
-credential_names=(imgbb-api-key catbox-userhash freeimage-api-key)
+credential_names=(
+    imgbb-api-key
+    catbox-userhash
+    freeimage-api-key
+    qbittorrent-username
+    qbittorrent-password
+    tracker-aither-api-token
+)
 declare -a credential_paths=()
 for credential_name in "${credential_names[@]}"; do
     credential_paths+=("$credential_directory/${credential_name}.cred")
@@ -583,6 +591,7 @@ fi
 
 system_files=(
     /etc/bdencode/config.toml
+    /etc/bdencode/release-profiles.json
     /etc/bdencode/media-apt.sources.list
     /etc/apt/preferences.d/bdencode-media
     /etc/systemd/system/bdencode-api.service
@@ -596,6 +605,7 @@ system_files=(
     /etc/systemd/system/bdencode-api.service.d/bdencode-recovery.conf
     /etc/systemd/system/bdencode-worker.service.d/bdencode-recovery.conf
     /etc/systemd/system/bdencode-worker.service.d/credential.conf
+    /etc/systemd/system/bdencode-api.service.d/credential.conf
     /etc/systemd/system/apt-daily.service.d/bdencode-recovery.conf
     /etc/systemd/system/apt-daily-upgrade.service.d/bdencode-recovery.conf
     /etc/systemd/system/multi-user.target.wants/bdencode-api.service
@@ -658,7 +668,14 @@ import sys
 directory, raw_uid, mode = sys.argv[1:]
 expected_uid = int(raw_uid)
 names = (
-    ("imgbb-api-key.cred", "catbox-userhash.cred", "freeimage-api-key.cred")
+    (
+        "imgbb-api-key.cred",
+        "catbox-userhash.cred",
+        "freeimage-api-key.cred",
+        "qbittorrent-username.cred",
+        "qbittorrent-password.cred",
+        "tracker-aither-api-token.cred",
+    )
     if mode == "all"
     else ("imgbb-api-key.cred",)
 )
@@ -709,7 +726,7 @@ echo "BDEncode application and host integration removed."
 echo "Blu-ray source roots were not modified."
 for credential_path in "${credential_paths[@]}"; do
     if [[ -e "$credential_path" || -L "$credential_path" ]]; then
-        echo "Preserved image-host credential: $credential_path"
+        echo "Preserved BDEncode credential: $credential_path"
     fi
 done
 echo "APT packages and this Git checkout were intentionally retained."

@@ -34,7 +34,7 @@ from .audio import (
 from .chapters import render_matroska_chapters
 from .config import Settings
 from .capabilities import capability_snapshot
-from .db import Database
+from .db import Database, StateConflictError
 from .encode import (
     PcmBlurayAudio,
     ReferenceRemuxPlan,
@@ -88,12 +88,20 @@ from .media.profiles import (
     recommended_profile,
     source_adapted_settings,
 )
+from .maintenance import (
+    MaintenanceDomainGuard,
+    MaintenanceJournal,
+    MaintenancePhase,
+    MaintenanceTargetSpec,
+    safe_tree_usage,
+)
 from .logs import assert_public_metadata_absent, sanitize_text
 from .models import (
     ArtifactCreate,
     ArtifactKind as DatabaseArtifactKind,
     EventCreate,
     Job,
+    JobControlState,
     JobState,
     Scan,
     ScanCreate,
@@ -805,6 +813,7 @@ def _remove_owned_completed_child(completed: Path, child: Path) -> None:
             f"completed-package cleanup target escaped its release directory: {child.name}"
         )
     if resolved.is_dir():
+        safe_tree_usage(resolved)
         shutil.rmtree(resolved)
     else:
         resolved.unlink()
@@ -2106,6 +2115,8 @@ class PipelineWorker:
     ) -> None:
         self.database = database
         self.settings = settings.validate()
+        self.maintenance = MaintenanceJournal(database, self.settings)
+        self.maintenance.recover()
         self.queue = JobQueue(database)
         self.scanner_factory = scanner_factory
         self.runner_factory = runner_factory or (
@@ -2128,7 +2139,84 @@ class PipelineWorker:
         self._runners: dict[str, Runner] = {}
 
     def _runner(self, paths: JobPaths) -> Runner:
-        return self._runners.setdefault(str(paths.root), self.runner_factory(paths))
+        key = str(paths.root)
+        runner = self._runners.get(key)
+        if runner is None:
+            runner = self.runner_factory(paths)
+            if isinstance(runner, CommandRunner):
+                runner.set_interrupt_requested(
+                    lambda: self._process_interrupt_requested(paths.root.name)
+                )
+            self._runners[key] = runner
+        return runner
+
+    def _process_interrupt_requested(self, job_id: str) -> bool:
+        if self.stop_requested():
+            return True
+        try:
+            control, _revision = self.database.get_control(job_id)
+        except Exception:
+            LOG.exception("job %s control polling failed; process continues", job_id)
+            return False
+        return control in {
+            JobControlState.PAUSE_REQUESTED,
+            JobControlState.CANCEL_REQUESTED,
+        }
+
+    def _acknowledge_operator_control(self, job_id: str) -> Job | None:
+        """Acknowledge the latest request at a worker-safe boundary."""
+
+        while True:
+            control, revision = self.database.get_control(job_id)
+            try:
+                if control is JobControlState.PAUSE_REQUESTED:
+                    return self.queue.acknowledge_pause(
+                        job_id, expected_control_revision=revision
+                    )
+                if control is JobControlState.CANCEL_REQUESTED:
+                    return self.queue.acknowledge_cancel(
+                        job_id, expected_control_revision=revision
+                    )
+                if control is JobControlState.PAUSED:
+                    return self.database.get_job(job_id)
+                return None
+            except StateConflictError:
+                # Pause may be escalated to cancel between observation and ack.
+                # Re-read instead of acknowledging the superseded revision.
+                continue
+
+    def _stop_at_operator_boundary(self, job_id: str) -> None:
+        if self._acknowledge_operator_control(job_id) is not None:
+            raise ProcessInterrupted("operator control acknowledged at safe boundary")
+
+    @staticmethod
+    def _remove_interrupted_partials(paths: JobPaths) -> None:
+        """Remove exact owned temporary outputs without traversing workspace links."""
+
+        # A recursive suffix search is unsafe here: an operator-controlled local
+        # workspace could acquire a directory symlink or Windows junction while a
+        # command is running, making cleanup walk outside the job root. Keep this
+        # list aligned with the explicit temporary paths created by the pipeline.
+        candidates = (paths.work / "video-encoded.partial.mkv",)
+        for candidate in candidates:
+            if not os.path.lexists(candidate) or candidate.is_symlink():
+                continue
+            try:
+                resolved_parent = candidate.parent.resolve(strict=True)
+                resolved_work = paths.work.resolve(strict=True)
+                if (
+                    resolved_parent != resolved_work
+                    or _unsafe_directory_link(paths.work)
+                    or _unsafe_directory_link(candidate)
+                    or not candidate.is_file()
+                ):
+                    LOG.warning(
+                        "refusing to remove unsafe interrupted partial %s", candidate
+                    )
+                    continue
+                candidate.unlink()
+            except OSError:
+                LOG.warning("could not remove interrupted partial %s", candidate)
 
     def _image_upload_clients(self) -> list[ImageUploadClient]:
         factories = (
@@ -2152,6 +2240,9 @@ class PipelineWorker:
     def process_one_stage(self, job: Job) -> Job:
         """Run exactly the current durable stage and return refreshed state."""
         paths = JobPaths.create(self.settings, job.id)
+        controlled = self._acknowledge_operator_control(job.id)
+        if controlled is not None:
+            return controlled
         if job.state is JobState.SCANNING:
             self._scan(job, paths)
         elif job.state is JobState.READY:
@@ -2180,6 +2271,9 @@ class PipelineWorker:
                     job.state.value,
                 )
                 return self.database.get_job(job.id)
+            controlled = self._acknowledge_operator_control(job.id)
+            if controlled is not None:
+                return controlled
             if job.state in {
                 JobState.AWAITING_SELECTION,
                 JobState.NEEDS_REVIEW,
@@ -2189,6 +2283,8 @@ class PipelineWorker:
             try:
                 before = job.state
                 job = self.process_one_stage(job)
+                if job.control_state is JobControlState.PAUSED:
+                    return job
                 if job.state is before:
                     raise RuntimeError(
                         f"worker stage {before.value} made no durable progress"
@@ -2206,10 +2302,19 @@ class PipelineWorker:
                     job = current
                 return job
             except ProcessInterrupted:
-                current = self.database.get_job(job.id)
+                paths = JobPaths.create(self.settings, job.id)
+                self._remove_interrupted_partials(paths)
+                controlled = self._acknowledge_operator_control(job.id)
+                current = controlled or self.database.get_job(job.id)
                 if current.state is JobState.CANCELLED:
                     LOG.info(
                         "job %s encode stopped after operator cancellation", job.id
+                    )
+                elif current.control_state is JobControlState.PAUSED:
+                    LOG.info(
+                        "job %s paused at durable %s boundary",
+                        job.id,
+                        current.state.value,
                     )
                 elif self.stop_requested():
                     LOG.info("job %s encode stopped for worker shutdown", job.id)
@@ -2219,12 +2324,17 @@ class PipelineWorker:
                         job.id,
                         current.state.value,
                     )
-                # Keeping the durable state lets the next worker invocation
-                # replay the stage or reuse a marker completed at the boundary;
-                # an API cancellation has already committed CANCELLED itself.
+                # Keeping the pipeline stage lets a resumed invocation reuse
+                # completed checkpoints and replay only the interrupted unit.
                 return current
             except subprocess.TimeoutExpired as exc:
                 current = self.database.get_job(job.id)
+                controlled = self._acknowledge_operator_control(job.id)
+                if controlled is not None:
+                    self._remove_interrupted_partials(
+                        JobPaths.create(self.settings, job.id)
+                    )
+                    return controlled
                 if self.stop_requested():
                     LOG.info(
                         "job %s stopped during %s without a failure transition",
@@ -2247,6 +2357,9 @@ class PipelineWorker:
                 return self.database.get_job(job.id)
             except (ImageUploadError, OSError) as exc:
                 current = self.database.get_job(job.id)
+                controlled = self._acknowledge_operator_control(job.id)
+                if controlled is not None:
+                    return controlled
                 if self.stop_requested():
                     LOG.info(
                         "job %s stopped during %s without a failure transition",
@@ -2283,6 +2396,12 @@ class PipelineWorker:
                 return self.database.get_job(job.id)
             except Exception as exc:
                 current = self.database.get_job(job.id)
+                controlled = self._acknowledge_operator_control(job.id)
+                if controlled is not None:
+                    self._remove_interrupted_partials(
+                        JobPaths.create(self.settings, job.id)
+                    )
+                    return controlled
                 if self.stop_requested():
                     LOG.info(
                         "job %s stopped during %s without a failure transition",
@@ -2341,7 +2460,10 @@ class PipelineWorker:
                     for root in self.settings.source_roots
                     if source == root or source.is_relative_to(root)
                 )
-                scanner = BluRayScanner(source_root=source_root)
+                scanner = BluRayScanner(
+                    source_root=source_root,
+                    runner=self._runner(paths),
+                )
             result = scanner.scan(source, content_kind=_content_kind(job))
             atomic_write_json(paths.scan_json, result.to_dict())
             _write_stage(marker, inputs, [paths.scan_json])
@@ -2935,15 +3057,7 @@ class PipelineWorker:
         }
 
         def interrupted() -> bool:
-            if self.stop_requested():
-                return True
-            try:
-                return self.database.get_job(job.id).state is JobState.CANCELLED
-            except Exception:
-                LOG.exception(
-                    "job %s cancellation polling failed; encode continues", job.id
-                )
-                return False
+            return self._process_interrupt_requested(job.id)
 
         marker = paths.stages / "video-encode.json"
         if not _valid_stage(marker, inputs, [paths.encoded_video]):
@@ -6038,6 +6152,11 @@ class PipelineWorker:
                             )
                         try:
                             for png in pending:
+                                # Never begin a new remote effect after a
+                                # durable operator request.  A request arriving
+                                # inside upload_png is acknowledged only after
+                                # its result/checkpoint is known.
+                                self._stop_at_operator_boundary(job.id)
                                 result = client.upload_png(png)
                                 if result.provider != provider_name:
                                     raise ImageUploadError(
@@ -6067,6 +6186,7 @@ class PipelineWorker:
                                         "images": uploaded,
                                     },
                                 )
+                                self._stop_at_operator_boundary(job.id)
                             finished = True
                             break
                         except ImageUploadError as exc:
@@ -6124,6 +6244,8 @@ class PipelineWorker:
                         "images": uploaded,
                     },
                 )
+            except ProcessInterrupted:
+                raise
             except ImageUploadError:
                 raise
             except Exception as exc:
@@ -6165,6 +6287,7 @@ class PipelineWorker:
             },
             [checkpoint, bbcode],
         )
+        self._stop_at_operator_boundary(job.id)
 
         # Upload adapters are external code and may run for minutes.  Re-open
         # the trust boundary afterwards so a concurrent/local mutation cannot
@@ -6379,29 +6502,45 @@ class PipelineWorker:
         if job.state is not JobState.COMPLETED or not paths.work.exists():
             return
 
-        removed_bytes = 0
+        operation = None
         try:
-            jobs_root = self.settings.jobs_root.resolve(strict=True)
-            job_root = paths.root.resolve(strict=True)
-            if job_root.parent != jobs_root or job_root.name != job.id:
-                raise RuntimeError("completed workspace has an unsafe job root")
-            if paths.work.is_symlink():
-                raise RuntimeError("completed work path must not be a symlink")
-            work = paths.work.resolve(strict=True)
-            if work != job_root / "work":
-                raise RuntimeError("completed work path escaped its job root")
-
-            for candidate in work.rglob("*"):
-                try:
-                    if candidate.is_symlink():
-                        removed_bytes += candidate.lstat().st_size
-                    elif candidate.is_file():
-                        removed_bytes += candidate.stat().st_size
-                except OSError:
-                    # Size is diagnostic only; deletion remains authoritative.
-                    pass
-            shutil.rmtree(work)
+            operation = self.maintenance.begin(
+                "completed-workspace-cleanup",
+                job.id,
+                [
+                    MaintenanceTargetSpec(
+                        paths.work,
+                        paths.root,
+                        "completed temporary work directory",
+                    )
+                ],
+                guard=MaintenanceDomainGuard(
+                    job_id=job.id,
+                    expected_job_version=job.version,
+                    allowed_job_states=(JobState.COMPLETED.value,),
+                ),
+            )
+            removed_bytes = int(operation.targets[0]["bytes_moved"])
+            self.maintenance.stage(operation.id)
+            self.database.record_completed_cleanup(
+                job.id,
+                expected_version=job.version,
+                cleanup=None,
+                payload={"bytes_removed": removed_bytes},
+                maintenance_operation_id=operation.id,
+            )
+            self.maintenance.finalize(operation.id)
         except (OSError, RuntimeError) as exc:
+            if operation is not None:
+                try:
+                    current = self.maintenance.operation(operation.id)
+                    if current.phase in {
+                        MaintenancePhase.INTENT,
+                        MaintenancePhase.DETACHED,
+                    }:
+                        self.maintenance.rollback(operation.id)
+                except Exception:
+                    LOG.exception("completed job %s workspace rollback failed", job.id)
             LOG.warning("completed job %s workspace cleanup failed: %s", job.id, exc)
             try:
                 self.database.add_event(
@@ -6415,18 +6554,6 @@ class PipelineWorker:
             except Exception:
                 LOG.exception("job %s cleanup warning could not be recorded", job.id)
             return
-
-        try:
-            self.database.add_event(
-                EventCreate(
-                    job_id=job.id,
-                    kind="job.workspace-cleaned",
-                    message="temporary encode work files removed after completion",
-                    payload={"bytes_removed": removed_bytes},
-                )
-            )
-        except Exception:
-            LOG.exception("job %s cleanup event could not be recorded", job.id)
 
     def _write_manifest(
         self,

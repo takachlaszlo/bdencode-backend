@@ -7,14 +7,21 @@ import type {
   Job,
   JobCreate,
   JobList,
+  JobStorageReport,
   JobState,
   ProfileRecommendationResponse,
   ProfileSchemaResponse,
+  ReleaseMetadataPayload,
+  ReleasePreparation,
+  ReleasePreparationList,
+  ReleaseProfileList,
+  ReleaseValidationResult,
   RuntimeCapabilitiesResponse,
   ScanList,
   SelectionPayload,
   SelectionValidation,
   SourceBrowserResponse,
+  TrackerReleaseProfile,
 } from "./types";
 
 const base = import.meta.env.BASE_URL.endsWith("/")
@@ -37,6 +44,33 @@ export class ApiError extends Error {
   }
 }
 
+async function responseError(response: Response): Promise<ApiError> {
+  const raw = await response.text();
+  let payload: unknown = raw || null;
+  let detail = `A kérés sikertelen (${response.status})`;
+  if (raw) {
+    try {
+      payload = JSON.parse(raw) as unknown;
+    } catch {
+      detail = raw;
+    }
+  }
+  if (payload && typeof payload === "object" && "detail" in payload) {
+    const apiDetail = payload.detail;
+    if (typeof apiDetail === "string") {
+      detail = apiDetail;
+    } else if (Array.isArray(apiDetail)) {
+      const messages = apiDetail.flatMap((item) =>
+        item && typeof item === "object" && "msg" in item && typeof item.msg === "string"
+          ? [item.msg]
+          : [],
+      );
+      if (messages.length) detail = messages.join("; ");
+    }
+  }
+  return new ApiError(response.status, detail, payload);
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_ROOT}${path}`, {
     ...init,
@@ -48,35 +82,34 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     credentials: "same-origin",
   });
 
-  if (!response.ok) {
-    const raw = await response.text();
-    let payload: unknown = raw || null;
-    let detail = `A kérés sikertelen (${response.status})`;
-    if (raw) {
-      try {
-        payload = JSON.parse(raw) as unknown;
-      } catch {
-        detail = raw;
-      }
-    }
-    if (payload && typeof payload === "object" && "detail" in payload) {
-      const apiDetail = payload.detail;
-      if (typeof apiDetail === "string") {
-        detail = apiDetail;
-      } else if (Array.isArray(apiDetail)) {
-        const messages = apiDetail.flatMap((item) =>
-          item && typeof item === "object" && "msg" in item && typeof item.msg === "string"
-            ? [item.msg]
-            : [],
-        );
-        if (messages.length) detail = messages.join("; ");
-      }
-    }
-    throw new ApiError(response.status, detail, payload);
-  }
+  if (!response.ok) throw await responseError(response);
 
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+export interface DownloadedFile {
+  blob: Blob;
+  filename: string;
+}
+
+async function apiDownload(path: string, init: RequestInit): Promise<DownloadedFile> {
+  const response = await fetch(`${API_ROOT}${path}`, {
+    ...init,
+    headers: {
+      Accept: "application/x-bittorrent, application/octet-stream",
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...init.headers,
+    },
+    credentials: "same-origin",
+  });
+  if (!response.ok) throw await responseError(response);
+  const disposition = response.headers.get("Content-Disposition") ?? "";
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1];
+  const plain = /filename="?([^";]+)"?/i.exec(disposition)?.[1];
+  let filename = encoded ? decodeURIComponent(encoded) : plain ?? "release.torrent";
+  filename = filename.replace(/[\\/\x00-\x1f\x7f]/g, "_").trim() || "release.torrent";
+  return { blob: await response.blob(), filename };
 }
 
 export const api = {
@@ -98,6 +131,21 @@ export const api = {
     apiFetch<Job>("/jobs", { method: "POST", body: JSON.stringify(request) }),
   cancelJob: (id: string) =>
     apiFetch<Job>(`/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  pauseJob: (id: string, expectedControlRevision?: number) =>
+    apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/pause`, {
+      method: "POST",
+      body: JSON.stringify(expectedControlRevision == null ? {} : { expected_control_revision: expectedControlRevision }),
+    }),
+  continueJob: (id: string, expectedControlRevision?: number) =>
+    apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/continue`, {
+      method: "POST",
+      body: JSON.stringify(expectedControlRevision == null ? {} : { expected_control_revision: expectedControlRevision }),
+    }),
+  requestCancelJob: (id: string, expectedControlRevision?: number) =>
+    apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      body: JSON.stringify(expectedControlRevision == null ? {} : { expected_control_revision: expectedControlRevision }),
+    }),
   retryJob: (id: string, expectedVersion: number) =>
     apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/retry`, {
       method: "POST",
@@ -110,13 +158,88 @@ export const api = {
     }),
   purgeJob: (id: string, expectedVersion: number) =>
     apiFetch<void>(
-      `/jobs/${encodeURIComponent(id)}/purge?expected_version=${expectedVersion}`,
+      `/jobs/${encodeURIComponent(id)}/purge?expected_version=${expectedVersion}&preserve_release=true`,
       { method: "DELETE" },
     ),
+  jobStorage: (id: string) =>
+    apiFetch<JobStorageReport>(`/jobs/${encodeURIComponent(id)}/storage`),
+  cleanupJob: (id: string, expectedVersion: number) =>
+    apiFetch<unknown>(`/jobs/${encodeURIComponent(id)}/cleanup`, {
+      method: "POST",
+      body: JSON.stringify({ scope: "temporary", expected_version: expectedVersion }),
+    }),
+  deleteJobRelease: (
+    id: string,
+    request: {
+      confirmation: string;
+      expected_sha256: string;
+      force_if_seeded: boolean;
+      preparation_versions: Record<string, number>;
+    },
+  ) => apiFetch<void>(`/jobs/${encodeURIComponent(id)}/release`, { method: "DELETE", body: JSON.stringify(request) }),
   resumeJob: (id: string) =>
     apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/resume`, { method: "POST" }),
   retryUpload: (id: string) =>
     apiFetch<Job>(`/jobs/${encodeURIComponent(id)}/retry-upload`, { method: "POST" }),
+  releaseProfiles: () =>
+    apiFetch<ReleaseProfileList | TrackerReleaseProfile[]>("/release-profiles"),
+  releasePreparations: (jobId: string) =>
+    apiFetch<ReleasePreparationList | ReleasePreparation[]>(
+      `/jobs/${encodeURIComponent(jobId)}/release-preparations`,
+    ),
+  createReleasePreparation: (
+    jobId: string,
+    request: { profile_id: string; metadata: ReleaseMetadataPayload },
+  ) =>
+    apiFetch<ReleasePreparation>(
+      `/jobs/${encodeURIComponent(jobId)}/release-preparations`,
+      { method: "POST", body: JSON.stringify(request) },
+    ),
+  releasePreparation: (preparationId: string) =>
+    apiFetch<ReleasePreparation>(
+      `/release-preparations/${encodeURIComponent(preparationId)}`,
+    ),
+  releasePreparationAction: (
+    preparationId: string,
+    action: "build" | "dupe-check" | "seed",
+    expectedVersion: number,
+  ) =>
+    apiFetch<ReleasePreparation>(
+      `/release-preparations/${encodeURIComponent(preparationId)}/${action}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ expected_version: expectedVersion }),
+      },
+    ),
+  validateReleasePreparation: (preparationId: string, expectedVersion: number) =>
+    apiFetch<ReleaseValidationResult>(
+      `/release-preparations/${encodeURIComponent(preparationId)}/validate`,
+      {
+        method: "POST",
+        body: JSON.stringify({ expected_version: expectedVersion }),
+      },
+    ),
+  exportReleasePreparation: (preparationId: string, expectedVersion: number) =>
+    apiDownload(`/release-preparations/${encodeURIComponent(preparationId)}/export`, {
+      method: "POST",
+      body: JSON.stringify({ expected_version: expectedVersion }),
+    }),
+  uploadReleasePreparation: (
+    preparationId: string,
+    request: { expected_version: number; manifest_sha256: string },
+  ) => apiFetch<ReleasePreparation>(
+    `/release-preparations/${encodeURIComponent(preparationId)}/upload`,
+    {
+      method: "POST",
+      headers: { "X-BDEncode-Manifest": request.manifest_sha256 },
+      body: JSON.stringify(request),
+    },
+  ),
+  deleteReleasePreparation: (preparationId: string, expectedVersion: number) =>
+    apiFetch<void>(
+      `/release-preparations/${encodeURIComponent(preparationId)}?expected_version=${expectedVersion}`,
+      { method: "DELETE" },
+    ),
   scans: (jobId: string) =>
     apiFetch<ScanList>(`/scans?job_id=${encodeURIComponent(jobId)}`),
   artifacts: (jobId: string) =>

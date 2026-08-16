@@ -52,8 +52,92 @@ class JobQueue:
             expected_version=expected_version,
         )
 
-    def cancel(self, job_id: str, *, message: str = "cancelled") -> Job:
-        return self.advance(job_id, JobState.CANCELLED, message=message)
+    def cancel(
+        self,
+        job_id: str,
+        *,
+        message: str = "cancellation requested",
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        # Historical API name retained; active work now uses request/ack
+        # semantics and therefore does not claim CANCELLED prematurely.
+        return self.request_cancel(
+            job_id,
+            message=message,
+            expected_control_revision=expected_control_revision,
+        )
+
+    def request_pause(
+        self,
+        job_id: str,
+        *,
+        message: str = "pause requested",
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        return self.database.request_pause(
+            job_id,
+            message=message,
+            expected_control_revision=expected_control_revision,
+        )
+
+    def pause(
+        self,
+        job_id: str,
+        *,
+        message: str = "pause requested",
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        return self.request_pause(
+            job_id,
+            message=message,
+            expected_control_revision=expected_control_revision,
+        )
+
+    def request_cancel(
+        self,
+        job_id: str,
+        *,
+        message: str = "cancellation requested",
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        return self.database.request_cancel(
+            job_id,
+            message=message,
+            expected_control_revision=expected_control_revision,
+        )
+
+    def resume(
+        self,
+        job_id: str,
+        *,
+        message: str = "resumed",
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        return self.database.resume_paused_job(
+            job_id,
+            message=message,
+            expected_control_revision=expected_control_revision,
+        )
+
+    def acknowledge_pause(
+        self,
+        job_id: str,
+        *,
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        return self.database.acknowledge_pause(
+            job_id, expected_control_revision=expected_control_revision
+        )
+
+    def acknowledge_cancel(
+        self,
+        job_id: str,
+        *,
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        return self.database.acknowledge_cancel(
+            job_id, expected_control_revision=expected_control_revision
+        )
 
     def fail(
         self,

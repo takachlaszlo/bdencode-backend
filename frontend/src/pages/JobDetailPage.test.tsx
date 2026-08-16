@@ -18,9 +18,16 @@ vi.mock("../api/client", async (importOriginal) => {
       artifacts: vi.fn(),
       events: vi.fn(),
       cancelJob: vi.fn(),
+      pauseJob: vi.fn(),
+      continueJob: vi.fn(),
+      requestCancelJob: vi.fn(),
       retryJob: vi.fn(),
       restartJob: vi.fn(),
       purgeJob: vi.fn(),
+      jobStorage: vi.fn(),
+      cleanupJob: vi.fn(),
+      deleteJobRelease: vi.fn(),
+      releasePreparations: vi.fn(),
       retryUpload: vi.fn(),
       resumeJob: vi.fn(),
     },
@@ -60,6 +67,8 @@ describe("JobDetailPage failed-job retry", () => {
     vi.mocked(api.scans).mockResolvedValue({ items: [], meta: { limit: 100, offset: 0, count: 0 } });
     vi.mocked(api.artifacts).mockResolvedValue({ items: [], meta: { limit: 500, offset: 0, count: 0 } });
     vi.mocked(api.events).mockResolvedValue({ items: [], after_id: 0 });
+    vi.mocked(api.jobStorage).mockResolvedValue({ workspace_bytes: 1024, reclaimable_bytes: 512, completed_release_bytes: 0, categories: [] });
+    vi.mocked(api.releasePreparations).mockResolvedValue([]);
   });
 
   it("confirms retry, reuses checkpoints and refreshes the job navigation state", async () => {
@@ -73,7 +82,8 @@ describe("JobDetailPage failed-job retry", () => {
     expect(screen.getByText("A munkafájlok a biztonságos folytatáshoz megmaradtak")).toBeInTheDocument();
     expect(screen.getByText(/A takarítás szándékosan vár/)).toBeInTheDocument();
 
-    await user.click(await screen.findByRole("button", { name: "Folytatás a hibától" }));
+    await user.click(await screen.findByText("Műveletek"));
+    await user.click(screen.getByRole("button", { name: "Folytatás a hibától" }));
 
     const dialog = screen.getByRole("dialog", { name: "Folytatod a hibától?" });
     expect(within(dialog).getByText("A kész munka nem vész el")).toBeInTheDocument();
@@ -102,7 +112,8 @@ describe("JobDetailPage failed-job retry", () => {
     );
     renderFailedJob();
 
-    await user.click(await screen.findByRole("button", { name: "Folytatás a hibától" }));
+    await user.click(await screen.findByText("Műveletek"));
+    await user.click(screen.getByRole("button", { name: "Folytatás a hibától" }));
     const dialog = screen.getByRole("dialog", { name: "Folytatod a hibától?" });
     await user.click(within(dialog).getByRole("button", { name: "Folytatás a hibától" }));
 
@@ -147,7 +158,8 @@ describe("JobDetailPage failed-job retry", () => {
     vi.mocked(api.purgeJob).mockResolvedValue(undefined);
     const first = renderFailedJob();
 
-    await user.click(await screen.findByRole("button", { name: "Újraindítás" }));
+    await user.click(await screen.findByText("Műveletek"));
+    await user.click(screen.getByRole("button", { name: "Újraindítás" }));
     const restartDialog = screen.getByRole("dialog", { name: "Újraindítod a megszakított munkát?" });
     expect(within(restartDialog).getByText("A korábbi beállítások megmaradnak")).toBeInTheDocument();
     await user.click(within(restartDialog).getByRole("button", { name: "Újraindítás" }));
@@ -156,9 +168,11 @@ describe("JobDetailPage failed-job retry", () => {
 
     vi.mocked(api.job).mockResolvedValue(cancelled);
     const second = renderFailedJob();
-    await user.click(await screen.findByRole("button", { name: "Munka törlése" }));
+    await user.click(await screen.findByText("Műveletek"));
+    await user.click(screen.getByRole("button", { name: "Munka törlése" }));
     const purgeDialog = screen.getByRole("dialog", { name: "Végleg törlöd ezt a munkát?" });
-    expect(within(purgeDialog).getByText(/A forráslemezhez és a completed mappához/)).toBeInTheDocument();
+    expect(within(purgeDialog).getByText(/completed release-hez a rendszer nem nyúl/)).toBeInTheDocument();
+    await user.type(within(purgeDialog).getByRole("textbox"), cancelled.name);
     await user.click(within(purgeDialog).getByRole("button", { name: "Munka végleges törlése" }));
     await waitFor(() => expect(api.purgeJob).toHaveBeenCalledWith("job-1", 6));
     second.unmount();
@@ -210,5 +224,102 @@ describe("JobDetailPage failed-job retry", () => {
 
     await waitFor(() => expect(api.resumeJob).toHaveBeenCalledWith("job-1"));
     expect(await screen.findByText("A munka folytatása elindult")).toBeInTheDocument();
+  });
+
+  it("pins a durable pause request to the current control revision", async () => {
+    const user = userEvent.setup();
+    const running = {
+      ...makeJob({ state: "ENCODING", progress: 0.34 }),
+      control_state: "RUNNING" as const,
+      control_revision: 4,
+      allowed_operations: ["pause", "cancel"],
+    };
+    const pauseRequested = {
+      ...running,
+      control_state: "PAUSE_REQUESTED" as const,
+      control_revision: 5,
+      control_requested_at: "2026-08-16T12:00:00Z",
+      allowed_operations: ["cancel"],
+    };
+    vi.mocked(api.job).mockResolvedValueOnce(running).mockResolvedValue(pauseRequested);
+    vi.mocked(api.pauseJob).mockResolvedValue(pauseRequested);
+    renderFailedJob();
+
+    await user.click(await screen.findByRole("button", { name: "Szüneteltetés" }));
+
+    await waitFor(() => expect(api.pauseJob).toHaveBeenCalledWith("job-1", 4));
+    expect(await screen.findByText("A szüneteltetés kérése rögzítve")).toBeInTheDocument();
+  });
+
+  it("keeps completed cleanup and seeded release deletion as separate guarded actions", async () => {
+    const user = userEvent.setup();
+    const completed = {
+      ...makeJob({
+        state: "COMPLETED",
+        output_path: "/completed/Release.Name/Release.Name.mkv",
+        selection: { output_name: "Release.Name" },
+        version: 8,
+      }),
+      allowed_operations: ["cleanup", "delete", "prepare_release", "delete_release"],
+    };
+    const outputSha = "a".repeat(64);
+    vi.mocked(api.job).mockResolvedValue(completed);
+    vi.mocked(api.jobStorage).mockResolvedValue({
+      workspace_bytes: 4096,
+      reclaimable_bytes: 2048,
+      completed_release_bytes: 8192,
+      release_present: true,
+      cleanup_allowed: true,
+      categories: [{ name: "work", bytes: 2048, file_count: 3, reclaimable: true, present: true }],
+    });
+    vi.mocked(api.artifacts).mockResolvedValue({
+      items: [{
+        id: "output-1",
+        job_id: "job-1",
+        scan_id: null,
+        kind: "OUTPUT",
+        name: "Release.Name.mkv",
+        path: "/completed/Release.Name/Release.Name.mkv",
+        mime_type: "video/x-matroska",
+        sha256: outputSha,
+        size_bytes: 8192,
+        metadata: {},
+        created_at: "2026-08-16T10:00:00Z",
+      }],
+      meta: { limit: 500, offset: 0, count: 1 },
+    });
+    vi.mocked(api.cleanupJob).mockResolvedValue(undefined);
+    vi.mocked(api.deleteJobRelease).mockResolvedValue(undefined);
+    vi.mocked(api.releasePreparations).mockResolvedValue([
+      { id: "prep-2", job_id: "job-1", state: "READY", version: 12 },
+      { id: "prep-1", job_id: "job-1", state: "FAILED", version: 4 },
+    ]);
+    const { queryClient } = renderFailedJob();
+
+    const storageCard = (await screen.findByRole("heading", { name: "Tárhely és takarítás" })).closest("section");
+    if (!storageCard) throw new Error("A tárhelykártya nem található");
+    await user.click(within(storageCard).getByRole("button", { name: "Ideiglenes fájlok takarítása" }));
+    const cleanupDialog = screen.getByRole("dialog", { name: "Kitakarítod az ideiglenes fájlokat?" });
+    await user.click(within(cleanupDialog).getByRole("button", { name: "Takarítás" }));
+    await waitFor(() => expect(api.cleanupJob).toHaveBeenCalledWith("job-1", 8));
+
+    await user.click(screen.getByText("Műveletek"));
+    await user.click(screen.getByRole("button", { name: "Completed release törlése" }));
+    const releaseDialog = screen.getByRole("dialog", { name: "Végleg törlöd a completed release-t?" });
+    expect(within(releaseDialog).getByText(outputSha)).toBeInTheDocument();
+    expect(within(releaseDialog).getByText('{"prep-1":4,"prep-2":12}')).toBeInTheDocument();
+    queryClient.setQueryData(["release-preparations", "job-1"], [
+      { id: "prep-1", job_id: "job-1", state: "READY", version: 99 },
+    ]);
+    await user.type(within(releaseDialog).getByRole("textbox"), "Release.Name");
+    await user.click(within(releaseDialog).getByRole("checkbox", { name: /Kényszerített törlés külső vagy seedelt eredmény ellenére/ }));
+    await user.click(within(releaseDialog).getByRole("button", { name: "Release végleges törlése" }));
+
+    await waitFor(() => expect(api.deleteJobRelease).toHaveBeenCalledWith("job-1", {
+      confirmation: "Release.Name",
+      expected_sha256: outputSha,
+      force_if_seeded: true,
+      preparation_versions: { "prep-1": 4, "prep-2": 12 },
+    }));
   });
 });
