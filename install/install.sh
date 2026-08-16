@@ -182,7 +182,8 @@ fi
 install -d -m 0750 \
     "$data_root" "$data_root/state" "$data_root/state/backups" \
     "$data_root/state/overrides" "$data_root/jobs" "$data_root/completed" \
-    "$data_root/cache" "$data_root/cache/build" "$data_root/updates" "$app_root/releases" \
+    "$data_root/release-kits" "$data_root/cache" "$data_root/cache/build" \
+    "$data_root/updates" "$app_root/releases" \
     "$app_root/tools/releases"
 assert_path_components_without_symlinks "$credential_directory"
 install -d -m 0700 "$credential_directory"
@@ -380,6 +381,24 @@ sudo systemctl is-active --quiet bdencode-install-recovery.path
 # this installation must preserve. APT oneshots are always allowed to finish.
 recover_stale_update
 
+# Record the live queue database before the transaction starts.  The actual
+# SQLite backup is deliberately delayed until the API and worker are stopped;
+# install_transaction's PREPARED barrier then guarantees that a v1 -> v2
+# migration can be rolled back together with the previous backend pointer.
+database_path="$data_root/state/encoder.sqlite3"
+if sudo test -f /etc/bdencode/config.toml; then
+    configured_database_path="$(sudo python3 -c \
+        'import sys,tomllib; d=tomllib.load(open(sys.argv[1],"rb")); s=d.get("bdencode",d); print(s.get("database_path") or "")' \
+        /etc/bdencode/config.toml)"
+    if [[ -n "$configured_database_path" ]]; then
+        if [[ "$configured_database_path" == /* ]]; then
+            database_path="$configured_database_path"
+        else
+            database_path="$data_root/$configured_database_path"
+        fi
+    fi
+fi
+
 unit_should_run bdencode-api.service && api_was_active=1
 unit_should_run bdencode-worker.service && worker_was_active=1
 unit_should_run bdencode-update.timer && timer_was_active=1
@@ -393,6 +412,7 @@ sudo systemctl is-enabled --quiet apt-daily-upgrade.timer && apt_upgrade_was_ena
 
 sudo /usr/local/libexec/bdencode-install-transaction begin \
     --transaction-id "$release_id" --app-root "$app_root" \
+    --database-path "$database_path" \
     --api-active "$api_was_active" --api-enabled "$api_was_enabled" \
     --worker-active "$worker_was_active" --worker-enabled "$worker_was_enabled" \
     --timer-active "$timer_was_active" --timer-enabled "$timer_was_enabled" \
@@ -495,6 +515,7 @@ env \
     -u BDENCODE_BIND_HOST \
     -u BDENCODE_BIND_PORT \
     -u BDENCODE_API_ROOT_PATH \
+    -u BDENCODE_RELEASE_PROFILES_PATH \
     -u BDENCODE_WORKER_POLL_SECONDS \
     -u BDENCODE_COMPARISON_PAIR_COUNT \
     -u BDENCODE_COMPARISON_FRAMES_PER_TYPE \
@@ -600,8 +621,18 @@ else
         exit 2
     fi
 fi
+sudo python3 "$repo_root/install/config_upgrade.py" \
+    /etc/bdencode/config.toml \
+    --release-profiles-path /etc/bdencode/release-profiles.json
 sudo chown "root:$task_group" /etc/bdencode/config.toml
 sudo chmod 0640 /etc/bdencode/config.toml
+if [[ ! -e /etc/bdencode/release-profiles.json ]]; then
+    sudo install -m 0640 -o root -g "$task_group" \
+        "$repo_root/config/release-profiles.empty.json" \
+        /etc/bdencode/release-profiles.json
+fi
+sudo chown "root:$task_group" /etc/bdencode/release-profiles.json
+sudo chmod 0640 /etc/bdencode/release-profiles.json
 
 render_unit_atomic "$repo_root/deploy/systemd/bdencode-api.service.in" \
     /etc/systemd/system/bdencode-api.service
@@ -614,42 +645,58 @@ atomic_root_install "$repo_root/deploy/systemd/bdencode-update.timer" \
 atomic_root_install "$repo_root/install/daily-update.sh" \
     /usr/local/libexec/bdencode-daily-update 0755
 
-credential_target=/etc/systemd/system/bdencode-worker.service.d/credential.conf
-credential_new="${credential_target}.new-${release_id}"
-credential_count=0
-credential_names=(imgbb-api-key catbox-userhash freeimage-api-key)
-sudo install -d -m 0755 /etc/systemd/system/bdencode-worker.service.d
-printf '[Service]\n' | sudo tee "$credential_new" >/dev/null
-for credential_name in "${credential_names[@]}"; do
-    credential_path="$credential_directory/${credential_name}.cred"
-    if [[ ! -e "$credential_path" && ! -L "$credential_path" ]]; then
-        continue
+render_credential_dropin() {
+    local credential_target="$1"
+    shift
+    local credential_new="${credential_target}.new-${release_id}"
+    local credential_count=0
+    local credential_name credential_path
+    sudo install -d -m 0755 "$(dirname "$credential_target")"
+    printf '[Service]\n' | sudo tee "$credential_new" >/dev/null
+    for credential_name in "$@"; do
+        credential_path="$credential_directory/${credential_name}.cred"
+        if [[ ! -e "$credential_path" && ! -L "$credential_path" ]]; then
+            continue
+        fi
+        if [[ -L "$credential_path" || ! -f "$credential_path" || ! -s "$credential_path" ]]; then
+            echo "Invalid encrypted credential file: $credential_path" >&2
+            exit 2
+        fi
+        if [[ "$(stat -c %u -- "$credential_path")" != "$task_uid" || \
+            "$(stat -c %a -- "$credential_path")" != 600 ]]; then
+            echo "Credential must be owned by $task_user with mode 0600: $credential_path" >&2
+            exit 2
+        fi
+        sudo systemd-creds decrypt \
+            --name="$credential_name" "$credential_path" /dev/null
+        printf 'LoadCredentialEncrypted=%s:%s\n' \
+            "$credential_name" "$credential_path" \
+            | sudo tee -a "$credential_new" >/dev/null
+        credential_count=$((credential_count + 1))
+    done
+    if [[ "$credential_count" -gt 0 ]]; then
+        sudo chmod 0644 "$credential_new"
+        sudo sync -f "$credential_new"
+        sudo mv -Tf "$credential_new" "$credential_target"
+        sudo sync -f "$(dirname "$credential_target")"
+    else
+        sudo rm -f "$credential_new" "$credential_target"
+        sudo sync -f "$(dirname "$credential_target")"
     fi
-    if [[ -L "$credential_path" || ! -f "$credential_path" || ! -s "$credential_path" ]]; then
-        echo "Invalid encrypted credential file: $credential_path" >&2
-        exit 2
-    fi
-    if [[ "$(stat -c %u -- "$credential_path")" != "$task_uid" || \
-        "$(stat -c %a -- "$credential_path")" != 600 ]]; then
-        echo "Credential must be owned by $task_user with mode 0600: $credential_path" >&2
-        exit 2
-    fi
-    sudo systemd-creds decrypt \
-        --name="$credential_name" "$credential_path" /dev/null
-    printf 'LoadCredentialEncrypted=%s:%s\n' \
-        "$credential_name" "$credential_path" \
-        | sudo tee -a "$credential_new" >/dev/null
-    credential_count=$((credential_count + 1))
-done
-if [[ "$credential_count" -gt 0 ]]; then
-    sudo chmod 0644 "$credential_new"
-    sudo sync -f "$credential_new"
-    sudo mv -Tf "$credential_new" "$credential_target"
-    sudo sync -f "$(dirname "$credential_target")"
-else
-    sudo rm -f "$credential_new" "$credential_target"
-    sudo sync -f "$(dirname "$credential_target")"
-fi
+}
+
+worker_credential_names=(imgbb-api-key catbox-userhash freeimage-api-key)
+api_credential_names=(
+    qbittorrent-username
+    qbittorrent-password
+    tracker-aither-api-token
+)
+render_credential_dropin \
+    /etc/systemd/system/bdencode-worker.service.d/credential.conf \
+    "${worker_credential_names[@]}"
+render_credential_dropin \
+    /etc/systemd/system/bdencode-api.service.d/credential.conf \
+    "${api_credential_names[@]}"
 
 sudo systemd-analyze verify \
     /etc/systemd/system/bdencode-api.service \

@@ -7,7 +7,7 @@ param(
     [string]$LinuxUser,
     [string]$WslLocation = (Join-Path $env:LOCALAPPDATA "BDEncodeWSL\Debian"),
     [string]$Repository = "https://github.com/takachlaszlo/bdencode-backend.git",
-    [string]$Branch = "codex/frontend",
+    [string]$Branch = "main",
     [switch]$AllowExistingDistro
 )
 

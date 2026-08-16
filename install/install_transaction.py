@@ -10,13 +10,14 @@ continues restoring the same root-owned snapshot.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -57,6 +58,7 @@ MANAGED_UNITS = APPLICATION_UNITS + APT_TIMER_UNITS
 # retained so they can understand and finish the published journal.
 SYSTEM_TARGETS = (
     Path("/etc/bdencode/config.toml"),
+    Path("/etc/bdencode/release-profiles.json"),
     Path("/etc/bdencode/media-apt.sources.list"),
     Path("/etc/apt/preferences.d/bdencode-media"),
     Path("/etc/systemd/system/bdencode-api.service"),
@@ -64,6 +66,7 @@ SYSTEM_TARGETS = (
     Path("/etc/systemd/system/bdencode-update.service"),
     Path("/etc/systemd/system/bdencode-update.timer"),
     Path("/etc/systemd/system/bdencode-worker.service.d/credential.conf"),
+    Path("/etc/systemd/system/bdencode-api.service.d/credential.conf"),
     Path("/etc/systemd/system/apt-daily.service.d/bdencode-recovery.conf"),
     Path("/etc/systemd/system/apt-daily-upgrade.service.d/bdencode-recovery.conf"),
     Path("/usr/local/libexec/bdencode-daily-update"),
@@ -309,11 +312,68 @@ class InstallTransaction:
         )
         return entry
 
+    @staticmethod
+    def database_path(app_root: Path, path: Path) -> Path:
+        """Return one installer-owned database path below ``data/state``.
+
+        The runtime supports an injectable database path for tests, but the
+        host installer and uninstaller deliberately manage only the database
+        below the deployment's validated state root.  Keeping the rollback
+        target in that same narrow tree makes exact WAL/SHM cleanup possible.
+        """
+
+        if not path.is_absolute():
+            raise InstallTransactionError(
+                f"Installer database path must be absolute: {path}"
+            )
+        resolved_app = InstallTransaction.app_root(app_root)
+        state_candidate = resolved_app.parent / "state"
+        state_details = safe_lstat(state_candidate)
+        if state_details is None or stat.S_ISLNK(
+            state_details.st_mode
+        ) or not stat.S_ISDIR(state_details.st_mode):
+            raise InstallTransactionError(
+                f"Unsafe installer database state root: {state_candidate}"
+            )
+        state_root = state_candidate.resolve(strict=True)
+        if state_root != state_candidate:
+            raise InstallTransactionError(
+                f"Installer database state root contains a symlink: {state_candidate}"
+            )
+        logical = Path(os.path.abspath(os.path.normpath(path)))
+        resolved = path.resolve(strict=False)
+        if logical != resolved:
+            raise InstallTransactionError(
+                f"Installer database path contains a symlinked component: {path}"
+            )
+        if resolved == state_root or not resolved.is_relative_to(state_root):
+            raise InstallTransactionError(
+                f"Installer database must be inside the state root: {resolved}"
+            )
+        current = safe_lstat(resolved)
+        if current is not None and (
+            stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode)
+        ):
+            raise InstallTransactionError(
+                f"Installer database is not a regular non-link file: {resolved}"
+            )
+        parent = resolved.parent
+        if parent.exists():
+            parent_details = safe_lstat(parent)
+            if parent_details is None or stat.S_ISLNK(
+                parent_details.st_mode
+            ) or not stat.S_ISDIR(parent_details.st_mode):
+                raise InstallTransactionError(
+                    f"Unsafe installer database directory: {parent}"
+                )
+        return resolved
+
     def begin(
         self,
         transaction_id: str,
         app_root: Path,
         unit_states: dict[str, dict[str, bool]] | None = None,
+        database_path: Path | None = None,
     ) -> None:
         if self.active_id() is not None or self.pending_services_id() is not None:
             raise InstallTransactionError(
@@ -324,6 +384,11 @@ class InstallTransaction:
             raise InstallTransactionError(f"Installer transaction already exists: {transaction}")
         resolved_app = self.app_root(app_root)
         targets = self.managed_targets(resolved_app)
+        planned_database = (
+            self.database_path(resolved_app, database_path)
+            if database_path is not None
+            else None
+        )
         if unit_states is None:
             unit_states = {
                 unit: {"active": False, "enabled": False}
@@ -345,12 +410,17 @@ class InstallTransaction:
                 for index, target in enumerate(targets)
             ]
             manifest = {
-                "schema": 1,
+                "schema": 2,
                 "transaction_id": transaction_id,
                 "created_at": utc_now(),
                 "app_root": str(resolved_app),
                 "unit_states": unit_states,
                 "targets": entries,
+                "database": (
+                    {"kind": "planned", "path": str(planned_database)}
+                    if planned_database is not None
+                    else None
+                ),
             }
             atomic_write(
                 building / "manifest.json",
@@ -380,7 +450,8 @@ class InstallTransaction:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise InstallTransactionError(f"Invalid installer manifest: {error}") from error
-        if manifest.get("schema") != 1 or manifest.get("transaction_id") != transaction.name:
+        schema = manifest.get("schema")
+        if schema not in {1, 2} or manifest.get("transaction_id") != transaction.name:
             raise InstallTransactionError("Installer manifest identity mismatch")
         app_root = self.app_root(Path(manifest.get("app_root", "")))
         allowed = set(self.managed_targets(app_root))
@@ -412,7 +483,154 @@ class InstallTransaction:
                 raise InstallTransactionError(
                     f"Installer manifest has invalid state for {unit}"
                 )
+        database = manifest.get("database")
+        if schema == 1 and database is not None:
+            raise InstallTransactionError(
+                "Legacy installer manifest may not contain a database snapshot"
+            )
+        if database is not None:
+            if not isinstance(database, dict) or not isinstance(
+                database.get("path"), str
+            ):
+                raise InstallTransactionError(
+                    "Installer manifest has an invalid database snapshot"
+                )
+            database_path = self.database_path(app_root, Path(database["path"]))
+            if str(database_path) != database["path"]:
+                raise InstallTransactionError(
+                    "Installer database snapshot path is not canonical"
+                )
+            kind = database.get("kind")
+            if kind not in {"planned", "absent", "file"}:
+                raise InstallTransactionError(
+                    "Installer manifest has an invalid database snapshot kind"
+                )
+            if kind == "file":
+                required = {
+                    "backup",
+                    "sha256",
+                    "size",
+                    "mode",
+                    "uid",
+                    "gid",
+                    "atime_ns",
+                    "mtime_ns",
+                }
+                if not required.issubset(database):
+                    raise InstallTransactionError(
+                        "Installer database snapshot metadata is incomplete"
+                    )
         return manifest
+
+    @staticmethod
+    def write_manifest(transaction: Path, manifest: dict[str, Any]) -> None:
+        atomic_write(
+            transaction / "manifest.json",
+            (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            ),
+        )
+
+    @staticmethod
+    def sqlite_readonly_uri(path: Path) -> str:
+        return f"{path.resolve(strict=True).as_uri()}?mode=ro&immutable=1"
+
+    @classmethod
+    def verify_sqlite(cls, path: Path) -> int | None:
+        try:
+            with closing(
+                sqlite3.connect(cls.sqlite_readonly_uri(path), uri=True)
+            ) as connection:
+                result = connection.execute("PRAGMA quick_check").fetchall()
+                if result != [("ok",)]:
+                    raise InstallTransactionError(
+                        "Installer database integrity check failed"
+                    )
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'schema_meta'"
+                ).fetchone()
+                if exists is None:
+                    return None
+                row = connection.execute(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+                ).fetchone()
+                return int(row[0]) if row is not None else None
+        except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+            raise InstallTransactionError(
+                "Installer database integrity check failed"
+            ) from error
+
+    def snapshot_database(
+        self, transaction: Path, entry: dict[str, Any]
+    ) -> dict[str, Any]:
+        target = Path(entry["path"])
+        details = safe_lstat(target)
+        sidecars = tuple(Path(f"{target}{suffix}") for suffix in ("-wal", "-shm"))
+        if details is None:
+            if any(safe_lstat(sidecar) is not None for sidecar in sidecars):
+                raise InstallTransactionError(
+                    "Installer database sidecar exists without its main database"
+                )
+            return {"kind": "absent", "path": str(target)}
+        if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+            raise InstallTransactionError(
+                f"Installer database is not a regular non-link file: {target}"
+            )
+
+        relative = Path("files") / "database.sqlite3"
+        backup = transaction / relative
+        backup.parent.mkdir(mode=0o700, exist_ok=True)
+        if safe_lstat(backup) is not None:
+            raise InstallTransactionError(
+                f"Installer database backup already exists: {backup}"
+            )
+        try:
+            with closing(
+                sqlite3.connect(str(target), timeout=30)
+            ) as source, closing(
+                sqlite3.connect(str(backup), timeout=30)
+            ) as destination:
+                source.execute("PRAGMA query_only = ON")
+                source.backup(destination)
+            os.chmod(backup, 0o600)
+            with backup.open("r+b") as stream:
+                os.fsync(stream.fileno())
+            backup_details = backup.stat()
+            schema_version = self.verify_sqlite(backup)
+            after = safe_lstat(target)
+            if (
+                after is None
+                or stat.S_ISLNK(after.st_mode)
+                or not stat.S_ISREG(after.st_mode)
+                or (details.st_dev, details.st_ino)
+                != (after.st_dev, after.st_ino)
+            ):
+                raise InstallTransactionError(
+                    f"Installer database changed identity during backup: {target}"
+                )
+            fsync_directory(backup.parent)
+        except Exception as error:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                Path(f"{backup}{suffix}").unlink(missing_ok=True)
+            if isinstance(error, InstallTransactionError):
+                raise
+            raise InstallTransactionError(
+                "Installer database backup failed"
+            ) from error
+        return {
+            "kind": "file",
+            "path": str(target),
+            "backup": str(relative),
+            "sha256": sha256_file(backup),
+            "size": backup_details.st_size,
+            "mode": stat.S_IMODE(details.st_mode),
+            "uid": details.st_uid,
+            "gid": details.st_gid,
+            "atime_ns": details.st_atime_ns,
+            "mtime_ns": details.st_mtime_ns,
+            "schema_version": schema_version,
+        }
 
     @staticmethod
     def run(
@@ -706,6 +924,23 @@ class InstallTransaction:
         fsync_directory(target.parent)
 
     @staticmethod
+    def remove_database_sidecars(target: Path) -> None:
+        changed = False
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(f"{target}{suffix}")
+            details = safe_lstat(sidecar)
+            if details is None:
+                continue
+            if not (stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode)):
+                raise InstallTransactionError(
+                    f"Refusing unsafe installer database sidecar: {sidecar}"
+                )
+            sidecar.unlink()
+            changed = True
+        if changed:
+            fsync_directory(target.parent)
+
+    @staticmethod
     def restore_file(target: Path, backup: Path, entry: dict[str, Any]) -> None:
         InstallTransaction.prepare_destination(target)
         descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.restore-", dir=target.parent)
@@ -791,6 +1026,37 @@ class InstallTransaction:
             else:
                 self.restore_symlink(target, entry)
             self.verify_restored(target, entry)
+
+    def restore_database(
+        self, transaction: Path, manifest: dict[str, Any]
+    ) -> None:
+        entry = manifest.get("database")
+        if entry is None:
+            return
+        kind = entry["kind"]
+        if kind == "planned":
+            raise InstallTransactionError(
+                "Installer database mutation was not protected by a snapshot"
+            )
+        target = Path(entry["path"])
+        if kind == "absent":
+            self.remove_database_sidecars(target)
+            self.restore_absent(target)
+            return
+        backup = self.validate_backup(transaction, entry)
+        backup_schema = self.verify_sqlite(backup)
+        if backup_schema != entry.get("schema_version"):
+            raise InstallTransactionError(
+                "Installer database backup schema verification failed"
+            )
+        self.remove_database_sidecars(target)
+        self.restore_file(target, backup, entry)
+        self.verify_restored(target, entry)
+        restored_schema = self.verify_sqlite(target)
+        if restored_schema != entry.get("schema_version"):
+            raise InstallTransactionError(
+                "Installer database schema verification failed after recovery"
+            )
 
     def clear_active(self, expected: str) -> None:
         if self.active_id() != expected:
@@ -895,6 +1161,10 @@ class InstallTransaction:
         try:
             self.write_state(transaction, "RESTORING")
             self.stop_runtime()
+            # Restore the old database before publishing the old release
+            # pointer.  The intermediate combination (new backend + old DB) is
+            # forward-migratable; the inverse (old backend + new DB) is not.
+            self.restore_database(transaction, manifest)
             self.restore(transaction, manifest)
             self.restore_unit_enablement(manifest)
         except Exception:
@@ -919,7 +1189,23 @@ class InstallTransaction:
         transaction = self.active_dir()
         if transaction is None or self.state(transaction) != "OBSERVING":
             raise InstallTransactionError("No observing installer transaction")
-        self.load_manifest(transaction)
+        manifest = self.load_manifest(transaction)
+        database = manifest.get("database")
+        if database is not None:
+            if database["kind"] != "planned":
+                raise InstallTransactionError(
+                    "Installer database snapshot was already prepared"
+                )
+            manifest["database"] = self.snapshot_database(
+                transaction, database
+            )
+            self.write_manifest(transaction, manifest)
+            fsync_directory(transaction)
+            manifest = self.load_manifest(transaction)
+            if manifest["database"]["kind"] == "planned":
+                raise InstallTransactionError(
+                    "Installer database snapshot was not published"
+                )
         self.write_state(transaction, "PREPARED")
 
     def commit(self) -> None:
@@ -1002,6 +1288,7 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--transaction-id")
     result.add_argument("--app-root", type=Path)
+    result.add_argument("--database-path", type=Path)
     for name in (
         "api-active",
         "api-enabled",
@@ -1029,8 +1316,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         transaction.initialize()
         if args.command == "begin":
-            if not args.transaction_id or args.app_root is None:
-                raise InstallTransactionError("begin requires --transaction-id and --app-root")
+            if (
+                not args.transaction_id
+                or args.app_root is None
+                or args.database_path is None
+            ):
+                raise InstallTransactionError(
+                    "begin requires --transaction-id, --app-root and --database-path"
+                )
             state_values = {
                 "bdencode-api.service": {
                     "active": require(args.api_active, "--api-active"),
@@ -1053,7 +1346,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "enabled": require(args.apt_upgrade_enabled, "--apt-upgrade-enabled"),
                 },
             }
-            transaction.begin(args.transaction_id, args.app_root, state_values)
+            transaction.begin(
+                args.transaction_id,
+                args.app_root,
+                state_values,
+                database_path=args.database_path,
+            )
         elif args.command == "prepare":
             transaction.prepare_mutation()
         elif args.command == "healthy":

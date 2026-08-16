@@ -8,7 +8,7 @@ Ez a dokumentum szándékosan részletes. Olyan felhasználónak is végigkövet
 > A BDEncode fejlesztés alatt áll. Első használatkor érdemes egy rövidebb vagy kevésbé fontos lemezzel próbát végezni, és az elkészült MKV-t lejátszással is ellenőrizni.
 
 > [!NOTE]
-> A 2.0 új selection-sémát, szigorúbb QC gate-eket és privát/publikus artifact-szétválasztást vezet be. Frissítés előtt olvasd el a [BDEncode 2.0 kiadási jegyzetet](docs/RELEASE_2_0.md).
+> A 2.1 tartós pause/folytatás/cancel vezérlést, tárhely-karbantartást és ellenőrzött torrent/release-előkészítést vezet be. Frissítés előtt olvasd el a [BDEncode 2.1 kiadási jegyzetet](docs/RELEASE_2_1.md). A [2.0 kiadási jegyzet](docs/RELEASE_2_0.md) történeti dokumentumként továbbra is elérhető.
 
 ## Tartalomjegyzék
 
@@ -16,7 +16,7 @@ Ez a dokumentum szándékosan részletes. Olyan felhasználónak is végigkövet
 - [2. Fontos fogalmak](#2-fontos-fogalmak)
 - [3. Telepítés Windows 10/11-re](#3-telepítés-windows-1011-re)
 - [4. Telepítés Debian szerverre](#4-telepítés-debian-szerverre)
-- [5. Képfeltöltő szolgáltatások beállítása](#5-képfeltöltő-szolgáltatások-beállítása)
+- [5. Képfeltöltő és release szolgáltatások beállítása](#5-képfeltöltő-és-release-szolgáltatások-beállítása)
 - [6. A telepítés ellenőrzése](#6-a-telepítés-ellenőrzése)
 - [7. Első kódolás lépésről lépésre](#7-első-kódolás-lépésről-lépésre)
 - [8. A várólista és az állapotok](#8-a-várólista-és-az-állapotok)
@@ -44,8 +44,10 @@ A főbb funkciók:
 - Kezdő, Haladó és Profi beállítási szint;
 - egyszerre egy teljes kódolás, miközben további lemezek előkészíthetők és sorba állíthatók;
 - legfeljebb a gép logikai CPU-kapacitásának beállított hányadát használó worker;
+- tartós pause-kérés, worker-visszaigazolás és biztonságos folytatás a webes felületről;
 - megszakított vagy hibás munka biztonságos folytatása;
 - hibás vagy megszakított munka teljes törlése az ideiglenes fájlokkal együtt;
+- tárhely-előnézet és a befejezett jobok ideiglenes munkaterületének célzott takarítása;
 - teljes dekódolási video QC, valamint codec-, profil-, szín- és HDR10-ellenőrzés;
 - veszteségmentes hangnál PCM-hash, veszteséges hangnál célkodek-, bitráta-, mintavétel-, csatorna- és időzítés-ellenőrzés;
 - alapértelmezetten 24, a címen elosztott, veszteségmentes PNG comparison képpár;
@@ -56,6 +58,7 @@ A főbb funkciók:
 - BBCode készítése;
 - MPLS/CLPI/PMT nyelvi adatok összesítése, ismeretlen hangnál választható CPU-s beszédfelismerési segítség és bizonytalanságnál kézi ellenőrzés;
 - privát nyers és tisztított napló; a publikus MKV nem kap naplót vagy más csatolmányt, a comparison külön sidecar marad;
+- privát v1 torrent, upload kit, dupe check, qBittorrentbe leállítva felvétel és explicit jóváhagyású tracker-feltöltés;
 - napi automatikus alkalmazás- és eszközfrissítés.
 
 A rendszer nem támogatja:
@@ -130,7 +133,7 @@ Ha a Git már telepítve van, nyiss PowerShellt, és futtasd:
 
 ```powershell
 cd C:\
-git clone --branch codex/frontend https://github.com/takachlaszlo/bdencode-backend.git BDEncode
+git clone --branch main https://github.com/takachlaszlo/bdencode-backend.git BDEncode
 cd C:\BDEncode
 ```
 
@@ -246,7 +249,7 @@ sudo apt-get install -y git tmux
 
 ```bash
 cd ~
-git clone --branch codex/frontend https://github.com/takachlaszlo/bdencode-backend.git
+git clone --branch main https://github.com/takachlaszlo/bdencode-backend.git
 cd ~/bdencode-backend
 ```
 
@@ -255,7 +258,7 @@ Ha a mappa már létezik:
 ```bash
 cd ~/bdencode-backend
 git fetch origin
-git switch codex/frontend
+git switch main
 git pull --ff-only
 ```
 
@@ -323,7 +326,7 @@ https://sajat-domain.example/encoder/
 
 A `127.0.0.1:8796` belső API-portot nem kell közvetlenül kitenni az internetre.
 
-## 5. Képfeltöltő szolgáltatások beállítása
+## 5. Képfeltöltő és release szolgáltatások beállítása
 
 A comparison képek feltöltéséhez a rendszer az alábbi szolgáltatókat ismeri:
 
@@ -386,6 +389,51 @@ wsl -d Debian
 ```
 
 Ezután a megjelenő Linux parancssorban használd a fenti Linux-parancsokat.
+
+### 5.3. Trackerprofil és qBittorrent beállítása
+
+A 2.1 release-előkészítése alapértelmezetten ki van kapcsolva: a telepítő egy üres, root által kezelt profilfájlt hoz létre. Az aktív fájl helye:
+
+```text
+/etc/bdencode/release-profiles.json
+```
+
+Kiindulási mintának a repository [release-profiles.example.json](config/release-profiles.example.json) fájlját használd. Másold át az aktív helyre, majd állítsd be a tracker saját adatait. A teljes profilfájlt titokként kezeld: root által olvasható konfiguráció, amely policyt, hálózati beállítást és privát tracker announce URL-t is tartalmazhat:
+
+- stabil `profile_id`, megjelenítési név és torrent `source` token;
+- HTTPS announce URL-ek; a tracker személyes passkeyt tehet az útvonalba vagy a querybe, ezért ezek nem tekinthetők credential nélkülinek;
+- darabméret- és képszám-korlátok;
+- fix, credential nélküli HTTPS dupe-check és publish endpoint, külön host-allowlisttel;
+- opcionális qBittorrent base URL és host-allowlist. Titkosítatlan HTTP csak loopback címen engedélyezett.
+
+API-token, qBittorrent-felhasználónév vagy jelszó soha ne kerüljön a JSON-ba. A dupe/publish API hitelesítési titka és a qBittorrent hitelesítési adatai a 5.2. pontban bemutatott `systemd-creds` eljárással készüljenek. Az alapértelmezett qBittorrent credentialnevek:
+
+```bash
+install_bdencode_secret qbittorrent-username
+install_bdencode_secret qbittorrent-password
+```
+
+A tracker token credentialnevének pontosan egyeznie kell a profil `tracker.credential_name` mezőjével. A telepítő a fix `tracker-aither-api-token` nevet automatikusan átadja az API szolgáltatásnak. Egyedi trackercredentialhoz ne módosítsd a telepítő által kezelt `credential.conf` fájlt, mert frissítéskor felülíródik. Hozz létre külön, üzemeltető által kezelt drop-int:
+
+```ini
+# /etc/systemd/system/bdencode-api.service.d/tracker-local.conf
+[Service]
+LoadCredentialEncrypted=egyedi-tracker-token:/home/FELHASZNALO/.config/bdencode/egyedi-tracker-token.cred
+```
+
+Ezután futtasd a `sudo systemctl daemon-reload` parancsot, indítsd újra a `bdencode-api.service` szolgáltatást, majd ellenőrizd a rendszert a `bdencode doctor --json` paranccsal. A `tracker-local.conf` szándékosan nem telepítő által kezelt fájl; az üzemeltető felelőssége a karbantartása és eltávolítása.
+
+### 5.4. Release-előkészítés biztonsági modellje
+
+A művelet csak sikeresen befejezett, tulajdonosi rekorddal és SHA-256 hashsel kötött MKV-ból indulhat. A torrent privát v1 torrent, és pontosan egy payloadot ír le:
+
+```text
+Release.Name/Release.Name.mkv
+```
+
+A comparisonból csak ellenőrzött, encode-oldali képek kerülnek az upload kitbe. A torrent, MediaInfo, NFO, BBCode, checksumok, upload-kérés és képek az alkalmazás privát `release-kits/<preparation-id>/` területén maradnak; nem kerülnek a publikus completed mappába. Az announce URL miatt a kit és maga a torrent is titkos, root/alkalmazás által védett adat. Exportkor a backend a manifesthez kötött torrentet stabilan, korlátozott méretben memóriába olvassa, újraellenőrzi, és `private, no-store` válaszban adja át; a HTTP-válasz már nem egy később újranyitott fájlra hivatkozik.
+
+A qBittorrent-integráció leállítva adja hozzá a torrentet, majd teljes rechecket kér; a torrentet nem indítja el automatikusan. A backend az ellenőrzött torrent byte-jait és elvárt infohashét adja át, és job–profil–infohash szintű kizárólagos claim akadályozza meg, hogy két párhuzamos preparation ugyanazt a távoli add műveletet kétszer indítsa el. Sikeres felvétel után nincs automatikus seed-retry. Trackerfeltöltéskor a korábbi receipt önmagában nem elég: közvetlenül az upload claim előtt új távoli dupe checknek kell ugyanahhoz a manifesthez kötött `CLEAR` eredményt adnia. Jobonként és trackerprofilonként egyszerre csak egy aktív, sikeres vagy bizonytalan publikálási kimenet lehet. A dupe check, a qBittorrent-felvétel és a publish közvetlenül a távoli kérés előtt újraellenőrzi a trackerprofil digestjét, valamint a completed payload tulajdonosi rekordját, útvonalát, méretét és hashét. Ha egy távoli művelet kimenetele bizonytalan (`UNKNOWN`), a rendszer nem próbálkozik automatikusan újra: előbb a trackerben vagy qBittorrentben kézzel ellenőrizd a tényleges állapotot.
 
 ## 6. A telepítés ellenőrzése
 
@@ -556,19 +604,43 @@ Ezért a helyes munkamenet:
 
 ### Megszakítás, folytatás és törlés
 
-- A **Megszakítás kérése** rendezett leállítást kér. Nem mindig azonnali, mert a futó programnak biztonságosan le kell zárnia a fájlt.
-- A **Folytatás a hibától** a meglevő érvényes checkpointokat használja; a már elkészült hosszú szakaszt nem futtatja újra szükségtelenül.
-- Az **Újraindítás** a megszakított munkát visszateszi a feldolgozásba.
-- A **Munka törlése** eltávolítja az adatbázis-bejegyzést és az adott job teljes ideiglenes munkaterületét.
+- A pipeline `state` mezője mellett külön `control_state` mutatja a kezelői vezérlést: `RUNNING`, `PAUSE_REQUESTED`, `PAUSED` vagy `CANCEL_REQUESTED`.
+- A **Szüneteltetés** először tartós `PAUSE_REQUESTED` kérést ír az adatbázisba. A worker leállítja az adott szakasz folyamatait, biztonságosan eltávolítja a részleges kimenetet, és csak ezután igazolja vissza a `PAUSED` állapotot. Emiatt a gomb hatása nem feltétlenül azonnali, és a félbehagyott lépés folytatáskor újrafuthat.
+- Csak a visszaigazolt `PAUSED` job engedi el a scan- vagy encode-sávját. Másik job ekkor sorra kerülhet; ezért a **Folytatás** `409` ütközést adhat, amíg a szükséges sáv foglalt.
+- A **Folytatás** a meglévő pipeline-állapotot és az érvényes checkpointokat tartja meg. Ez nem azonos a `NEEDS_REVIEW` állapot jóváhagyásával vagy a `FAILED` job újrapróbálásával.
+- A **Megszakítás** aktív folyamatnál `CANCEL_REQUESTED`, majd worker-visszaigazolás után `CANCELLED`. Már tétlen vagy szünetelő jobnál a lezárás azonnal, egy tranzakcióban megtörténhet.
+- A **Folytatás a hibától** a meglevő érvényes checkpointokat használja; az **Újraindítás** a `CANCELLED` munkát teszi vissza a feldolgozásba.
+- A `control_revision` és a job `version` optimista zárolása megakadályozza, hogy két megnyitott böngészőablak elavult gombnyomása felülírja egymást.
+
+### Tárhely-előnézet, takarítás és törlés
+
+A job tárhelynézete külön mutatja a privát munkaterületet és a publikus completed release-t. A **Takarítás** csak `COMPLETED` jobon, `temporary` scope-pal használható: a nagy ideiglenes `work` tartalmat karanténon keresztül törli, de az elkészült MKV-t és a publikus comparison bizonyítékokat megőrzi. A leválasztás szándéka és pontos célpontjai előbb SQLite maintenance journalba kerülnek; a fájlrendszer-mozgatás és a domain-adatbázis commit közötti processzhalál után az induláskori recovery determinisztikusan visszaállítja a nem commitolt, illetve végleg eltávolítja a commitolt karantént.
+
+A **Munka törlése** csak terminális (`COMPLETED`, `FAILED` vagy `CANCELLED`) jobnál engedélyezett. Eltávolítja a job adatbázis-bejegyzését, privát munkaterületét és olyan release-előkészítési kitjeit, amelyekhez nem tartozik külső kimenetel, de a completed release-t mindig megőrzi. `UNKNOWN`, `PUBLISHED`, sikeres/bizonytalan qBittorrent-receipt vagy publication receipt auditrekordja nem törölhető egyszerű preparation- vagy jobtörléssel.
+
+A publikus release törlése külön, erős megerősítést kérő művelet: a release nevének és az MKV SHA-256 hashének egyeznie kell, továbbá a kliensnek az összes preparation azonosítóját és aktuális verzióját tartalmazó pontos snapshotot is vissza kell küldenie. A backend ugyanabban az adatbázis-tranzakcióban újraellenőrzi ezt a halmazt, mielőtt a release-t és a kapcsolódó auditrekordokat leválasztja. Már seedelt vagy `UNKNOWN` kimenetel esetén külön force jóváhagyás szükséges.
 
 > [!WARNING]
-> A **Munka törlése** nem visszavonható. Csak a kiválasztott job munkaterületét törli; az eredeti Blu-ray forrást nem.
+> A job és a release törlése nem visszavonható. Egyik sem módosítja az eredeti Blu-ray forrást; a completed release-t kizárólag a külön **Release törlése** művelet távolíthatja el.
+
+### Torrent és feltöltési csomag készítése
+
+`COMPLETED` jobon a **Release előkészítése** panelen válassz trackerprofilt, töltsd ki a release metaadatait, majd haladj az alábbi ellenőrzött lépéseken:
+
+1. **Validate** – újraellenőrzi az MKV tulajdonosi rekordját, útvonalát, méretét, hashét, a profil digestjét és a comparison képeket.
+2. **Build** – elkészíti a privát torrentet és a hash-manifesttel rögzített upload kitet.
+3. **Export** – stabilan memóriába olvasott és a manifest/torrent policy szerint újraellenőrzött torrentet tölt le, böngésző- vagy proxycache nélkül.
+4. **Dupe check** – a konfigurált tracker fix endpointján ellenőriz; csak `CLEAR` eredmény enged tovább.
+5. **Seed** – opcionálisan leállítva hozzáadja qBittorrenthez és teljes rechecket kér. Az indítás továbbra is kézi döntés; a globális claim az ugyanahhoz a torrenthez tartozó párhuzamos addot is kizárja.
+6. **Upload** – új, publikálásidejű `CLEAR` dupe check után, az aktuális manifest hashéhez kötött és a reverse proxy hitelesített felhasználóazonosságával auditált explicit jóváhagyással publikál.
+
+A release-előkészítés saját tartós állapotgépet és verziót használ; böngészőfrissítés nem veszíti el a receipt-eket. Szolgáltatásindításkor a félbemaradt `PREPARING` művelet `FAILED` lesz és az árva build-staging kitakarítható, míg a félbemaradt `SEEDING_CHECK`, `SEEDING` vagy `PUBLISHING` művelet `UNKNOWN` állapotba kerül. Ezeket a hálózati műveleteket a rendszer nem ismétli meg automatikusan. `NEEDS_REVIEW`, `FAILED` vagy különösen `UNKNOWN` esetén ne ismételd vakon a távoli műveletet: előbb ellenőrizd a tracker/qBittorrent valós állapotát.
 
 ## 9. Naplók, elemzések és comparison
 
 ### 9.1. Mi marad meg?
 
-Sikeres véglegesítés után a nagy ideiglenes `work` tartalom automatikusan törlődik. A publikus `completed/<release>/` csomagban megmaradnak:
+A nagy ideiglenes `work` tartalom sikeres véglegesítés után eltávolítható; ha megmaradt, a tárhelynézetből célzottan takarítható. A publikus `completed/<release>/` csomagban megmaradnak:
 
 - az elkészült MKV;
 - a comparison PNG-k, metrikák és BBCode;
@@ -577,7 +649,7 @@ Sikeres véglegesítés után a nagy ideiglenes `work` tartalom automatikusan t�
 
 A teljes munkanapló, a szakaszonkénti naplók, az alkalmazott x264/x265 és mux beállítások, a MediaInfo/MKV elemzés, a manifest és a részletes QC eredmények a privát job-munkatérben és az alkalmazás artifact-tárában maradnak. Nem kerülnek az MKV-ba vagy a publikus release-mappába.
 
-Hibánál a szükséges munkafájlok szándékosan megmaradnak, hogy a job folytatható legyen. Ha nem akarod folytatni, használd a webes **Munka törlése** műveletet.
+Hibánál a szükséges munkafájlok szándékosan megmaradnak, hogy a job folytatható legyen. Ha nem akarod folytatni, előbb szakítsd meg vagy zárd le a jobot, majd használd a webes **Munka törlése** műveletet. Ez a completed release-t nem törli.
 
 ### 9.2. Videó comparison
 
@@ -643,7 +715,7 @@ Kilépés az élő nézetből: `Ctrl+C`.
 
 | Jelenség vagy üzenet | Mit jelent? | Javítás |
 |---|---|---|
-| A telepítőablak rögtön bezáródik | Régi telepítő vagy korai PowerShell-hiba | Töltsd le a legfrissebb `codex/frontend` ágat, csomagold ki teljesen, majd futtasd a `windows-install.cmd` fájlt rendszergazdaként. Az új telepítő hiba esetén Enterre vár. |
+| A telepítőablak rögtön bezáródik | Régi telepítő vagy korai PowerShell-hiba | Töltsd le a legfrissebb `main` ágat, csomagold ki teljesen, majd futtasd a `windows-install.cmd` fájlt rendszergazdaként. Az új telepítő hiba esetén Enterre vár. |
 | „A Linuxos Windows-alrendszer nincs telepítve” | A WSL még nincs engedélyezve | Hagyd, hogy a telepítő bekapcsolja, majd indítsd újra a gépet és futtasd újra. |
 | `WSL_E_VM_MODE_INVALID_STATE` | A Debian már létrejött, de a WSL2 konverzió még nem fejeződött be | Indítsd újra a Windowst, majd a friss telepítőt. A jelenlegi telepítő helyreállítja a félkész állapotot. |
 | `invalid option name: pipefail` | Windows CRLF sorvég került a Bash szkriptbe | Régi telepítőhiba; frissítsd a repót és futtasd újra. A jelenlegi telepítő normalizálja a sorvégeket. |
@@ -741,12 +813,14 @@ A futási idő naponta változhat, mert a rendszer terheléselosztás céljábó
 ```bash
 cd ~/bdencode-backend
 git fetch origin
-git switch codex/frontend
+git switch main
 git pull --ff-only
 bash install/install.sh
 ```
 
 Windows alatt a repót Windowsból is frissítheted, majd újrafuttathatod a `windows-install.cmd` fájlt. A telepítő frissítésként kezeli a már létező környezetet; nem kell előtte eltávolítani.
+
+A Windows-telepítő és a kézi frissítési példa egyaránt a `main` ágat használja. A Linux installer a sémamigráció előtt, leállított API és worker mellett a SQLite backup API-val konzisztens, root-only adatbázismentést készít és annak digestjét a telepítési tranzakcióhoz köti. Ha a candidate health/doctor ellenőrzése megbukik, vagy a telepítés a tartós `HEALTHY` döntés előtt megszakad, a rollback előbb ezt az adatbázismentést állítja vissza és ellenőrzi, utána állítja vissza az előző alkalmazáspointert és konfigurációt, és csak ezután indíthatja újra a régi szolgáltatásokat. A már tartós `HEALTHY` állapot utáni megszakítást a recovery a validált candidate commitjának finalizálásával zárja le, nem rollbackkel. Így a régi backend nem kap nála újabb adatbázissémát; sikertelen vagy nem bizonyítható schema-safe visszaállításnál a szolgáltatások blokkolva maradnak kézi helyreállításig.
 
 ## 12. Eltávolítás Linux vagy szerver esetén
 
@@ -818,12 +892,14 @@ A `--data-root` és `--confirm-data-root` értékének pontosan egyeznie kell. E
 
 ### 12.5. Credentialök törlése
 
-Mindhárom képfeltöltő titkosított credentialjének törlése:
+A hat, telepítő által ismert fix titkosított credential törlése:
 
 ```bash
 cd ~/bdencode-backend
 bash install/uninstall.sh --purge-credentials
 ```
+
+A kapcsoló pontosan az `imgbb-api-key`, `catbox-userhash`, `freeimage-api-key`, `qbittorrent-username`, `qbittorrent-password` és `tracker-aither-api-token` credentialt törli. Egyedi nevű trackercredentialt és az üzemeltető által kezelt `tracker-local.conf` drop-int szándékosan nem távolít el; ezeket szükség esetén külön, kézzel kell törölni.
 
 Alkalmazás, adatok és credentialök együttes eltávolításakor a kapcsolókat egy parancsban add meg.
 
@@ -947,6 +1023,14 @@ A gépszintű konfiguráció helye:
 ```
 
 Módosítás előtt készíts másolatot, és inkább futtasd újra a telepítőt a kívánt környezeti változókkal. Kézi szerkesztésnél egy hibás útvonal vagy jogosultság a workert indulásképtelenné teheti.
+
+A trackerprofilok külön, root által kezelt fájlban vannak:
+
+```text
+/etc/bdencode/release-profiles.json
+```
+
+A fix dupe/publish endpointokat és host-allowlisteket itt, a hozzájuk tartozó API-titkokat kizárólag titkosított systemd credentialként állítsd be. Az announce URL személyes passkeyt tartalmazhat, ezért magát a root-only profilfájlt és az abból készülő torrentet/upload kitet is titokként kezeld. A részletes lépések az [5.3. fejezetben](#53-trackerprofil-és-qbittorrent-beállítása) találhatók.
 
 ### 14.4. Adatbiztonság
 

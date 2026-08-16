@@ -11,9 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from .capabilities import capability_snapshot
-from .config import Settings
+from .config import ConfigurationError, Settings
 from .db import Database
 from .qc.video import COMPARISON_FONT_FILE
+from .release_profiles import (
+    RELEASE_PROFILE_VALIDATION_ERROR,
+    load_release_profiles,
+)
 
 
 MANDATORY_TOOLS = (
@@ -68,10 +72,10 @@ def _data_path_check(settings: Settings) -> dict[str, Any]:
     """Report workspace capacity and the narrow runtime write contract.
 
     The systemd services deliberately see ``data_root`` itself as read-only.
-    Only the state, job, completed-output, cache and update subtrees are made
-    writable.  The UI's workspace status therefore represents those required
-    roots collectively while retaining the root mount's actual write result
-    for diagnostics.
+    Only the state, job, completed-output, release-kit, cache and update
+    subtrees are made writable.  The UI's workspace status therefore
+    represents those required roots collectively while retaining the root
+    mount's actual write result for diagnostics.
     """
 
     root = _path_check(settings.data_root, writable=False)
@@ -79,6 +83,7 @@ def _data_path_check(settings: Settings) -> dict[str, Any]:
         "state": settings.state_root,
         "jobs": settings.jobs_root,
         "completed": settings.completed_root,
+        "release_kits": settings.release_kits_root,
         "cache": settings.cache_root,
         "updates": settings.updates_root,
     }
@@ -91,6 +96,39 @@ def _data_path_check(settings: Settings) -> dict[str, Any]:
     root["ok"] = bool(root["readable"] and runtime_writable)
     root["required_writable_paths"] = required_checks
     return root
+
+
+def _release_profiles_status(settings: Settings) -> dict[str, Any]:
+    path = settings.resolved_release_profiles_path
+    present = os.path.lexists(path)
+    if not present:
+        return {
+            "path": str(path),
+            "present": False,
+            "valid": False,
+            "configured": False,
+            "profile_count": 0,
+            "error_code": "missing",
+        }
+    try:
+        document = load_release_profiles(path)
+    except ConfigurationError as error:
+        return {
+            "path": str(path),
+            "present": True,
+            "valid": False,
+            "configured": False,
+            "profile_count": 0,
+            "error_code": error.code or RELEASE_PROFILE_VALIDATION_ERROR,
+        }
+    return {
+        "path": str(path),
+        "present": True,
+        "valid": True,
+        "configured": bool(document.profiles),
+        "profile_count": len(document.profiles),
+        "error_code": None,
+    }
 
 
 def _credential_status(name: str) -> dict[str, Any]:
@@ -241,6 +279,12 @@ def build_report(
         "catbox": _credential_status("catbox-userhash"),
         "freeimage": _credential_status("freeimage-api-key"),
     }
+    release_credentials = {
+        "qbittorrent_username": _credential_status("qbittorrent-username"),
+        "qbittorrent_password": _credential_status("qbittorrent-password"),
+        "aither_api_token": _credential_status("tracker-aither-api-token"),
+    }
+    release_profiles = _release_profiles_status(settings)
     warnings: list[str] = []
     if not database_available:
         warnings.append("database is not initialized")
@@ -260,6 +304,8 @@ def build_report(
         )
     if not image_upload_credentials["freeimage"]["configured"]:
         warnings.append("Freeimage upload credential is not configured")
+    if release_profiles["present"] and not release_profiles["valid"]:
+        warnings.append("release profile configuration is invalid")
     missing_ffmpeg = {
         "encoders": sorted(MANDATORY_FFMPEG_ENCODERS - set(ffmpeg["encoders"])),
         "filters": sorted(MANDATORY_FFMPEG_FILTERS - set(ffmpeg["filters"])),
@@ -298,6 +344,8 @@ def build_report(
         "comparison_annotation": {"font": comparison_font},
         "vapoursynth": vs,
         "image_upload_credentials": image_upload_credentials,
+        "release_credentials": release_credentials,
+        "release_profiles": release_profiles,
         # Compatibility alias for older frontends and monitoring clients.
         "imgbb_credential": image_upload_credentials["imgbb"],
         "worker_cpu_policy": {

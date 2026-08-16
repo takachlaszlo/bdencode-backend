@@ -43,6 +43,10 @@ class Settings:
     # environment overrides load without becoming unknown configuration.
     comparison_frames_per_type: int = 4
     log_level: str = "INFO"
+    # Release preparation is intentionally stored outside ``completed``.  A
+    # completed directory is a public release tree, while release kits may
+    # contain a private tracker torrent and therefore remain server-side.
+    release_profiles_path: Path | None = None
     config_path: Path | None = None
 
     @property
@@ -64,6 +68,14 @@ class Settings:
     @property
     def updates_root(self) -> Path:
         return self.data_root / "updates"
+
+    @property
+    def release_kits_root(self) -> Path:
+        return self.data_root / "release-kits"
+
+    @property
+    def resolved_release_profiles_path(self) -> Path:
+        return self.release_profiles_path or self.state_root / "release-profiles.json"
 
     @property
     def resolved_database_path(self) -> Path:
@@ -98,6 +110,7 @@ class Settings:
             self.completed_root,
             self.cache_root,
             self.updates_root,
+            self.release_kits_root,
             self.state_root / "overrides",
             self.state_root / "backups",
         ):
@@ -126,7 +139,12 @@ class Settings:
 
 
 def _coerce(name: str, value: Any) -> Any:
-    path_fields = {"data_root", "database_path", "config_path"}
+    path_fields = {
+        "data_root",
+        "database_path",
+        "release_profiles_path",
+        "config_path",
+    }
     if name in path_fields:
         return None if value in (None, "") else Path(value)
     if name == "source_roots":

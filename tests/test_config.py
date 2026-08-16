@@ -66,3 +66,30 @@ def test_legacy_comparison_frames_environment_value_is_still_coerced(
 
     assert settings.comparison_frames_per_type == 3
     assert isinstance(settings.comparison_frames_per_type, int)
+
+
+def test_release_paths_are_private_and_configurable(tmp_path: Path) -> None:
+    configured = tmp_path / "profiles.json"
+    settings = load_settings(
+        tmp_path / "missing.toml",
+        env={
+            "BDENCODE_DATA_ROOT": str(tmp_path / "data"),
+            "BDENCODE_SOURCE_ROOTS": str(tmp_path / "source"),
+            "BDENCODE_RELEASE_PROFILES_PATH": str(configured),
+        },
+    )
+
+    assert settings.release_kits_root == settings.data_root / "release-kits"
+    assert settings.resolved_release_profiles_path == configured
+
+
+def test_create_directories_includes_private_release_kit_root(tmp_path: Path) -> None:
+    settings = Settings(
+        data_root=tmp_path / "data",
+        source_roots=(tmp_path / "source",),
+    ).validate()
+
+    settings.create_directories()
+
+    assert settings.release_kits_root.is_dir()
+    assert settings.release_kits_root.parent == settings.data_root

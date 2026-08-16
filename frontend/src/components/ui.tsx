@@ -146,19 +146,29 @@ export function Modal({
   children,
   footer,
   onClose,
+  busy = false,
+  ariaDescribedBy,
 }: PropsWithChildren<{
   open: boolean;
   title: string;
   footer?: ReactNode;
   onClose: () => void;
+  busy?: boolean;
+  ariaDescribedBy?: string;
 }>) {
   const titleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const onCloseRef = useRef(onClose);
+  const busyRef = useRef(busy);
 
   useEffect(() => {
     onCloseRef.current = onClose;
   }, [onClose]);
+
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
 
   useEffect(() => {
     if (!open) return;
@@ -166,29 +176,85 @@ export function Modal({
       ? document.activeElement
       : null;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCloseRef.current();
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!busyRef.current) onCloseRef.current();
+        return;
+      }
+
+      if (event.key !== "Tab") return;
+
+      const focusableElements = Array.from(dialog.querySelectorAll<HTMLElement>(
+        'a[href], area[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [contenteditable="true"]',
+      )).filter((element) => element.getAttribute("aria-hidden") !== "true");
+
+      if (focusableElements.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+
+      const firstElement = focusableElements[0];
+      const lastElement = focusableElements[focusableElements.length - 1];
+      const activeElement = document.activeElement;
+
+      if (!dialog.contains(activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? lastElement : firstElement).focus();
+      } else if (event.shiftKey && activeElement === firstElement) {
+        event.preventDefault();
+        lastElement.focus();
+      } else if (!event.shiftKey && activeElement === lastElement) {
+        event.preventDefault();
+        firstElement.focus();
+      }
     };
     document.addEventListener("keydown", handleKeyDown);
-    closeButtonRef.current?.focus();
+    if (closeButtonRef.current && !closeButtonRef.current.disabled) {
+      closeButtonRef.current.focus();
+    } else {
+      dialogRef.current?.focus();
+    }
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
-      previouslyFocused?.focus();
+      if (previouslyFocused?.isConnected) previouslyFocused.focus();
     };
   }, [open]);
 
+  const requestClose = () => {
+    if (!busy) onClose();
+  };
+
   if (!open) return null;
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+    <div className="modal-backdrop" role="presentation" onMouseDown={requestClose}>
       <div
+        ref={dialogRef}
         className="modal"
         role="dialog"
+        tabIndex={-1}
         aria-modal="true"
         aria-labelledby={titleId}
+        aria-describedby={ariaDescribedBy}
+        aria-busy={busy || undefined}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="modal__header">
           <h2 id={titleId}>{title}</h2>
-          <button ref={closeButtonRef} type="button" className="icon-button" onClick={onClose} aria-label="Bezárás">×</button>
+          <button
+            ref={closeButtonRef}
+            type="button"
+            className="icon-button"
+            onClick={requestClose}
+            aria-label="Bezárás"
+            disabled={busy}
+          >
+            ×
+          </button>
         </div>
         <div className="modal__body">{children}</div>
         {footer && <div className="modal__footer">{footer}</div>}

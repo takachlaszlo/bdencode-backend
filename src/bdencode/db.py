@@ -11,9 +11,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from .models import (
@@ -26,6 +27,7 @@ from .models import (
     Event,
     EventCreate,
     Job,
+    JobControlState,
     JobCreate,
     JobState,
     Scan,
@@ -37,7 +39,27 @@ from .models import (
 from .progress import pipeline_progress_baseline
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_INITIALIZE_MAX_ATTEMPTS = 8
+_INITIALIZE_BUSY_TIMEOUT_MS = 500
+_INITIALIZE_BACKOFF_INITIAL_SECONDS = 0.01
+_INITIALIZE_BACKOFF_MAX_SECONDS = 0.25
+
+
+# Only these states can have an executing worker operation.  Pausing any other
+# state is acknowledged in the API transaction because no process can still be
+# mutating its workspace.
+CONTROL_ACTIVE_STATES = frozenset(
+    {
+        JobState.SCANNING,
+        JobState.ENCODING,
+        JobState.MUXING,
+        JobState.QC,
+        JobState.COMPARISON,
+        JobState.UPLOADING,
+    }
+)
 
 
 class PersistenceError(RuntimeError):
@@ -80,6 +102,24 @@ def _json_load(value: str | None, default: Any) -> Any:
     return json.loads(value)
 
 
+def _is_sqlite_busy(error: sqlite3.OperationalError) -> bool:
+    message = str(error).casefold()
+    return "busy" in message or "locked" in message
+
+
+def _execute_sql_statements(connection: sqlite3.Connection, script: str) -> None:
+    """Execute a schema script without sqlite3.executescript's implicit commit."""
+
+    pending = ""
+    for line in script.splitlines():
+        pending += f"{line}\n"
+        if sqlite3.complete_statement(pending):
+            connection.execute(pending)
+            pending = ""
+    if pending.strip():
+        raise PersistenceError("incomplete database schema statement")
+
+
 class Database:
     """Injectable database handle; connections are short-lived and fork-safe."""
 
@@ -101,16 +141,21 @@ class Database:
     def display_path(self) -> str:
         return self.path
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, busy_timeout_ms: int | None = None) -> sqlite3.Connection:
+        effective_timeout_ms = (
+            self.busy_timeout_ms
+            if busy_timeout_ms is None
+            else max(0, int(busy_timeout_ms))
+        )
         connection = sqlite3.connect(
             self._connection_target,
-            timeout=self.busy_timeout_ms / 1000,
+            timeout=effective_timeout_ms / 1000,
             isolation_level=None,
             uri=self._connection_is_uri,
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
+        connection.execute(f"PRAGMA busy_timeout = {effective_timeout_ms}")
         return connection
 
     @contextmanager
@@ -137,6 +182,31 @@ class Database:
             connection.close()
 
     def initialize(self) -> None:
+        """Initialize or migrate the database with bounded lock retries."""
+
+        if self._initialized:
+            return
+        last_busy_error: sqlite3.OperationalError | None = None
+        for attempt in range(_INITIALIZE_MAX_ATTEMPTS):
+            try:
+                self._initialize_once()
+                return
+            except sqlite3.OperationalError as error:
+                if not _is_sqlite_busy(error):
+                    raise
+                last_busy_error = error
+                if attempt + 1 == _INITIALIZE_MAX_ATTEMPTS:
+                    break
+                delay = min(
+                    _INITIALIZE_BACKOFF_INITIAL_SECONDS * (2**attempt),
+                    _INITIALIZE_BACKOFF_MAX_SECONDS,
+                )
+                time.sleep(delay)
+        raise PersistenceError(
+            "database initialization remained busy after bounded retries"
+        ) from last_busy_error
+
+    def _initialize_once(self) -> None:
         if self._initialized:
             return
         with self._initialize_lock:
@@ -144,10 +214,19 @@ class Database:
                 return
             if self.path != ":memory:":
                 Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-            connection = self._connect()
+            connection = self._connect(
+                busy_timeout_ms=min(
+                    max(0, int(self.busy_timeout_ms)),
+                    _INITIALIZE_BUSY_TIMEOUT_MS,
+                )
+            )
             try:
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.execute("PRAGMA synchronous = FULL")
+                # The version and column inventory are deliberately read only
+                # after acquiring the cross-process write lock.  Otherwise two
+                # v1 initializers can both plan the same ALTER TABLE migration.
+                connection.execute("BEGIN IMMEDIATE")
                 existing_meta = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
                 ).fetchone()
@@ -162,12 +241,48 @@ class Database:
                             f"unsupported database schema {existing_version}; "
                             f"expected 1 or {SCHEMA_VERSION}"
                         )
+                # v1 -> v2 is deliberately a small, atomic column migration.
+                # The idempotent schema block below remains the single place
+                # where new v2 tables and indexes are declared.
+                if existing_version == 1:
+                    columns = {
+                        str(row["name"])
+                        for row in connection.execute(
+                            "PRAGMA table_info(jobs)"
+                        ).fetchall()
+                    }
+                    if "control_state" not in columns:
+                        connection.execute(
+                            "ALTER TABLE jobs ADD COLUMN control_state TEXT "
+                            "NOT NULL DEFAULT 'RUNNING' CHECK (control_state IN "
+                            "('RUNNING','PAUSE_REQUESTED','PAUSED','CANCEL_REQUESTED'))"
+                        )
+                    if "control_revision" not in columns:
+                        connection.execute(
+                            "ALTER TABLE jobs ADD COLUMN control_revision INTEGER "
+                            "NOT NULL DEFAULT 1 CHECK (control_revision >= 1)"
+                        )
+                    if "control_requested_at" not in columns:
+                        connection.execute(
+                            "ALTER TABLE jobs ADD COLUMN control_requested_at TEXT"
+                        )
+                    if "control_message" not in columns:
+                        connection.execute(
+                            "ALTER TABLE jobs ADD COLUMN control_message TEXT"
+                        )
+                    connection.execute(
+                        "UPDATE schema_meta SET value = '2' "
+                        "WHERE key = 'schema_version'"
+                    )
                 blocking = ",".join(f"'{state.value}'" for state in BLOCKING_STATES)
                 job_states = ",".join(f"'{state.value}'" for state in JobState)
+                control_states = ",".join(
+                    f"'{state.value}'" for state in JobControlState
+                )
                 scan_states = ",".join(f"'{state.value}'" for state in ScanState)
-                connection.executescript(
+                _execute_sql_statements(
+                    connection,
                     f"""
-                    BEGIN IMMEDIATE;
                     CREATE TABLE IF NOT EXISTS schema_meta (
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL
@@ -189,23 +304,35 @@ class Database:
                         status_message TEXT,
                         error TEXT,
                         resume_state TEXT CHECK (resume_state IS NULL OR resume_state IN ({job_states})),
+                        control_state TEXT NOT NULL DEFAULT 'RUNNING'
+                            CHECK (control_state IN ({control_states})),
+                        control_revision INTEGER NOT NULL DEFAULT 1
+                            CHECK (control_revision >= 1),
+                        control_requested_at TEXT,
+                        control_message TEXT,
                         version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT
                     );
-                    CREATE INDEX IF NOT EXISTS ix_jobs_queue
+                    DROP INDEX IF EXISTS ix_jobs_queue;
+                    CREATE INDEX ix_jobs_queue
                         ON jobs (priority DESC, created_at ASC)
-                        WHERE state = 'QUEUED';
-                    CREATE INDEX IF NOT EXISTS ix_jobs_ready
+                        WHERE state = 'QUEUED' AND control_state = 'RUNNING';
+                    DROP INDEX IF EXISTS ix_jobs_ready;
+                    CREATE INDEX ix_jobs_ready
                         ON jobs (priority DESC, created_at ASC)
-                        WHERE state = 'READY';
+                        WHERE state = 'READY' AND control_state = 'RUNNING';
                     DROP INDEX IF EXISTS ux_jobs_single_active;
-                    CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_single_scanning
-                        ON jobs ((1)) WHERE state = 'SCANNING';
-                    CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_single_encoding
-                        ON jobs ((1)) WHERE state IN ({blocking});
+                    DROP INDEX IF EXISTS ux_jobs_single_scanning;
+                    CREATE UNIQUE INDEX ux_jobs_single_scanning
+                        ON jobs ((1))
+                        WHERE state = 'SCANNING' AND control_state != 'PAUSED';
+                    DROP INDEX IF EXISTS ux_jobs_single_encoding;
+                    CREATE UNIQUE INDEX ux_jobs_single_encoding
+                        ON jobs ((1))
+                        WHERE state IN ({blocking}) AND control_state != 'PAUSED';
 
                     CREATE TABLE IF NOT EXISTS scans (
                         id TEXT PRIMARY KEY,
@@ -248,10 +375,75 @@ class Database:
                         created_at TEXT NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS ix_events_job_id ON events (job_id, id);
+
+                    CREATE TABLE IF NOT EXISTS release_preparations (
+                        id TEXT PRIMARY KEY,
+                        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                        state TEXT NOT NULL,
+                        profile_id TEXT NOT NULL,
+                        profile_digest TEXT NOT NULL,
+                        metadata_json TEXT NOT NULL,
+                        payload_name TEXT NOT NULL,
+                        payload_path TEXT NOT NULL,
+                        payload_size INTEGER NOT NULL CHECK (payload_size >= 1),
+                        payload_sha256 TEXT NOT NULL,
+                        kit_path TEXT,
+                        manifest_sha256 TEXT,
+                        torrent_infohash TEXT,
+                        torrent_sha256 TEXT,
+                        dupe_receipt_json TEXT,
+                        qbittorrent_receipt_json TEXT,
+                        publication_receipt_json TEXT,
+                        error TEXT,
+                        version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS ix_release_preparations_job
+                        ON release_preparations(job_id, created_at DESC);
+                    CREATE TABLE IF NOT EXISTS release_preparation_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        preparation_id TEXT NOT NULL
+                            REFERENCES release_preparations(id) ON DELETE CASCADE,
+                        kind TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        message TEXT,
+                        payload_json TEXT NOT NULL DEFAULT '{{}}',
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS ix_release_events_preparation
+                        ON release_preparation_events(preparation_id, id);
+                    CREATE TABLE IF NOT EXISTS maintenance_operations (
+                        id TEXT PRIMARY KEY,
+                        kind TEXT NOT NULL,
+                        subject_id TEXT NOT NULL,
+                        phase TEXT NOT NULL CHECK (
+                            phase IN (
+                                'INTENT', 'DETACHED', 'COMMITTED',
+                                'FINALIZED', 'ROLLED_BACK'
+                            )
+                        ),
+                        targets_json TEXT NOT NULL,
+                        lease_owner TEXT NOT NULL,
+                        lease_pid INTEGER NOT NULL CHECK (lease_pid >= 0),
+                        lease_host TEXT NOT NULL,
+                        lease_process_token TEXT NOT NULL,
+                        lease_expires_at REAL NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS ix_maintenance_operations_phase
+                        ON maintenance_operations(phase, created_at);
+                    CREATE TABLE IF NOT EXISTS maintenance_target_claims (
+                        original_path_key TEXT PRIMARY KEY,
+                        operation_id TEXT NOT NULL
+                            REFERENCES maintenance_operations(id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS ix_maintenance_target_claims_operation
+                        ON maintenance_target_claims(operation_id);
                     INSERT INTO schema_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
                         ON CONFLICT(key) DO UPDATE SET value = excluded.value;
-                    COMMIT;
-                    """
+                    """,
                 )
                 version_row = connection.execute(
                     "SELECT value FROM schema_meta WHERE key = 'schema_version'"
@@ -261,6 +453,7 @@ class Database:
                     raise PersistenceError(
                         f"unsupported database schema {actual_version}; expected {SCHEMA_VERSION}"
                     )
+                connection.commit()
                 self._initialized = True
                 if self.path == ":memory:":
                     # A named shared-memory database lives until its final
@@ -387,7 +580,11 @@ class Database:
         placeholders = ",".join("?" for _ in BLOCKING_STATES)
         with self._read() as connection:
             row = connection.execute(
-                f"SELECT * FROM jobs WHERE state IN ({placeholders}) LIMIT 1",
+                f"""
+                SELECT * FROM jobs
+                WHERE state IN ({placeholders}) AND control_state != 'PAUSED'
+                LIMIT 1
+                """,
                 [state.value for state in BLOCKING_STATES],
             ).fetchone()
         return self._decode_job(row) if row else None
@@ -396,7 +593,11 @@ class Database:
         placeholders = ",".join("?" for _ in PREPARATION_ACTIVE_STATES)
         with self._read() as connection:
             row = connection.execute(
-                f"SELECT * FROM jobs WHERE state IN ({placeholders}) LIMIT 1",
+                f"""
+                SELECT * FROM jobs
+                WHERE state IN ({placeholders}) AND control_state != 'PAUSED'
+                LIMIT 1
+                """,
                 [state.value for state in PREPARATION_ACTIVE_STATES],
             ).fetchone()
         return self._decode_job(row) if row else None
@@ -408,14 +609,19 @@ class Database:
             with self._write() as connection:
                 placeholders = ",".join("?" for _ in PREPARATION_ACTIVE_STATES)
                 active = connection.execute(
-                    f"SELECT id FROM jobs WHERE state IN ({placeholders}) LIMIT 1",
+                    f"""
+                    SELECT id FROM jobs
+                    WHERE state IN ({placeholders}) AND control_state != 'PAUSED'
+                    LIMIT 1
+                    """,
                     [state.value for state in PREPARATION_ACTIVE_STATES],
                 ).fetchone()
                 if active:
                     return None
                 row = connection.execute(
                     """
-                    SELECT * FROM jobs WHERE state = 'QUEUED'
+                    SELECT * FROM jobs
+                    WHERE state = 'QUEUED' AND control_state = 'RUNNING'
                     ORDER BY priority DESC, created_at ASC LIMIT 1
                     """
                 ).fetchone()
@@ -438,14 +644,19 @@ class Database:
             with self._write() as connection:
                 placeholders = ",".join("?" for _ in BLOCKING_STATES)
                 active = connection.execute(
-                    f"SELECT id FROM jobs WHERE state IN ({placeholders}) LIMIT 1",
+                    f"""
+                    SELECT id FROM jobs
+                    WHERE state IN ({placeholders}) AND control_state != 'PAUSED'
+                    LIMIT 1
+                    """,
                     [state.value for state in BLOCKING_STATES],
                 ).fetchone()
                 if active:
                     return None
                 row = connection.execute(
                     """
-                    SELECT * FROM jobs WHERE state = 'READY'
+                    SELECT * FROM jobs
+                    WHERE state = 'READY' AND control_state = 'RUNNING'
                     ORDER BY priority DESC, created_at ASC LIMIT 1
                     """
                 ).fetchone()
@@ -470,6 +681,17 @@ class Database:
         details: dict[str, Any] | None = None,
         expected_version: int | None = None,
     ) -> Job:
+        if target is JobState.CANCELLED:
+            # Keep the legacy generic transition endpoint safe: an executing
+            # stage must not be declared CANCELLED until its worker acks.
+            if expected_version is not None:
+                observed = self.get_job(job_id)
+                if observed.version != expected_version:
+                    raise StateConflictError(
+                        f"job version is {observed.version}, expected {expected_version}",
+                        current=observed.state,
+                    )
+            return self.request_cancel(job_id, message=message or "cancelled")
         try:
             with self._write() as connection:
                 row = self._job_row(connection, job_id)
@@ -487,6 +709,293 @@ class Database:
                 )
         except sqlite3.IntegrityError as exc:
             raise QueueBlockedError(self.active_job()) from exc
+
+    def request_pause(
+        self,
+        job_id: str,
+        *,
+        message: str = "pause requested",
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        """Durably request a pause, acknowledging idle jobs immediately."""
+
+        with self._write() as connection:
+            row = self._job_row(connection, job_id)
+            current = JobState(row["state"])
+            control = JobControlState(row["control_state"])
+            self._check_control_revision(row, expected_control_revision)
+            if current in TERMINAL_STATES:
+                raise StateConflictError(
+                    "terminal jobs cannot be paused", current=current
+                )
+            if control in {
+                JobControlState.PAUSE_REQUESTED,
+                JobControlState.PAUSED,
+            }:
+                return self._decode_job(row)
+            if control is JobControlState.CANCEL_REQUESTED:
+                raise StateConflictError(
+                    "cancellation is already requested", current=current
+                )
+            target = (
+                JobControlState.PAUSE_REQUESTED
+                if current in CONTROL_ACTIVE_STATES
+                else JobControlState.PAUSED
+            )
+            return self._set_control_in_connection(
+                connection,
+                row,
+                target,
+                message=message,
+                requested_at=utc_now(),
+                kind="job.control.pause-requested",
+                payload={"acknowledged": target is JobControlState.PAUSED},
+            )
+
+    def request_cancel(
+        self,
+        job_id: str,
+        *,
+        message: str = "cancellation requested",
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        """Request cancellation without declaring an active process stopped.
+
+        Idle and already-paused jobs have no in-flight worker effects, so their
+        request and acknowledgement are committed atomically.
+        """
+
+        with self._write() as connection:
+            row = self._job_row(connection, job_id)
+            current = JobState(row["state"])
+            control = JobControlState(row["control_state"])
+            self._check_control_revision(row, expected_control_revision)
+            if current is JobState.CANCELLED:
+                return self._decode_job(row)
+            if current in {JobState.COMPLETED, JobState.FAILED}:
+                raise StateConflictError(
+                    "completed or failed jobs cannot be cancelled", current=current
+                )
+            if control is JobControlState.CANCEL_REQUESTED:
+                return self._decode_job(row)
+            active = (
+                current in CONTROL_ACTIVE_STATES
+                and control is not JobControlState.PAUSED
+            )
+            if active:
+                return self._set_control_in_connection(
+                    connection,
+                    row,
+                    JobControlState.CANCEL_REQUESTED,
+                    message=message,
+                    requested_at=utc_now(),
+                    kind="job.control.cancel-requested",
+                    payload={"acknowledged": False},
+                )
+
+            # There is no worker/process to acknowledge this request.  Commit
+            # the ordinary terminal transition and control revision together.
+            transitioned = self._transition_in_connection(
+                connection,
+                row,
+                JobState.CANCELLED,
+                message=message,
+                details={"control_acknowledged": True},
+            )
+            terminal_row = self._job_row(connection, job_id)
+            return self._set_control_in_connection(
+                connection,
+                terminal_row,
+                JobControlState.RUNNING,
+                message=None,
+                requested_at=None,
+                kind="job.control.cancelled",
+                payload={
+                    "acknowledged": True,
+                    "state_version": transitioned.version,
+                },
+            )
+
+    def acknowledge_pause(
+        self,
+        job_id: str,
+        *,
+        expected_control_revision: int | None = None,
+        message: str | None = None,
+    ) -> Job:
+        """Worker acknowledgement after all stage processes have stopped."""
+
+        with self._write() as connection:
+            row = self._job_row(connection, job_id)
+            current = JobState(row["state"])
+            self._check_control_revision(row, expected_control_revision)
+            if JobControlState(row["control_state"]) is JobControlState.PAUSED:
+                return self._decode_job(row)
+            if (
+                JobControlState(row["control_state"])
+                is not JobControlState.PAUSE_REQUESTED
+            ):
+                raise StateConflictError(
+                    "no pause is awaiting acknowledgement", current=current
+                )
+            return self._set_control_in_connection(
+                connection,
+                row,
+                JobControlState.PAUSED,
+                message=message or row["control_message"] or "paused",
+                requested_at=row["control_requested_at"],
+                kind="job.control.paused",
+                payload={"acknowledged": True, "stage": current.value},
+            )
+
+    def acknowledge_cancel(
+        self,
+        job_id: str,
+        *,
+        expected_control_revision: int | None = None,
+        message: str | None = None,
+    ) -> Job:
+        """Worker acknowledgement after termination and partial cleanup."""
+
+        with self._write() as connection:
+            row = self._job_row(connection, job_id)
+            current = JobState(row["state"])
+            self._check_control_revision(row, expected_control_revision)
+            if current is JobState.CANCELLED:
+                return self._decode_job(row)
+            if (
+                JobControlState(row["control_state"])
+                is not JobControlState.CANCEL_REQUESTED
+            ):
+                raise StateConflictError(
+                    "no cancellation is awaiting acknowledgement", current=current
+                )
+            cancel_message = message or row["control_message"] or "cancelled"
+            self._transition_in_connection(
+                connection,
+                row,
+                JobState.CANCELLED,
+                message=cancel_message,
+                details={"control_acknowledged": True},
+            )
+            return self._set_control_in_connection(
+                connection,
+                self._job_row(connection, job_id),
+                JobControlState.RUNNING,
+                message=None,
+                requested_at=None,
+                kind="job.control.cancelled",
+                payload={"acknowledged": True, "stage": current.value},
+            )
+
+    def resume_paused_job(
+        self,
+        job_id: str,
+        *,
+        message: str = "resumed",
+        expected_control_revision: int | None = None,
+    ) -> Job:
+        """Release a durable pause without changing its pipeline/checkpoints."""
+
+        try:
+            with self._write() as connection:
+                row = self._job_row(connection, job_id)
+                current = JobState(row["state"])
+                self._check_control_revision(row, expected_control_revision)
+                if JobControlState(row["control_state"]) is not JobControlState.PAUSED:
+                    raise StateConflictError("job is not paused", current=current)
+                if current in TERMINAL_STATES:
+                    raise StateConflictError(
+                        "terminal jobs cannot be resumed", current=current
+                    )
+                return self._set_control_in_connection(
+                    connection,
+                    row,
+                    JobControlState.RUNNING,
+                    message=None,
+                    requested_at=None,
+                    kind="job.control.resumed",
+                    payload={"message": message, "stage": current.value},
+                )
+        except sqlite3.IntegrityError as exc:
+            if current in PREPARATION_ACTIVE_STATES:
+                raise QueueBlockedError(self.preparing_job()) from exc
+            if current in BLOCKING_STATES:
+                raise QueueBlockedError(self.encoding_job()) from exc
+            raise
+
+    def get_control(self, job_id: str) -> tuple[JobControlState, int]:
+        """Cheap polling read used by process runners."""
+
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT control_state, control_revision FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"job not found: {job_id}")
+        return JobControlState(row["control_state"]), int(row["control_revision"])
+
+    @staticmethod
+    def _check_control_revision(
+        row: sqlite3.Row, expected_control_revision: int | None
+    ) -> None:
+        if (
+            expected_control_revision is not None
+            and int(row["control_revision"]) != expected_control_revision
+        ):
+            raise StateConflictError(
+                "job control revision is "
+                f"{row['control_revision']}, expected {expected_control_revision}",
+                current=JobState(row["state"]),
+            )
+
+    def _set_control_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        target: JobControlState,
+        *,
+        message: str | None,
+        requested_at: str | None,
+        kind: str,
+        payload: dict[str, Any],
+    ) -> Job:
+        previous = JobControlState(row["control_state"])
+        now = utc_now()
+        cursor = connection.execute(
+            """
+            UPDATE jobs SET control_state = ?, control_revision = control_revision + 1,
+                control_requested_at = ?, control_message = ?, updated_at = ?
+            WHERE id = ? AND control_revision = ?
+            """,
+            (
+                target.value,
+                requested_at,
+                message,
+                now,
+                row["id"],
+                row["control_revision"],
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise StateConflictError(
+                "job control changed concurrently", current=JobState(row["state"])
+            )
+        self._insert_event(
+            connection,
+            job_id=row["id"],
+            kind=kind,
+            message=message,
+            payload={
+                **payload,
+                "control_from": previous.value,
+                "control_to": target.value,
+                "previous_control_revision": int(row["control_revision"]),
+                "new_control_revision": int(row["control_revision"]) + 1,
+            },
+        )
+        return self._decode_job(self._job_row(connection, row["id"]))
 
     def retry_failed_job(
         self,
@@ -729,21 +1238,83 @@ class Database:
         *,
         expected_version: int | None = None,
         cleanup: Callable[[], None] | None = None,
+        allow_completed: bool = False,
+        expected_release_versions: Mapping[str, int] | None = None,
+        maintenance_operation_id: str | None = None,
     ) -> None:
-        """Delete a failed/cancelled job after its workspace cleanup succeeds."""
+        """Delete a terminal job after its workspace cleanup succeeds.
+
+        Completed records are retained by default for compatibility.  The
+        maintenance API opts in only after independently proving that the
+        public completed release will be preserved.
+        """
 
         with self._write() as connection:
             row = self._job_row(connection, job_id)
             current = JobState(row["state"])
-            if current not in {JobState.FAILED, JobState.CANCELLED}:
+            deletable = {JobState.FAILED, JobState.CANCELLED}
+            if allow_completed:
+                deletable.add(JobState.COMPLETED)
+            if current not in deletable:
+                allowed = (
+                    "FAILED, CANCELLED, or COMPLETED"
+                    if allow_completed
+                    else "FAILED or CANCELLED"
+                )
                 raise StateConflictError(
-                    "only FAILED or CANCELLED jobs can be permanently deleted",
+                    f"only {allowed} jobs can be deleted",
                     current=current,
                 )
             if expected_version is not None and row["version"] != expected_version:
                 raise StateConflictError(
                     f"job version is {row['version']}, expected {expected_version}",
                     current=current,
+                )
+            if expected_release_versions is not None:
+                if any(
+                    not isinstance(identifier, str)
+                    or type(version) is not int
+                    or version < 1
+                    for identifier, version in expected_release_versions.items()
+                ):
+                    raise ValueError("invalid release preparation version snapshot")
+                expected = {
+                    identifier: version
+                    for identifier, version in expected_release_versions.items()
+                }
+                if len(expected) != len(expected_release_versions):
+                    raise ValueError("invalid release preparation version snapshot")
+                preparations = connection.execute(
+                    "SELECT id, state, version FROM release_preparations "
+                    "WHERE job_id = ?",
+                    (job_id,),
+                ).fetchall()
+                actual = {
+                    str(preparation["id"]): int(preparation["version"])
+                    for preparation in preparations
+                }
+                if actual != expected:
+                    raise StateConflictError(
+                        "release preparations changed concurrently",
+                        current=current,
+                    )
+                active_release_states = {
+                    "PREPARING",
+                    "SEEDING_CHECK",
+                    "SEEDING",
+                    "PUBLISHING",
+                }
+                if any(
+                    str(preparation["state"]) in active_release_states
+                    for preparation in preparations
+                ):
+                    raise StateConflictError(
+                        "active release preparation prevents job deletion",
+                        current=current,
+                    )
+            if cleanup is not None and maintenance_operation_id is not None:
+                raise ValueError(
+                    "cleanup and maintenance_operation_id are mutually exclusive"
                 )
             if cleanup is not None:
                 cleanup()
@@ -753,6 +1324,97 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise StateConflictError("job changed concurrently", current=current)
+            if maintenance_operation_id is not None:
+                self._mark_maintenance_committed(
+                    connection,
+                    maintenance_operation_id,
+                    kind="terminal-job-purge",
+                    subject_id=job_id,
+                )
+
+    def record_completed_cleanup(
+        self,
+        job_id: str,
+        *,
+        expected_version: int | None,
+        cleanup: Callable[[], None] | None,
+        payload: Mapping[str, Any],
+        maintenance_operation_id: str | None = None,
+    ) -> Job:
+        """Bind a short workspace quarantine to the completed-job snapshot."""
+
+        with self._write() as connection:
+            row = self._job_row(connection, job_id)
+            current = JobState(row["state"])
+            if current is not JobState.COMPLETED:
+                raise StateConflictError(
+                    "temporary cleanup is limited to completed jobs",
+                    current=current,
+                )
+            if expected_version is not None and row["version"] != expected_version:
+                raise StateConflictError(
+                    f"job version is {row['version']}, expected {expected_version}",
+                    current=current,
+                )
+            if maintenance_operation_id is not None and cleanup is not None:
+                raise ValueError(
+                    "cleanup and maintenance_operation_id are mutually exclusive"
+                )
+            if cleanup is not None:
+                cleanup()
+            self._insert_event(
+                connection,
+                job_id=job_id,
+                kind="job.workspace-cleaned",
+                message="temporary workspace cleanup completed",
+                payload=payload,
+            )
+            if maintenance_operation_id is not None:
+                self._mark_maintenance_committed(
+                    connection,
+                    maintenance_operation_id,
+                    kind="completed-workspace-cleanup",
+                    subject_id=job_id,
+                )
+            return self._decode_job(self._job_row(connection, job_id))
+
+    @staticmethod
+    def _mark_maintenance_committed(
+        connection: sqlite3.Connection,
+        operation_id: str,
+        *,
+        kind: str,
+        subject_id: str,
+    ) -> None:
+        """Commit a filesystem detach lease in the domain mutation transaction."""
+
+        row = connection.execute(
+            "SELECT kind, subject_id, phase, targets_json "
+            "FROM maintenance_operations WHERE id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise PersistenceError(f"maintenance operation not found: {operation_id}")
+        if row["kind"] != kind or row["subject_id"] != subject_id:
+            raise PersistenceError("maintenance operation binding does not match")
+        if row["phase"] != "DETACHED":
+            raise PersistenceError(
+                "maintenance operation must be fully detached before commit"
+            )
+        targets = _json_load(row["targets_json"], None)
+        if not isinstance(targets, list) or any(
+            not isinstance(target, dict) or target.get("state") != "DETACHED"
+            for target in targets
+        ):
+            raise PersistenceError("maintenance target receipts are incomplete")
+        cursor = connection.execute(
+            "UPDATE maintenance_operations "
+            "SET phase = 'COMMITTED', updated_at = ? "
+            "WHERE id = ? AND phase = 'DETACHED'",
+            (utc_now(), operation_id),
+        )
+        if cursor.rowcount != 1:
+            raise PersistenceError("maintenance operation changed concurrently")
 
     def set_selection(
         self,
@@ -852,6 +1514,10 @@ class Database:
                 raise StateConflictError(
                     "terminal jobs cannot report progress", current=current
                 )
+            if JobControlState(row["control_state"]) is JobControlState.PAUSED:
+                raise StateConflictError(
+                    "paused jobs cannot report progress", current=current
+                )
             previous = float(row["progress"]) if row["progress"] is not None else 0.0
             effective_progress = max(previous, progress)
             now = utc_now()
@@ -882,6 +1548,12 @@ class Database:
         details: dict[str, Any],
     ) -> Job:
         current = JobState(row["state"])
+        control = JobControlState(row["control_state"])
+        if control is not JobControlState.RUNNING and target is not JobState.CANCELLED:
+            raise StateConflictError(
+                f"job control is {control.value}; worker must acknowledge it first",
+                current=current,
+            )
         resume = JobState(row["resume_state"]) if row["resume_state"] else None
         try:
             validate_transition(current, target, resume_state=resume)

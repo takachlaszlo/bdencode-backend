@@ -97,9 +97,65 @@ describe("API client", () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "/encoder/api/v1/jobs/job%2F1/purge?expected_version=9",
+      "/encoder/api/v1/jobs/job%2F1/purge?expected_version=9&preserve_release=true",
       expect.objectContaining({ method: "DELETE" }),
     );
+  });
+
+  it("sends durable pause, continue and cancel requests with control revisions", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ id: "job/1", control_state: "PAUSED" }));
+
+    await api.pauseJob("job/1", 3);
+    await api.continueJob("job/1", 4);
+    await api.requestCancelJob("job/1", 5);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/encoder/api/v1/jobs/job%2F1/pause",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ expected_control_revision: 3 }) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/encoder/api/v1/jobs/job%2F1/continue",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ expected_control_revision: 4 }) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "/encoder/api/v1/jobs/job%2F1/cancel",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ expected_control_revision: 5 }) }),
+    );
+  });
+
+  it("uses guarded maintenance and release-preparation endpoints", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ workspace_bytes: 10, reclaimable_bytes: 5, completed_release_bytes: 20, categories: [] }))
+      .mockResolvedValueOnce(mockResponse({ operation_id: "cleanup-1" }))
+      .mockResolvedValueOnce(mockResponse({ id: "prep/1", state: "READY", version: 7 }))
+      .mockResolvedValueOnce(mockResponse({ valid: true, failures: [], payload: {}, screenshots: 6 }))
+      .mockResolvedValueOnce(mockResponse({ id: "prep/1", state: "PUBLISHED", version: 8 }))
+      .mockResolvedValueOnce(mockResponse(null, 204))
+      .mockResolvedValueOnce(mockResponse(null, 204));
+
+    const manifestSha256 = "b".repeat(64);
+    await api.jobStorage("job/1");
+    await api.cleanupJob("job/1", 6);
+    await api.releasePreparationAction("prep/1", "dupe-check", 7);
+    await api.validateReleasePreparation("prep/1", 7);
+    await api.uploadReleasePreparation("prep/1", { expected_version: 7, manifest_sha256: manifestSha256 });
+    await api.deleteReleasePreparation("prep/1", 8);
+    await api.deleteJobRelease("job/1", { confirmation: "Release.Name", expected_sha256: "a".repeat(64), force_if_seeded: false, preparation_versions: { "prep/1": 8 } });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/encoder/api/v1/jobs/job%2F1/storage", expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/encoder/api/v1/jobs/job%2F1/cleanup", expect.objectContaining({ method: "POST", body: JSON.stringify({ scope: "temporary", expected_version: 6 }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/encoder/api/v1/release-preparations/prep%2F1/dupe-check", expect.objectContaining({ method: "POST", body: JSON.stringify({ expected_version: 7 }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(4, "/encoder/api/v1/release-preparations/prep%2F1/validate", expect.objectContaining({ method: "POST", body: JSON.stringify({ expected_version: 7 }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(5, "/encoder/api/v1/release-preparations/prep%2F1/upload", expect.objectContaining({
+      method: "POST",
+      headers: expect.objectContaining({ "X-BDEncode-Manifest": manifestSha256 }),
+      body: JSON.stringify({ expected_version: 7, manifest_sha256: manifestSha256 }),
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(6, "/encoder/api/v1/release-preparations/prep%2F1?expected_version=8", expect.objectContaining({ method: "DELETE" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(7, "/encoder/api/v1/jobs/job%2F1/release", expect.objectContaining({ method: "DELETE", body: JSON.stringify({ confirmation: "Release.Name", expected_sha256: "a".repeat(64), force_if_seeded: false, preparation_versions: { "prep/1": 8 } }) }));
   });
 
   it("preserves a plain-text proxy error after reading the response body once", async () => {

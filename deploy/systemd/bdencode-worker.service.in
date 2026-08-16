@@ -39,7 +39,7 @@ ProtectClock=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
-ReadWritePaths=@DATA_ROOT@/state @DATA_ROOT@/jobs @DATA_ROOT@/completed @DATA_ROOT@/cache @DATA_ROOT@/updates
+ReadWritePaths=@DATA_ROOT@/state @DATA_ROOT@/jobs @DATA_ROOT@/completed @DATA_ROOT@/release-kits @DATA_ROOT@/cache @DATA_ROOT@/updates
 ReadOnlyPaths="@SOURCE_ROOT@"
 
 [Install]

@@ -134,7 +134,7 @@ def test_schema_one_active_index_is_migrated_without_losing_jobs(tmp_path):
     migrated = Database(path)
     migrated.initialize()
 
-    assert migrated.schema_version() == 1
+    assert migrated.schema_version() == 2
     assert migrated.get_job(queued.id).name == "legacy"
     with sqlite3.connect(path) as connection:
         indexes = {
@@ -364,7 +364,7 @@ def test_scan_selection_artifacts_events_and_reopen(database):
 
     reopened = Database(database.path)
     assert reopened.get_job(job.id).selection["playlist"] == "00800.mpls"
-    assert reopened.schema_version() == 1
+    assert reopened.schema_version() == 2
 
 
 def test_in_memory_database_stays_available_across_short_connections():
@@ -503,7 +503,10 @@ def test_failed_retry_rejects_non_failed_terminal_jobs(database):
     finish(queue, completed.id)
     cancelled = enqueue(queue, "cancelled")
     queue.claim_next()
-    queue.cancel(cancelled.id)
+    requested = queue.cancel(cancelled.id)
+    queue.acknowledge_cancel(
+        cancelled.id, expected_control_revision=requested.control_revision
+    )
 
     for job_id, state in (
         (completed.id, JobState.COMPLETED),

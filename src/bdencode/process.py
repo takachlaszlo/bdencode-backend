@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import re
+import signal
 import shlex
 import subprocess
 import threading
@@ -316,8 +317,93 @@ def classify_media_diagnostics(
 
 
 class CommandRunner:
-    def __init__(self, audit_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        audit_path: Path | None = None,
+        *,
+        interrupt_requested: Callable[[], bool] | None = None,
+        terminate_grace_seconds: float = 10.0,
+    ) -> None:
+        if terminate_grace_seconds < 0:
+            raise ValueError("terminate_grace_seconds cannot be negative")
         self.audit_path = audit_path
+        self.interrupt_requested = interrupt_requested
+        self.terminate_grace_seconds = terminate_grace_seconds
+
+    def set_interrupt_requested(
+        self, callback: Callable[[], bool] | None
+    ) -> "CommandRunner":
+        """Attach the durable worker poller to an already-created runner."""
+
+        self.interrupt_requested = callback
+        return self
+
+    @staticmethod
+    def _popen_group_options() -> dict[str, object]:
+        if os.name == "posix":
+            return {"start_new_session": True}
+        creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": creation_flag} if creation_flag else {}
+
+    def _terminate_process(self, process: subprocess.Popen[object]) -> None:
+        """Terminate a whole command group, escalating after a bounded grace."""
+
+        if process.poll() is not None:
+            return
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+        else:
+            break_signal = getattr(signal, "CTRL_BREAK_EVENT", None)
+            try:
+                if break_signal is None:
+                    raise OSError("CTRL_BREAK_EVENT is unavailable")
+                process.send_signal(break_signal)
+            except OSError:
+                process.terminate()
+        try:
+            process.wait(timeout=self.terminate_grace_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+        else:
+            # CREATE_NEW_PROCESS_GROUP prevents console-signal leakage.  taskkill
+            # is the native whole-tree escalation; fall back to killing the root
+            # if it is unavailable (for example in a minimal test environment).
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=max(self.terminate_grace_seconds, 1.0),
+                    check=False,
+                    shell=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                process.kill()
+        process.wait()
+
+    def _interruption_requested(
+        self, override: Callable[[], bool] | None = None
+    ) -> bool:
+        callbacks = (self.interrupt_requested, override)
+        for callback in callbacks:
+            if callback is None:
+                continue
+            try:
+                if callback():
+                    return True
+            except Exception:
+                LOG.exception("interrupt polling failed; process continues")
+        return False
 
     def run(
         self,
@@ -331,6 +417,8 @@ class CommandRunner:
         ok_returncodes: Sequence[int] = (0,),
         timeout: float | None = None,
         preserve_stderr_attempts: bool = True,
+        interrupt_requested: Callable[[], bool] | None = None,
+        poll_interval: float = 0.2,
     ) -> ProcessResult:
         command = tuple(os.fspath(item) for item in argv)
         if not command or not command[0]:
@@ -339,6 +427,8 @@ class CommandRunner:
             raise ValueError("argv contains a NUL byte")
         if cwd is not None:
             cwd = cwd.resolve(strict=True)
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
 
         self._validate_audit_path()
         if stdout_path:
@@ -353,19 +443,39 @@ class CommandRunner:
         out_handle = stdout_path.open("wb") if stdout_path else subprocess.DEVNULL
         err_handle = stderr_path.open("wb") if stderr_path else subprocess.DEVNULL
         started = time.time()
+        process: subprocess.Popen[bytes] | None = None
+        interrupted = False
+        timed_out = False
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 cwd=cwd,
                 env=None if env is None else dict(env),
                 stdin=subprocess.DEVNULL,
                 stdout=out_handle,
                 stderr=err_handle,
-                timeout=timeout,
-                check=False,
                 shell=False,
-                start_new_session=False,
+                **self._popen_group_options(),
             )
+            while process.poll() is None:
+                if self._interruption_requested(interrupt_requested):
+                    interrupted = True
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                time.sleep(poll_interval)
+            if not interrupted:
+                interrupted = self._interruption_requested(interrupt_requested)
+            if interrupted or timed_out:
+                self._terminate_process(process)
+            else:
+                process.wait()
+        except BaseException:
+            if process is not None:
+                self._terminate_process(process)
+            raise
         finally:
             if stdout_path:
                 out_handle.close()
@@ -373,13 +483,17 @@ class CommandRunner:
                 err_handle.close()
         result = ProcessResult(
             command,
-            completed.returncode,
+            process.returncode,
             started,
             time.time(),
             stdout_path,
             stderr_path,
         )
         self._audit(result)
+        if interrupted:
+            raise ProcessInterrupted(results=(result,))
+        if timed_out:
+            raise subprocess.TimeoutExpired(command, timeout)
         if check and result.returncode not in ok_returncodes:
             raise ProcessFailure(result)
         return result
@@ -392,7 +506,10 @@ class CommandRunner:
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         command = tuple(os.fspath(item) for item in argv)
-        return subprocess.run(
+        if not command or not command[0]:
+            raise ValueError("argv must not be empty")
+        started = time.monotonic()
+        process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -400,10 +517,44 @@ class CommandRunner:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
-            check=check,
             shell=False,
+            **self._popen_group_options(),
         )
+        stdout = ""
+        stderr = ""
+        try:
+            while True:
+                if self._interruption_requested():
+                    self._terminate_process(process)
+                    stdout, stderr = process.communicate()
+                    raise ProcessInterrupted()
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    self._terminate_process(process)
+                    stdout, stderr = process.communicate()
+                    raise subprocess.TimeoutExpired(
+                        command, timeout, output=stdout, stderr=stderr
+                    )
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            if process.poll() is None:
+                self._terminate_process(process)
+            raise
+        completed = subprocess.CompletedProcess(
+            command, process.returncode, stdout=stdout, stderr=stderr
+        )
+        if check and completed.returncode != 0:
+            raise subprocess.CalledProcessError(
+                completed.returncode,
+                command,
+                output=stdout,
+                stderr=stderr,
+            )
+        return completed
 
     def _audit(self, result: ProcessResult) -> None:
         if self.audit_path is None:
@@ -528,22 +679,10 @@ class CommandRunner:
         def terminate_processes() -> None:
             for process in processes:
                 if process.poll() is None:
-                    process.terminate()
-            for process in processes:
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                    self._terminate_process(process)
 
         def requested_interruption() -> bool:
-            if interrupt_requested is None:
-                return False
-            try:
-                return bool(interrupt_requested())
-            except Exception:
-                LOG.exception("interrupt polling failed; process continues")
-                return False
+            return self._interruption_requested(interrupt_requested)
 
         try:
             for index, command in enumerate(normalized):
@@ -570,7 +709,7 @@ class CommandRunner:
                     if is_last
                     else (error_handle or subprocess.DEVNULL),
                     shell=False,
-                    start_new_session=False,
+                    **self._popen_group_options(),
                 )
                 processes.append(process)
                 if previous_stdout is not None:
@@ -620,8 +759,7 @@ class CommandRunner:
                 try:
                     process.wait(timeout=30)
                 except subprocess.TimeoutExpired:
-                    process.terminate()
-                    process.wait(timeout=10)
+                    self._terminate_process(process)
         except BaseException:
             terminate_processes()
             raise

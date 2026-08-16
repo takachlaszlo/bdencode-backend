@@ -97,6 +97,7 @@ def test_runtime_capabilities_is_fresh_and_does_not_prepare_paths(
         "state",
         "jobs",
         "completed",
+        "release_kits",
         "cache",
         "updates",
     }
@@ -204,7 +205,7 @@ def test_health_capabilities_and_job_flow(tmp_path):
     with make_client(tmp_path) as client:
         capabilities = client.get("/api/v1/capabilities")
         assert capabilities.status_code == 200
-        assert capabilities.json()["backend_version"] == "2.0.0"
+        assert capabilities.json()["backend_version"] == "2.1.0"
         assert capabilities.json()["constraints"]["max_active_jobs"] == 1
         assert capabilities.json()["output_video_codecs"] == ["x264", "x265"]
         assert capabilities.json()["audio_actions"] == [
