@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -43,6 +44,10 @@ class Settings:
     # environment overrides load without becoming unknown configuration.
     comparison_frames_per_type: int = 4
     log_level: str = "INFO"
+    # Optional, operator-confirmed AI profile adviser.  The API endpoint is
+    # intentionally fixed in code; only the model and timeout are configurable.
+    ai_model: str = "gpt-5.6-terra"
+    ai_timeout_seconds: float = 60.0
     # Release preparation is intentionally stored outside ``completed``.  A
     # completed directory is a public release tree, while release kits may
     # contain a private tracker torrent and therefore remain server-side.
@@ -94,6 +99,14 @@ class Settings:
             raise ConfigurationError("comparison_pair_count must be between 20 and 50")
         if self.comparison_frames_per_type < 1:
             raise ConfigurationError("comparison_frames_per_type must be positive")
+        if (
+            not self.ai_model
+            or len(self.ai_model) > 100
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", self.ai_model) is None
+        ):
+            raise ConfigurationError("ai_model contains unsupported characters")
+        if not 5 <= self.ai_timeout_seconds <= 180:
+            raise ConfigurationError("ai_timeout_seconds must be between 5 and 180")
         data = self.data_root.expanduser().resolve(strict=False)
         sources = tuple(
             item.expanduser().resolve(strict=False) for item in self.source_roots
@@ -158,7 +171,7 @@ def _coerce(name: str, value: Any) -> Any:
         "comparison_frames_per_type",
     }:
         return int(value)
-    if name == "worker_poll_seconds":
+    if name in {"worker_poll_seconds", "ai_timeout_seconds"}:
         return float(value)
     return value
 

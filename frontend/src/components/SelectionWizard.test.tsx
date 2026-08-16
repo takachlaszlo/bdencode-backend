@@ -44,6 +44,8 @@ vi.mock("../api/client", async (importOriginal) => {
       ...actual.api,
       profileSchema: vi.fn(),
       profileRecommendation: vi.fn(),
+      aiRecommendationStatus: vi.fn(),
+      aiRecommendation: vi.fn(),
       validateSelection: vi.fn(),
       saveSelection: vi.fn(),
     },
@@ -86,6 +88,25 @@ describe("SelectionWizard", () => {
       source: "deterministic_expert_rules",
       requires_operator_confirmation: true,
       settings: { crf: 18, preset: "slow", profile: "high" },
+    });
+    vi.mocked(api.aiRecommendationStatus).mockResolvedValue({
+      provider: "openai",
+      configured: true,
+      model: "gpt-test",
+      structured_output: true,
+      requires_operator_confirmation: true,
+    });
+    vi.mocked(api.aiRecommendation).mockResolvedValue({
+      source: "openai_responses_api",
+      provider: "openai",
+      model: "gpt-test",
+      requires_operator_confirmation: true,
+      settings: { crf: 16.5, preset: "slower", tune: "grain" },
+      temporal_filter: "progressive",
+      summary: "Magas minőségű, szemcsemegőrző beállítás.",
+      rationale: ["A scan progresszív 1080p filmet mutat."],
+      warnings: ["A célméret CRF mellett tájékoztató."],
+      confidence: 0.91,
     });
     vi.mocked(api.validateSelection).mockResolvedValue(validation);
     vi.mocked(api.saveSelection).mockResolvedValue(
@@ -163,6 +184,37 @@ describe("SelectionWizard", () => {
     await user.click(screen.getByRole("button", { name: "Tovább" }));
     expect(screen.getByRole("heading", { name: "Hangsávok" })).toBeInTheDocument();
     expect(screen.getByPlaceholderText("forrás: eng")).toBeInTheDocument();
+  });
+
+  it("requests a scan-aware AI profile and applies only editable fields", async () => {
+    const user = userEvent.setup();
+    const view = renderApp(
+      <SelectionWizard
+        job={makeJob({ state: "AWAITING_SELECTION" })}
+        scan={makeScan()}
+        onComplete={vi.fn()}
+      />,
+    );
+
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    expect(view.getByRole("heading", { name: "AI beállítási tanácsadó" })).toBeInTheDocument();
+    await waitFor(() => expect(view.getByRole("button", { name: "AI-javaslat kérése" })).toBeEnabled());
+    await user.type(view.getByRole("spinbutton", { name: /Kívánt méret/ }), "12");
+    await user.type(view.getByRole("textbox", { name: /Műfaj/ }), "film noir");
+    await user.click(view.getByRole("button", { name: "AI-javaslat kérése" }));
+
+    expect(await view.findByText("Magas minőségű, szemcsemegőrző beállítás.")).toBeInTheDocument();
+    expect(api.aiRecommendation).toHaveBeenCalledWith("job-1", expect.objectContaining({
+      playlist_id: "00001",
+      detail_level: "beginner",
+      quality_priority: "balanced",
+      target_size_gib: 12,
+      genre: "film noir",
+    }));
+    await user.click(view.getByRole("button", { name: "Javaslat alkalmazása a mezőkre" }));
+    expect(view.getByRole("spinbutton", { name: /CRF minőség/ })).toHaveValue(16.5);
+    expect(view.getByText(/bekerült a szerkeszthető mezőkbe/)).toBeInTheDocument();
   });
 
   it("does not leave the track step while a retained subtitle is unclassified", async () => {

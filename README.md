@@ -42,6 +42,7 @@ A főbb funkciók:
 - DTS-HD forrásnál lehetőség szerint újrakódolás nélküli DTS core kinyerés, TrueHD vagy más forrásnál ellenőrzött DTS-kódolás;
 - Blu-ray LPCM esetén a Matroska által nem támogatott bitstream-copy helyett FLAC/AC-3/E-AC-3/DTS átalakítás vagy elhagyás;
 - Kezdő, Haladó és Profi beállítási szint;
+- opcionális AI-tanácsadó, amely a technikai scan és a megadott minőségi cél alapján szerkeszthető x264/x265 profiljavaslatot készít;
 - egyszerre egy teljes kódolás, miközben további lemezek előkészíthetők és sorba állíthatók;
 - legfeljebb a gép logikai CPU-kapacitásának beállított hányadát használó worker;
 - tartós pause-kérés, worker-visszaigazolás és biztonságos folytatás a webes felületről;
@@ -394,6 +395,36 @@ wsl -d Debian
 
 Ezután a megjelenő Linux parancssorban használd a fenti Linux-parancsokat.
 
+### 5.2.1. Az opcionális AI-tanácsadó bekapcsolása
+
+Az AI-tanácsadó használatához saját OpenAI API-kulcs szükséges. A BDEncode nem tartalmaz közös kulcsot, és a funkció kulcs nélkül is biztonságosan kikapcsolt állapotban marad. A kulcsot az [OpenAI API keys](https://platform.openai.com/api-keys) oldalon lehet létrehozni.
+
+> [!IMPORTANT]
+> A kulcsot ne másold be a BDEncode weboldalára, GitHub issue-ba vagy chatüzenetbe. Kizárólag a szerveren, a fenti rejtett bevitelű segédfüggvénnyel telepítsd.
+
+Miután a teljes `install_bdencode_secret` függvényt már bemásoltad a terminálba, futtasd:
+
+```bash
+install_bdencode_secret openai-api-key
+cd ~/bdencode-backend
+bash install/install.sh
+```
+
+A telepítő titkosított `openai-api-key.cred` fájlt köt a `bdencode-api.service` szolgáltatáshoz. Ha éppen kódolás vagy más blokkoló művelet fut, a telepítő nem szakítja meg: várd meg a munka biztonságos lezárását, majd futtasd újra.
+
+Ellenőrzés a weboldalon: **Rendszer → AI tanácsadó → API-kulcs**. A helyes állapot: **Használatra kész**. Parancssorból a `doctor --json` jelentés `ai_recommendation.credential.ready_for_consumer` mezője legyen `true`.
+
+Az alapértelmezett modell `gpt-5.6-terra`. Más támogatott modell a `/etc/bdencode/config.toml` fájl `ai_model` beállításával választható, majd a szolgáltatásokat a telepítő újbóli futtatásával kell frissíteni. A modellt csak akkor módosítsd, ha ismered az adott OpenAI API-modell elérhetőségét és költségeit.
+
+Adatvédelem és működés:
+
+- a film videója, hangja, képkockái és fájlrendszerútvonala nem kerül az AI szolgáltatóhoz;
+- csak egy tömör technikai scanösszefoglaló, a választott playlist adatai és az általad beírt cél kerül a kérésbe;
+- a kérés `store: false` beállítást használ;
+- az AI csak szigorú, előre engedélyezett mezőkben adhat javaslatot, parancssort nem készíthet;
+- cropot, HDR-formátumot, kodeket, bitmélységet és más biztonsági korlátot nem írhat felül;
+- a választ a helyi x264/x265 validátor újra ellenőrzi, és alkalmazás után is szükséges a **Terv ellenőrzése**.
+
 ### 5.3. Trackerprofil és qBittorrent beállítása
 
 A 2.1 release-előkészítése alapértelmezetten ki van kapcsolva: a telepítő egy üres, root által kezelt profilfájlt hoz létre. Az aktív fájl helye:
@@ -572,6 +603,23 @@ Az átalakítás veszteséges lehet. Ha nincs kompatibilitási vagy méretprobl�
 - 3D tartalom nem támogatott.
 
 Kezdő módban a rendszer biztonságos alapértékeket ad. Haladó és Profi módban több x264/x265 paraméter külön állítható. Ha nem tudod pontosan, mit jelent egy paraméter, hagyd a profil ajánlott értékén.
+
+#### AI-javaslat kérése
+
+Ha az 5.2.1. pont szerint beállítottad az API-kulcsot, a videóbeállításoknál megjelenik az **AI beállítási tanácsadó** csempe. Használata:
+
+1. Válaszd ki a helyes playlistet, mert az ajánló ennek a scanadatait elemzi.
+2. Válaszd ki a részletességet: Kezdő, Haladó vagy Profi.
+3. Add meg a minőségi célt: **maximális minőség**, **kiegyensúlyozott** vagy **kompakt fájl**.
+4. Opcionálisan adj meg célméretet GiB-ban. Ez tájékoztató cél: a CRF-alapú encode pontos fájlméretet nem tud garantálni.
+5. Opcionálisan add meg a műfajt, például `szemcsés 35 mm-es dráma`, `anime`, `koncert` vagy `gyors akciófilm`.
+6. A szabad szöveges mezőben leírhatod a prioritásokat, például: `A filmszemcsét őrizze meg, a fájl inkább lehet nagyobb.`
+7. Nyomd meg az **AI-javaslat kérése** gombot.
+8. Olvasd el az indoklást és a figyelmeztetéseket. Az AI válasza még nem változtatja meg a tervet.
+9. Ha megfelelő, nyomd meg a **Javaslat alkalmazása a mezőkre** gombot. Ez csak a szerkeszthető mezőket tölti ki; ezután kézzel is módosíthatod őket.
+10. Végül mindig nyomd meg a **Terv ellenőrzése** gombot. Kódolás csak a backend sikeres validálása és a kezelő jóváhagyása után indulhat.
+
+Az AI nem helyettesíti a scan- és plannerellenőrzést. Ha a szolgáltató nem érhető el, a már meglévő determinisztikus szakértői profil használható tovább; emiatt nem kell megszakítani vagy törölni a jobot.
 
 ### 7.5. Terv ellenőrzése és sorba állítása
 
@@ -756,6 +804,9 @@ Kilépés az élő nézetből: `Ctrl+C`.
 | Régebbi telepítőn átmeneti `curl: (7) Failed to connect` látszik | A health check gyorsabban indult, mint a szolgáltatás | Frissítsd a repót. A jelenlegi telepítő legfeljebb 10 másodpercig csendben újrapróbálkozik, és csak a végleges health-check hibát jelzi. |
 | `VapourSynth hiba` | A `vspipe` vagy egy szükséges plugin nem tölthető be | Futtasd a `doctor --json` parancsot, frissítsd a telepítést, majd nézd meg a worker naplóját. |
 | ImgBB/Catbox/Freeimage credential nincs beállítva | Az adott képfeltöltő nem használható hitelesítve | Állítsd be az 5. fejezet szerint. A kódolás ettől még elkészülhet, de a feltöltés korlátozott vagy hibás lehet. |
+| „Az OpenAI API-kulcs nincs beállítva a szerveren” | Az opcionális AI-tanácsadó nem kapta meg a credentialt | Hajtsd végre az 5.2.1. pontot. A hagyományos profilajánló és a kódolás ettől még működik. |
+| „Az AI szolgáltatás nem adott használható választ” | Hálózati, szolgáltatói, jogosultsági vagy modellhiba történt | Ellenőrizd az internetkapcsolatot és az OpenAI API-fiókot, majd próbáld újra. Ha sürgős, használd a determinisztikus profilt; a job adatai nem vesznek el. |
+| Az AI célmérete nem pontosan teljesül | A CRF minőséget céloz, nem garantált bájtméretet | A célméret csak tanácsadási szempont. Pontos méretigényhez később külön kétmenetes méretcélzó mód szükséges. |
 | A forrás nem jelenik meg | Rossz gyökérmappa, jogosultsági hiba vagy közvetlen UNC útvonal | Ellenőrizd, hogy a gyökér alatt ténylegesen van `BDMV`, Windows alatt használj meghajtóbetűjelet. |
 | `source color metadata is incomplete` | A lemez színinformációja hiányos vagy ellentmondásos | Nyisd meg a tervet, ellenőrizd a scan adatokat és erősítsd meg a helyes színprofilt. UHD-n ne hagyd figyelmen kívül automatikusan. |
 | A comparison túl sokáig fut | Hibás vagy régi összehasonlító szakasz, nehezen található frame-pár | Frissítsd a rendszert. Az új gyors comparison időkorlátos. Ha review állapotba kerül, használd a folytatást. |
@@ -923,14 +974,14 @@ A `--data-root` és `--confirm-data-root` értékének pontosan egyeznie kell. E
 
 ### 12.5. Credentialök törlése
 
-A hat, telepítő által ismert fix titkosított credential törlése:
+A hét, telepítő által ismert fix titkosított credential törlése:
 
 ```bash
 cd ~/bdencode-backend
 bash install/uninstall.sh --purge-credentials
 ```
 
-A kapcsoló pontosan az `imgbb-api-key`, `catbox-userhash`, `freeimage-api-key`, `qbittorrent-username`, `qbittorrent-password` és `tracker-aither-api-token` credentialt törli. Egyedi nevű trackercredentialt és az üzemeltető által kezelt `tracker-local.conf` drop-int szándékosan nem távolít el; ezeket szükség esetén külön, kézzel kell törölni.
+A kapcsoló pontosan az `imgbb-api-key`, `catbox-userhash`, `freeimage-api-key`, `qbittorrent-username`, `qbittorrent-password`, `tracker-aither-api-token` és `openai-api-key` credentialt törli. Egyedi nevű trackercredentialt és az üzemeltető által kezelt `tracker-local.conf` drop-int szándékosan nem távolít el; ezeket szükség esetén külön, kézzel kell törölni.
 
 Alkalmazás, adatok és credentialök együttes eltávolításakor a kapcsolókat egy parancsban add meg.
 

@@ -405,6 +405,11 @@ def build_report(
             consumer_active=api_active,
         ),
     }
+    ai_credential = _credential_status(
+        "openai-api-key",
+        consumer_service=API_SERVICE,
+        consumer_active=api_active,
+    )
     release_profiles = _release_profiles_status(settings)
     warnings: list[str] = []
     if not database_available:
@@ -430,6 +435,10 @@ def build_report(
             warnings.append(
                 f"{label} upload credential is not bound to {WORKER_SERVICE}"
             )
+    if ai_credential["configured"] and not ai_credential["ready_for_consumer"]:
+        warnings.append(
+            f"OpenAI API credential is not bound to {API_SERVICE}"
+        )
     if release_profiles["present"] and not release_profiles["valid"]:
         warnings.append("release profile configuration is invalid")
     missing_ffmpeg = {
@@ -471,6 +480,11 @@ def build_report(
         "vapoursynth": vs,
         "image_upload_credentials": image_upload_credentials,
         "release_credentials": release_credentials,
+        "ai_recommendation": {
+            "provider": "openai",
+            "model": settings.ai_model,
+            "credential": ai_credential,
+        },
         "release_profiles": release_profiles,
         # Compatibility alias for older frontends and monitoring clients.
         "imgbb_credential": image_upload_credentials["imgbb"],

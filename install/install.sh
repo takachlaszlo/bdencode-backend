@@ -523,6 +523,8 @@ env \
     -u BDENCODE_WORKER_POLL_SECONDS \
     -u BDENCODE_COMPARISON_PAIR_COUNT \
     -u BDENCODE_COMPARISON_FRAMES_PER_TYPE \
+    -u BDENCODE_AI_MODEL \
+    -u BDENCODE_AI_TIMEOUT_SECONDS \
     -u BDENCODE_LOG_LEVEL \
     "$release_root/venv/bin/python" -m pytest -q "$repo_root/tests"
 
@@ -694,6 +696,7 @@ api_credential_names=(
     qbittorrent-username
     qbittorrent-password
     tracker-aither-api-token
+    openai-api-key
 )
 render_credential_dropin \
     /etc/systemd/system/bdencode-worker.service.d/credential.conf \

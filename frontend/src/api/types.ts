@@ -104,6 +104,24 @@ export interface RuntimeVapourSynthCapability {
   [key: string]: unknown;
 }
 
+export interface RuntimeCredentialCapability {
+  configured?: boolean;
+  present?: boolean;
+  runtime_loaded?: boolean | null;
+  encrypted_at_rest?: boolean;
+  source?: "systemd-runtime" | "encrypted-file";
+  consumer_service?: string;
+  service_binding_present?: boolean;
+  service_bound?: boolean;
+  service_active?: boolean | null;
+  ready_for_consumer?: boolean;
+  permissions?: string;
+  permissions_ok?: boolean;
+  owner_ok?: boolean;
+  metadata_ok?: boolean;
+  [key: string]: unknown;
+}
+
 export interface RuntimeCapabilitiesResponse {
   status?: string;
   database?: {
@@ -153,23 +171,13 @@ export interface RuntimeCapabilitiesResponse {
     permissions_ok?: boolean;
     [key: string]: unknown;
   };
-  image_upload_credentials?: Record<string, {
-    configured?: boolean;
-    present?: boolean;
-    runtime_loaded?: boolean | null;
-    encrypted_at_rest?: boolean;
-    source?: "systemd-runtime" | "encrypted-file";
-    consumer_service?: string;
-    service_binding_present?: boolean;
-    service_bound?: boolean;
-    service_active?: boolean | null;
-    ready_for_consumer?: boolean;
-    permissions?: string;
-    permissions_ok?: boolean;
-    owner_ok?: boolean;
-    metadata_ok?: boolean;
+  image_upload_credentials?: Record<string, RuntimeCredentialCapability>;
+  ai_recommendation?: {
+    provider?: string;
+    model?: string;
+    credential?: RuntimeCredentialCapability;
     [key: string]: unknown;
-  }>;
+  };
   worker_cpu_policy?: {
     requested_percent?: number;
     logical_cpus?: number | null;
@@ -546,6 +554,38 @@ export interface ProfileRecommendationResponse {
   source: string;
   requires_operator_confirmation: boolean;
   settings: Record<string, unknown>;
+}
+
+export type AIQualityPriority = "maximum" | "balanced" | "compact";
+
+export interface AIRecommendationStatus {
+  provider: "openai";
+  configured: boolean;
+  model: string;
+  structured_output: boolean;
+  requires_operator_confirmation: boolean;
+}
+
+export interface AIRecommendationRequest {
+  playlist_id: string;
+  detail_level: DetailLevel;
+  quality_priority: AIQualityPriority;
+  target_size_gib: number | null;
+  genre: string | null;
+  prompt: string;
+}
+
+export interface AIRecommendationResponse {
+  source: "openai_responses_api";
+  provider: "openai";
+  model: string;
+  requires_operator_confirmation: boolean;
+  settings: Record<string, unknown>;
+  temporal_filter: string;
+  summary: string;
+  rationale: string[];
+  warnings: string[];
+  confidence: number;
 }
 
 export interface TrackSelection {

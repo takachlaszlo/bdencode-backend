@@ -144,6 +144,26 @@ describe("SystemPage runtime capabilities", () => {
     expect(screen.getByText("Írható").nextElementSibling).toHaveTextContent("Nem");
   });
 
+  it("shows whether the optional AI adviser credential is ready", async () => {
+    mockRuntime({
+      ai_recommendation: {
+        provider: "openai",
+        model: "gpt-5.6-terra",
+        credential: {
+          configured: true,
+          ready_for_consumer: true,
+          consumer_service: "bdencode-api.service",
+        },
+      },
+    });
+
+    renderApp(<SystemPage />, "/settings");
+
+    expect(await screen.findByText("Scan-alapú profiljavaslat")).toBeInTheDocument();
+    expect(screen.getByText("gpt-5.6-terra")).toBeInTheDocument();
+    expect(screen.getByText("Használatra kész")).toBeInTheDocument();
+  });
+
   it("shows worker credential readiness instead of the API process runtime view", async () => {
     mockRuntime({
       image_upload_credentials: {

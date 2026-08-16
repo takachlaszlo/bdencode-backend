@@ -23,6 +23,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Dispatch, ReactNode, SetStateAction } from "react";
 import type {
+  AIQualityPriority,
   DetailLevel,
   DiscScanResult,
   FieldSpec,
@@ -277,6 +278,11 @@ export function SelectionWizard({
   );
   const [settings, setSettings] = useState<Record<string, unknown>>(initial?.settings ?? {});
   const [settingsSearch, setSettingsSearch] = useState("");
+  const [aiQualityPriority, setAiQualityPriority] = useState<AIQualityPriority>("balanced");
+  const [aiTargetSize, setAiTargetSize] = useState("");
+  const [aiGenre, setAiGenre] = useState("");
+  const [aiPrompt, setAiPrompt] = useState("Őrizze meg a forrás részleteit és textúráját, ésszerű fájlméret mellett.");
+  const [aiApplied, setAiApplied] = useState(false);
   const [validation, setValidation] = useState<SelectionValidation | null>(null);
   const initialVideo = defaultPlaylist?.streams.find((stream) => stream.kind === "video")?.video;
   const initialConfirmedColor = parseSourceColor(initial?.settings.color);
@@ -297,6 +303,11 @@ export function SelectionWizard({
   const recommendation = useQuery({
     queryKey: ["profile-recommendation", encoder, detailLevel, job.content_type],
     queryFn: () => api.profileRecommendation(encoder, detailLevel, job.content_type),
+  });
+  const aiStatus = useQuery({
+    queryKey: ["ai-recommendation-status"],
+    queryFn: api.aiRecommendationStatus,
+    enabled: step === 3,
   });
 
   useEffect(() => {
@@ -329,6 +340,20 @@ export function SelectionWizard({
   const validate = useMutation({
     mutationFn: () => api.validateSelection(job.id, payload, job.version),
     onSuccess: (result) => setValidation(result),
+  });
+  const aiRecommendation = useMutation({
+    mutationFn: () => {
+      const parsedSize = aiTargetSize.trim() ? Number.parseFloat(aiTargetSize) : null;
+      return api.aiRecommendation(job.id, {
+        playlist_id: playlistId,
+        detail_level: detailLevel,
+        quality_priority: aiQualityPriority,
+        target_size_gib: parsedSize !== null && Number.isFinite(parsedSize) ? parsedSize : null,
+        genre: aiGenre.trim() || null,
+        prompt: aiPrompt.trim(),
+      });
+    },
+    onSuccess: () => setAiApplied(false),
   });
   const save = useMutation({
     mutationFn: () => api.saveSelection(job.id, payload, job.version),
@@ -367,6 +392,30 @@ export function SelectionWizard({
       return next;
     });
     clearPlanFeedback();
+    aiRecommendation.reset();
+    setAiApplied(false);
+  }
+
+  function applyAIRecommendation() {
+    if (!aiRecommendation.data || !schema.data) return;
+    const editable = editableRecommendation(
+      schema.data.fields,
+      aiRecommendation.data.settings,
+    );
+    setSettings((current) => ({ ...current, ...editable }));
+    if ([
+      "progressive",
+      "ivtc_tff",
+      "ivtc_bff",
+      "bwdif_tff",
+      "bwdif_bff",
+      "hybrid_safe_bob_tff",
+      "hybrid_safe_bob_bff",
+    ].includes(aiRecommendation.data.temporal_filter)) {
+      setTemporalFilter(aiRecommendation.data.temporal_filter);
+    }
+    clearPlanFeedback();
+    setAiApplied(true);
   }
 
   function updateTrack(streamId: string, update: Partial<TrackSelection>) {
@@ -568,12 +617,83 @@ export function SelectionWizard({
                 onConfirm={confirmSourceColor}
               />
             )}
+            <Card className="settings-card ai-adviser-card">
+              <div className="section-heading">
+                <div><span className="section-heading__icon"><Sparkles size={19} /></span><div><h3>AI beállítási tanácsadó</h3><p>A scan és a saját minőségi célod alapján</p></div></div>
+                {aiStatus.data?.configured && <Badge tone="success">{aiStatus.data.model}</Badge>}
+              </div>
+              <Notice tone="info" title="Mit kap meg az AI?">
+                Csak a kiválasztott playlist technikai scanadatait és az alábbi célleírást küldi el az OpenAI API-nak. A film, képkockák, fájlútvonalak és API-kulcs nem kerülnek a kérés tartalmába. A válasz csak szerkeszthető javaslat; alkalmazás és planner-ellenőrzés nélkül nem indulhat kódolás.
+              </Notice>
+              {aiStatus.isError ? (
+                <Notice tone="danger">Az AI állapota nem kérdezhető le. Frissítsd az oldalt, vagy ellenőrizd a backend verzióját.</Notice>
+              ) : aiStatus.isLoading ? (
+                <ProgressBar value={0.35} label="AI elérhetőségének ellenőrzése…" />
+              ) : !aiStatus.data?.configured ? (
+                <Notice tone="warning" title="OpenAI API-kulcs szükséges">
+                  Az AI-ajánló telepítve van, de a szerveren még nincs <code>openai-api-key</code> credential. A kulcs beállításáig a hagyományos, determinisztikus ajánlott profil használható.
+                </Notice>
+              ) : null}
+              <div className="ai-goal-grid">
+                <label className="field">
+                  <span>Minőség és méret prioritása</span>
+                  <select value={aiQualityPriority} onChange={(event) => { setAiQualityPriority(event.target.value as AIQualityPriority); aiRecommendation.reset(); }}>
+                    <option value="maximum">Maximális minőség / archiválás</option>
+                    <option value="balanced">Kiegyensúlyozott minőség és méret</option>
+                    <option value="compact">Kisebb fájl az elsődleges</option>
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Kívánt méret (GiB, opcionális)</span>
+                  <input type="number" min="0.1" max="500" step="0.1" value={aiTargetSize} onChange={(event) => { setAiTargetSize(event.target.value); aiRecommendation.reset(); }} placeholder="pl. 12" />
+                  <small>CRF esetén ez irány, nem garantált végleges méret.</small>
+                </label>
+                <label className="field">
+                  <span>Műfaj / képjellemzők (opcionális)</span>
+                  <input maxLength={120} value={aiGenre} onChange={(event) => { setAiGenre(event.target.value); aiRecommendation.reset(); }} placeholder="pl. szemcsés film noir, anime, koncert" />
+                </label>
+                <label className="field ai-goal-prompt">
+                  <span>Saját kérés az AI-nak</span>
+                  <textarea maxLength={2000} rows={4} value={aiPrompt} onChange={(event) => { setAiPrompt(event.target.value); aiRecommendation.reset(); }} placeholder="Írd le, milyen eredményt szeretnél…" />
+                </label>
+              </div>
+              <Button
+                className="ai-recommend-button"
+                icon={<WandSparkles size={17} />}
+                loading={aiRecommendation.isPending}
+                disabled={!aiStatus.data?.configured || !playlistId}
+                onClick={() => aiRecommendation.mutate()}
+              >
+                AI-javaslat kérése
+              </Button>
+              {aiRecommendation.isError && (
+                <Notice tone="danger" title="Az AI-javaslat nem készült el">
+                  {aiRecommendation.error instanceof ApiError ? aiRecommendation.error.detail : "Ismeretlen hiba történt."}
+                </Notice>
+              )}
+              {aiRecommendation.data && (
+                <div className="ai-recommendation-result">
+                  <div className="ai-recommendation-result__heading">
+                    <div><span className="eyebrow">AI-javaslat · {Math.round(aiRecommendation.data.confidence * 100)}% bizonyosság</span><h4>{aiRecommendation.data.summary}</h4></div>
+                    <Badge tone="info">{aiRecommendation.data.model}</Badge>
+                  </div>
+                  {aiRecommendation.data.rationale.length > 0 && <ul>{aiRecommendation.data.rationale.map((item) => <li key={item}>{item}</li>)}</ul>}
+                  {aiRecommendation.data.warnings.length > 0 && (
+                    <Notice tone="warning" title="Fontos korlátok">
+                      <ul>{aiRecommendation.data.warnings.map((item) => <li key={item}>{item}</li>)}</ul>
+                    </Notice>
+                  )}
+                  <Button variant="secondary" icon={<Check size={17} />} onClick={applyAIRecommendation}>Javaslat alkalmazása a mezőkre</Button>
+                  {aiApplied && <Notice tone="success">Az AI-javaslat bekerült a szerkeszthető mezőkbe. A végleges szerveroldali ellenőrzés továbbra is kötelező.</Notice>}
+                </div>
+              )}
+            </Card>
             <Card className="settings-card">
               <div className="section-heading">
                 <div><span className="section-heading__icon"><WandSparkles size={19} /></span><div><h3>Ajánlott profil</h3><p>A scan és a tartalomtípus alapján</p></div></div>
                 <div className="detail-switch" role="group" aria-label="Profil részletessége">
                   {(["beginner", "advanced", "pro"] as DetailLevel[]).map((level) => (
-                    <button type="button" key={level} className={detailLevel === level ? "active" : ""} aria-pressed={detailLevel === level} onClick={() => { setDetailLevel(level); setValidation(null); }}>
+                    <button type="button" key={level} className={detailLevel === level ? "active" : ""} aria-pressed={detailLevel === level} onClick={() => { setDetailLevel(level); setValidation(null); aiRecommendation.reset(); setAiApplied(false); }}>
                       {level === "beginner" ? "Kezdő" : level === "advanced" ? "Haladó" : "Profi"}
                     </button>
                   ))}

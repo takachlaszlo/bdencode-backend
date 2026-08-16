@@ -16,6 +16,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import __version__
 from .audio import AUDIO_ACTIONS, audio_presets_payload
+from .ai_recommendation import (
+    AIRecommendationError,
+    AIRecommendationRequest,
+    AIRecommendationResponse,
+    AIRecommendationService,
+    AIRecommendationUnavailable,
+    RecommendationContext,
+)
 from .db import (
     Database,
     NotFoundError,
@@ -68,6 +76,7 @@ from .doctor import build_report
 from .media.profiles import (
     DetailLevel,
     VideoEncoder,
+    gop_for_frame_rate,
     profile_schema,
     recommended_profile,
 )
@@ -215,6 +224,7 @@ def create_app(
     database: Database | str | Path | None = None,
     *,
     settings: Settings | None = None,
+    ai_recommender: AIRecommendationService | None = None,
 ) -> FastAPI:
     if isinstance(database, Database):
         db = database
@@ -224,6 +234,12 @@ def create_app(
     release_service: ReleaseService | None = None
     release_service_lock = threading.Lock()
     maintenance_journal: MaintenanceJournal | None = None
+    recommendation_service = ai_recommender or AIRecommendationService(
+        model=(settings.ai_model if settings is not None else "gpt-5.6-terra"),
+        timeout_seconds=(
+            settings.ai_timeout_seconds if settings is not None else 60.0
+        ),
+    )
 
     if settings is not None and all(
         path.is_dir()
@@ -341,6 +357,24 @@ def create_app(
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
+    @application.exception_handler(AIRecommendationUnavailable)
+    async def ai_unavailable_handler(
+        _request: Request, exc: AIRecommendationUnavailable
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc), "code": "ai_recommendation_unavailable"},
+        )
+
+    @application.exception_handler(AIRecommendationError)
+    async def ai_error_handler(
+        _request: Request, exc: AIRecommendationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": str(exc), "code": "ai_recommendation_failed"},
+        )
+
     @application.get(f"{API_PREFIX}/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         active = db.encoding_job()
@@ -395,6 +429,8 @@ def create_app(
                 "dolby_vision_retention": False,
                 "hdr_modes": ["SDR", "HDR10"],
                 "comparison_images": "lossless PNG",
+                "ai_recommendation": True,
+                "ai_recommendation_requires_confirmation": True,
                 "audio_transcode_presets": audio_presets_payload(),
             },
         )
@@ -431,6 +467,148 @@ def create_app(
             "requires_operator_confirmation": True,
             "settings": profile.to_dict(),
         }
+
+    @application.get(f"{API_PREFIX}/ai-recommendation/status")
+    def ai_recommendation_status() -> dict[str, Any]:
+        return recommendation_service.status()
+
+    @application.post(
+        f"{API_PREFIX}/jobs/{{job_id}}/ai-recommendation",
+        response_model=AIRecommendationResponse,
+    )
+    def recommend_job_settings(
+        job_id: str, request: AIRecommendationRequest
+    ) -> AIRecommendationResponse:
+        job = db.get_job(job_id)
+        if job.state not in {JobState.AWAITING_SELECTION, JobState.NEEDS_REVIEW}:
+            raise StateConflictError(
+                "AI recommendation is available only while configuring a job",
+                current=job.state,
+            )
+        scan_row = next(
+            (
+                item
+                for item in db.list_scans(job_id=job_id, limit=500)
+                if item.status in {ScanState.AWAITING_SELECTION, ScanState.COMPLETED}
+            ),
+            None,
+        )
+        if scan_row is None:
+            raise StateConflictError(
+                "job has no successful scan for AI recommendation", current=job.state
+            )
+        raw_scan = scan_row.result
+        playlists = raw_scan.get("playlists")
+        if not isinstance(playlists, list):
+            raise ConfigurationError("stored scan result has no playlists")
+        playlist = next(
+            (
+                item
+                for item in playlists
+                if isinstance(item, Mapping)
+                and str(item.get("playlist_id")) == request.playlist_id
+            ),
+            None,
+        )
+        if playlist is None:
+            raise ConfigurationError("selected playlist is not present in the scan")
+        streams = playlist.get("streams")
+        stream_rows = [item for item in streams or [] if isinstance(item, Mapping)]
+        video_row = next(
+            (item for item in stream_rows if item.get("kind") == "video"), None
+        )
+        video = (
+            video_row.get("video")
+            if isinstance(video_row, Mapping)
+            and isinstance(video_row.get("video"), Mapping)
+            else {}
+        )
+        encoder = (
+            VideoEncoder.X265
+            if str(raw_scan.get("disc_kind", "bd")).lower() == "uhd"
+            else VideoEncoder.X264
+        )
+        content_type = str(
+            raw_scan.get("content_kind") or job.content_type.value
+        ).lower()
+        gop_overrides: dict[str, Any] = {}
+        frame_rate = video.get("frame_rate")
+        if frame_rate:
+            try:
+                keyint, min_keyint = gop_for_frame_rate(str(frame_rate))
+            except ValueError:
+                pass
+            else:
+                gop_overrides = {"keyint": keyint, "min_keyint": min_keyint}
+        base = recommended_profile(
+            encoder,
+            detail_level=request.detail_level,
+            content_type=content_type,
+            overrides=gop_overrides,
+        )
+        scan_facts = {
+            "disc_kind": str(raw_scan.get("disc_kind", "unknown")),
+            "content_kind": content_type,
+            "playlist": {
+                "duration_seconds": playlist.get("duration_seconds"),
+                "chapter_count": len(playlist.get("chapters") or []),
+                "segment_count": len(playlist.get("segments") or []),
+                "angle_count": playlist.get("angle_count", 1),
+                "seamless_branching": bool(playlist.get("seamless_branching")),
+            },
+            "video": {
+                key: video.get(key)
+                for key in (
+                    "codec",
+                    "width",
+                    "height",
+                    "frame_rate",
+                    "field_order",
+                    "bit_depth",
+                    "pixel_format",
+                    "color_primaries",
+                    "color_transfer",
+                    "color_matrix",
+                    "color_range",
+                    "hdr10",
+                    "dolby_vision",
+                    "hdr10_base_layer",
+                    "three_d",
+                )
+            },
+            "audio": [
+                {
+                    "codec": item.get("codec"),
+                    "codec_profile": item.get("codec_profile"),
+                    "channels": item.get("channels"),
+                    "sample_rate": item.get("sample_rate"),
+                    "bit_depth": item.get("bit_depth"),
+                    "object_audio": bool(item.get("object_audio")),
+                }
+                for item in stream_rows
+                if item.get("kind") == "audio"
+            ],
+            "subtitle_track_count": sum(
+                1 for item in stream_rows if item.get("kind") == "subtitle"
+            ),
+            # Do not forward free-form scanner warnings: older scanner builds
+            # may include a source path in their prose.  The count retains a
+            # useful uncertainty signal without disclosing filesystem data.
+            "scan_warning_count": len(raw_scan.get("warnings") or []),
+        }
+        return recommendation_service.recommend(
+            RecommendationContext(
+                encoder=encoder,
+                detail_level=request.detail_level,
+                content_type=content_type,
+                scan_facts=scan_facts,
+                base_settings=base,
+                quality_priority=request.quality_priority,
+                target_size_gib=request.target_size_gib,
+                genre=request.genre,
+                prompt=request.prompt,
+            )
+        )
 
     @application.get(f"{API_PREFIX}/sources")
     def browse_sources(path: str | None = None) -> dict[str, object]:

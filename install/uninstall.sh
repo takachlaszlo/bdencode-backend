@@ -17,8 +17,8 @@ Options:
   --source-root PATH        Blu-ray source root (repeatable)
   --purge-data              Also remove the complete data root
   --confirm-data-root PATH  Required exact confirmation for --purge-data
-  --purge-credentials       Remove all six fixed BDEncode credentials:
-                            image hosts, qBittorrent login and Aither token
+  --purge-credentials       Remove all seven fixed BDEncode credentials:
+                            image hosts, qBittorrent login, Aither and OpenAI
   --purge-credential        Legacy option: remove only the ImgBB credential
   -h, --help                Show this help
 
@@ -421,6 +421,7 @@ credential_names=(
     qbittorrent-username
     qbittorrent-password
     tracker-aither-api-token
+    openai-api-key
 )
 declare -a credential_paths=()
 for credential_name in "${credential_names[@]}"; do
@@ -675,6 +676,7 @@ names = (
         "qbittorrent-username.cred",
         "qbittorrent-password.cred",
         "tracker-aither-api-token.cred",
+        "openai-api-key.cred",
     )
     if mode == "all"
     else ("imgbb-api-key.cred",)

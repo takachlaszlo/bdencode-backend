@@ -88,8 +88,8 @@ def test_uninstaller_validates_database_and_credential_paths() -> None:
 def test_uninstaller_preserves_or_purges_only_fixed_credentials() -> None:
     content = script()
     assert "--purge-credentials" in content
-    assert "Remove all six fixed BDEncode credentials" in content
-    assert "qBittorrent login and Aither token" in content
+    assert "Remove all seven fixed BDEncode credentials" in content
+    assert "qBittorrent login, Aither and OpenAI" in content
     assert "Remove the three fixed image-host credentials" not in content
     assert "--purge-credential)" in content
     assert "Legacy option: remove only the ImgBB credential" in content
@@ -100,6 +100,7 @@ def test_uninstaller_preserves_or_purges_only_fixed_credentials() -> None:
         "qbittorrent-username",
         "qbittorrent-password",
         "tracker-aither-api-token",
+        "openai-api-key",
     ):
         assert credential in content
     assert 'credential_purge_mode=imgbb' in content

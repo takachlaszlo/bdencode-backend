@@ -10,4 +10,6 @@ comparison_pair_count = 24
 # A korábbi comparison_frames_per_type kulcs kompatibilitási okból még betölthető,
 # de az új, mintavételezett comparison nem használja.
 log_level = "INFO"
+ai_model = "gpt-5.6-terra"
+ai_timeout_seconds = 60
 release_profiles_path = "/etc/bdencode/release-profiles.json"

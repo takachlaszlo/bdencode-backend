@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from bdencode import doctor
+from bdencode.ai_recommendation import AIRecommendationResponse
 from bdencode.api import create_app
 from bdencode.config import Settings
 from bdencode.db import Database, NotFoundError
@@ -201,6 +202,66 @@ def valid_selection() -> dict[str, object]:
         "tracks": [],
         "upload_images": False,
     }
+
+
+def test_ai_recommendation_uses_selected_scan_playlist_and_requires_confirmation(
+    tmp_path,
+):
+    class FakeRecommender:
+        context = None
+
+        def status(self):
+            return {
+                "provider": "openai",
+                "configured": True,
+                "model": "gpt-test",
+                "structured_output": True,
+                "requires_operator_confirmation": True,
+            }
+
+        def recommend(self, context):
+            self.context = context
+            return AIRecommendationResponse(
+                model="gpt-test",
+                settings={"encoder": "x264", "crf": 16.5, "preset": "slower"},
+                temporal_filter="progressive",
+                summary="Magas minőségű filmes javaslat.",
+                rationale=["A scan progresszív 1080p forrást mutat."],
+                warnings=["A célméret CRF mellett csak tájékoztató."],
+                confidence=0.9,
+            )
+
+    recommender = FakeRecommender()
+    with TestClient(
+        create_app(
+            Database(tmp_path / "ai-api.sqlite3"),
+            ai_recommender=recommender,
+        )
+    ) as client:
+        job = awaiting_selection_job(client)
+        status = client.get("/api/v1/ai-recommendation/status")
+        response = client.post(
+            f"/api/v1/jobs/{job['id']}/ai-recommendation",
+            json={
+                "playlist_id": "00001",
+                "detail_level": "advanced",
+                "quality_priority": "maximum",
+                "target_size_gib": 12.5,
+                "genre": "film noir",
+                "prompt": "A filmszemcse maradjon meg.",
+            },
+        )
+
+    assert status.status_code == 200
+    assert status.json()["configured"] is True
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["settings"]["crf"] == 16.5
+    assert payload["requires_operator_confirmation"] is True
+    assert recommender.context.encoder.value == "x264"
+    assert recommender.context.detail_level.value == "advanced"
+    assert recommender.context.scan_facts["video"]["width"] == 1920
+    assert "source" not in recommender.context.scan_facts
 
 
 def test_health_capabilities_and_job_flow(tmp_path):

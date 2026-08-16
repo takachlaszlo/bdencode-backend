@@ -55,6 +55,9 @@ export function SystemPage() {
   const cpuFraction = finiteNumber(capabilities.data?.constraints.cpu_budget_fraction);
   const cpuPercent = cpuPercentFromRuntime ?? (cpuFraction === null ? null : cpuFraction * 100);
   const imageCredentials = runtime.data?.image_upload_credentials ?? {};
+  const aiRecommendation = runtime.data?.ai_recommendation;
+  const aiCredential = aiRecommendation?.credential;
+  const aiReady = aiCredential?.ready_for_consumer === true;
 
   function refresh() {
     void Promise.all([health.refetch(), runtime.refetch(), capabilities.refetch()]);
@@ -146,6 +149,16 @@ export function SystemPage() {
                     );
                   })}
                 </div>
+              </Card>
+              <Card>
+                <span className="eyebrow">AI tanácsadó</span><h2>Scan-alapú profiljavaslat</h2>
+                <p className="muted-copy">A technikai scan és az operátori cél alapján javasol x264/x265 mezőket. A javaslatot a backend újra validálja, és csak kézi alkalmazás után használja.</p>
+                <dl className="summary-list summary-list--stacked">
+                  <div><dt>Szolgáltató</dt><dd>{aiRecommendation?.provider ?? "OpenAI"}</dd></div>
+                  <div><dt>Modell</dt><dd>{aiRecommendation?.model ?? "Ismeretlen"}</dd></div>
+                  <div><dt>API-kulcs</dt><dd>{aiReady ? "Használatra kész" : aiCredential?.configured ? "Beállítva, de nincs az API-hoz kötve" : "Nincs beállítva"}</dd></div>
+                </dl>
+                <Badge tone={aiReady ? "success" : aiCredential?.configured ? "warning" : "neutral"}>{aiReady ? "Elérhető" : "Opcionális"}</Badge>
               </Card>
             </div>
           </div>

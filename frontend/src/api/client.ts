@@ -1,4 +1,7 @@
 import type {
+  AIRecommendationRequest,
+  AIRecommendationResponse,
+  AIRecommendationStatus,
   ArtifactList,
   CapabilitiesResponse,
   DetailLevel,
@@ -261,6 +264,13 @@ export const api = {
   ) =>
     apiFetch<ProfileRecommendationResponse>(
       `/profiles/${encoder}/recommendation?detail_level=${detail}&content_type=${encodeURIComponent(contentType.toLowerCase())}`,
+    ),
+  aiRecommendationStatus: () =>
+    apiFetch<AIRecommendationStatus>("/ai-recommendation/status"),
+  aiRecommendation: (id: string, request: AIRecommendationRequest) =>
+    apiFetch<AIRecommendationResponse>(
+      `/jobs/${encodeURIComponent(id)}/ai-recommendation`,
+      { method: "POST", body: JSON.stringify(request) },
     ),
   validateSelection: (id: string, selection: SelectionPayload, version?: number) =>
     apiFetch<SelectionValidation>(
