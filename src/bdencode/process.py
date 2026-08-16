@@ -12,8 +12,9 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Literal, Mapping, Sequence
 
 
 SECRET_MARKERS = (
@@ -51,6 +52,41 @@ class ProcessInterrupted(RuntimeError):
         self.results = tuple(results)
 
 
+class DiagnosticCategory(StrEnum):
+    SOURCE_CORRUPTION = "source_corruption"
+    DECODE_INTEGRITY = "decode_integrity"
+    OPEN_GOP_SEEK = "open_gop_seek"
+    TIMESTAMP = "timestamp"
+    ENVIRONMENT = "environment"
+    UNKNOWN = "unknown"
+
+
+class DiagnosticSeverity(StrEnum):
+    WARNING = "warning"
+    ERROR = "error"
+    FATAL = "fatal"
+
+
+@dataclass(frozen=True, slots=True)
+class MediaDiagnostic:
+    code: str
+    category: DiagnosticCategory
+    severity: DiagnosticSeverity
+    count: int
+    examples: tuple[str, ...]
+    requires_review: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "code": self.code,
+            "category": self.category.value,
+            "severity": self.severity.value,
+            "count": self.count,
+            "examples": list(self.examples),
+            "requires_review": self.requires_review,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class ProcessResult:
     argv: tuple[str, ...]
@@ -66,7 +102,7 @@ class ProcessResult:
 
     @property
     def display_command(self) -> str:
-        return shlex.join(self.argv)
+        return shlex.join(redact_argv(self.argv))
 
 
 def redact_argv(argv: Sequence[str]) -> list[str]:
@@ -88,9 +124,7 @@ def redact_argv(argv: Sequence[str]) -> list[str]:
             else:
                 redacted.append(item)
                 hide_next = True
-        elif re.search(
-            r"(?i)([?&](?:key|token|userhash|api[_-]?key)=)[^&\s]+", item
-        ):
+        elif re.search(r"(?i)([?&](?:key|token|userhash|api[_-]?key)=)[^&\s]+", item):
             redacted.append(
                 re.sub(
                     r"(?i)([?&](?:key|token|userhash|api[_-]?key)=)[^&\s]+",
@@ -101,6 +135,184 @@ def redact_argv(argv: Sequence[str]) -> list[str]:
         else:
             redacted.append(item)
     return redacted
+
+
+def next_stderr_attempt_path(path: Path) -> Path:
+    """Return the first unused, human-sortable archive name for ``path``."""
+
+    for attempt in range(1, 10_000):
+        candidate = path.with_name(f"{path.stem}.attempt-{attempt:02d}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"too many preserved stderr attempts for {path.name}")
+
+
+def _reject_link_output_path(path: Path, *, description: str) -> None:
+    """Reject predictable output files redirected through links/reparse points."""
+
+    if not os.path.lexists(path):
+        return
+    is_junction = getattr(path, "is_junction", None)
+    if path.is_symlink() or (callable(is_junction) and is_junction()):
+        raise ValueError(
+            f"{description} cannot be a symbolic link or junction"
+        )
+
+
+def preserve_previous_stderr(path: Path) -> Path | None:
+    """Archive an existing stderr log while keeping the base name for latest."""
+
+    _reject_link_output_path(path, description="stderr path")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise ValueError("stderr path exists but is not a regular file")
+    archived = next_stderr_attempt_path(path)
+    path.replace(archived)
+    return archived
+
+
+_DIAGNOSTIC_RULES: tuple[
+    tuple[str, DiagnosticCategory, DiagnosticSeverity, re.Pattern[str]], ...
+] = (
+    (
+        "pes_packet_size_mismatch",
+        DiagnosticCategory.SOURCE_CORRUPTION,
+        DiagnosticSeverity.ERROR,
+        re.compile(r"(?i)PES packet size mismatch"),
+    ),
+    (
+        "corrupt_packet",
+        DiagnosticCategory.SOURCE_CORRUPTION,
+        DiagnosticSeverity.ERROR,
+        re.compile(r"(?i)(?:packet corrupt|corrupt(?:ed)? input packet|CRC error)"),
+    ),
+    (
+        "truncated_input",
+        DiagnosticCategory.SOURCE_CORRUPTION,
+        DiagnosticSeverity.ERROR,
+        re.compile(r"(?i)(?:truncated (?:file|packet|nal)|unexpected end of file)"),
+    ),
+    (
+        "missing_reference_picture",
+        DiagnosticCategory.OPEN_GOP_SEEK,
+        DiagnosticSeverity.WARNING,
+        re.compile(
+            r"(?i)(?:missing reference picture|mmco:\s*unref short failure|"
+            r"reference picture missing during reorder)"
+        ),
+    ),
+    (
+        "decode_error",
+        DiagnosticCategory.DECODE_INTEGRITY,
+        DiagnosticSeverity.ERROR,
+        re.compile(
+            r"(?i)(?:error while decoding|invalid NAL|decode_slice_header error|"
+            r"concealing \d+ DC, \d+ AC, \d+ MV errors)"
+        ),
+    ),
+    (
+        "timestamp_discontinuity",
+        DiagnosticCategory.TIMESTAMP,
+        DiagnosticSeverity.WARNING,
+        re.compile(
+            r"(?i)(?:non-monoton(?:ous|ically increasing) DTS|timestamp discontinuity|"
+            r"invalid, non monotonically increasing dts)"
+        ),
+    ),
+    (
+        "storage_or_io_failure",
+        DiagnosticCategory.ENVIRONMENT,
+        DiagnosticSeverity.FATAL,
+        re.compile(
+            r"(?i)(?:No space left on device|Input/output error|Permission denied|"
+            r"Read-only file system)"
+        ),
+    ),
+    (
+        "unclassified_error",
+        DiagnosticCategory.UNKNOWN,
+        DiagnosticSeverity.ERROR,
+        re.compile(r"(?i)\b(?:error|failed|invalid data found)\b"),
+    ),
+)
+
+
+def classify_media_diagnostics(
+    text: str,
+    *,
+    context: Literal["source", "sampled", "final_decode", "generic"] = "generic",
+    max_examples: int = 3,
+) -> tuple[MediaDiagnostic, ...]:
+    """Classify FFmpeg/demux diagnostics without equating seek noise to corruption."""
+
+    if max_examples < 1:
+        raise ValueError("max diagnostic examples must be positive")
+    grouped: dict[
+        str,
+        tuple[DiagnosticCategory, DiagnosticSeverity, list[str], int],
+    ] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        for code, category, severity, pattern in _DIAGNOSTIC_RULES:
+            if not pattern.search(line):
+                continue
+            effective_category = category
+            effective_severity = severity
+            if category is DiagnosticCategory.OPEN_GOP_SEEK and context != "sampled":
+                effective_category = DiagnosticCategory.DECODE_INTEGRITY
+                effective_severity = DiagnosticSeverity.ERROR
+            prior = grouped.get(code)
+            if prior is None:
+                examples = [line]
+                grouped[code] = (
+                    effective_category,
+                    effective_severity,
+                    examples,
+                    1,
+                )
+            else:
+                prior_category, prior_severity, examples, count = prior
+                if len(examples) < max_examples and line not in examples:
+                    examples.append(line)
+                grouped[code] = (
+                    prior_category,
+                    prior_severity,
+                    examples,
+                    count + 1,
+                )
+            break
+
+    results = []
+    for code, (category, severity, examples, count) in grouped.items():
+        requires_review = not (
+            category is DiagnosticCategory.OPEN_GOP_SEEK and context == "sampled"
+        )
+        results.append(
+            MediaDiagnostic(
+                code=code,
+                category=category,
+                severity=severity,
+                count=count,
+                examples=tuple(examples),
+                requires_review=requires_review,
+            )
+        )
+    return tuple(
+        sorted(
+            results,
+            key=lambda item: (
+                -{
+                    DiagnosticSeverity.WARNING: 1,
+                    DiagnosticSeverity.ERROR: 2,
+                    DiagnosticSeverity.FATAL: 3,
+                }[item.severity],
+                item.code,
+            ),
+        )
+    )
 
 
 class CommandRunner:
@@ -118,6 +330,7 @@ class CommandRunner:
         check: bool = True,
         ok_returncodes: Sequence[int] = (0,),
         timeout: float | None = None,
+        preserve_stderr_attempts: bool = True,
     ) -> ProcessResult:
         command = tuple(os.fspath(item) for item in argv)
         if not command or not command[0]:
@@ -127,10 +340,15 @@ class CommandRunner:
         if cwd is not None:
             cwd = cwd.resolve(strict=True)
 
+        self._validate_audit_path()
         if stdout_path:
             stdout_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+            _reject_link_output_path(stdout_path, description="stdout path")
         if stderr_path:
             stderr_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+            _reject_link_output_path(stderr_path, description="stderr path")
+            if preserve_stderr_attempts:
+                preserve_previous_stderr(stderr_path)
 
         out_handle = stdout_path.open("wb") if stdout_path else subprocess.DEVNULL
         err_handle = stderr_path.open("wb") if stderr_path else subprocess.DEVNULL
@@ -191,6 +409,7 @@ class CommandRunner:
         if self.audit_path is None:
             return
         self.audit_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        _reject_link_output_path(self.audit_path, description="audit path")
         record = {
             "argv": redact_argv(result.argv),
             "returncode": result.returncode,
@@ -203,6 +422,12 @@ class CommandRunner:
         with self.audit_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
+    def _validate_audit_path(self) -> None:
+        if self.audit_path is None:
+            return
+        self.audit_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        _reject_link_output_path(self.audit_path, description="audit path")
+
     def run_pipeline(
         self,
         commands: Sequence[Sequence[str | os.PathLike[str]]],
@@ -214,6 +439,7 @@ class CommandRunner:
         stderr_line_callback: Callable[[str], None] | None = None,
         interrupt_requested: Callable[[], bool] | None = None,
         poll_interval: float = 0.2,
+        preserve_stderr_attempts: bool = True,
     ) -> list[ProcessResult]:
         """Connect commands with OS pipes without invoking a shell.
 
@@ -235,7 +461,24 @@ class CommandRunner:
         if cwd is not None:
             cwd = cwd.resolve(strict=True)
 
+        self._validate_audit_path()
         errors = list(stderr_paths or [None] * len(normalized))
+        for error_path in errors:
+            if error_path is None:
+                continue
+            error_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+            _reject_link_output_path(error_path, description="stderr path")
+        if preserve_stderr_attempts:
+            archived_paths: set[Path] = set()
+            for error_path in errors:
+                if error_path is None:
+                    continue
+                normalized_path = error_path.resolve(strict=False)
+                if normalized_path in archived_paths:
+                    continue
+                error_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+                preserve_previous_stderr(error_path)
+                archived_paths.add(normalized_path)
         error_handles: list[object] = []
         processes: list[subprocess.Popen[bytes]] = []
         started: list[float] = []

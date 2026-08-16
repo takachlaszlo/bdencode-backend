@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 import re
@@ -16,10 +17,78 @@ class MuxTrack:
     name: str | None = None
     default: bool = False
     forced: bool = False
+    sync_offset_ms: Decimal = Decimal(0)
+    subtitle_kind: str | None = None
 
     def __post_init__(self) -> None:
         if not self.language or len(self.language) > 35:
             raise ValueError("invalid BCP 47 language tag")
+        if not isinstance(self.default, bool) or not isinstance(self.forced, bool):
+            raise ValueError("track default and forced flags must be boolean")
+        sync_offset = _decimal(self.sync_offset_ms, name="track sync offset")
+        object.__setattr__(self, "sync_offset_ms", sync_offset)
+        if self.subtitle_kind not in {None, "unknown", "full", "forced"}:
+            raise ValueError(
+                "subtitle_kind must be unknown, full, forced or omitted"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class CommonTimelinePlan:
+    """Mux offsets and expected starts on one normalized presentation timeline."""
+
+    origin_seconds: Decimal
+    expected_start_seconds: tuple[Decimal, ...]
+    video_sync_offset_ms: Decimal
+    track_sync_offsets_ms: tuple[Decimal, ...]
+
+
+def plan_common_zero_timeline(
+    reference_video_start: Decimal | str | int | float,
+    retained_track_starts: Sequence[Decimal | str | int | float],
+    *,
+    encoded_video_start: Decimal | str | int | float = Decimal(0),
+    sidecar_start_times: Sequence[Decimal | str | int | float] | None = None,
+) -> CommonTimelinePlan:
+    """Preserve relative stream timing while rebasing the earliest stream to zero.
+
+    The encoded video produced from Y4M starts at zero, while audio and subtitle
+    sidecars normally retain the reference-remux timestamps.  The optional
+    encoded/sidecar starts account for codec priming or container rounding, so
+    the calculated mux offsets restore the reviewed source relationship rather
+    than assuming every intermediate starts exactly where its source did.
+    """
+
+    starts = (
+        _decimal(reference_video_start, name="reference video start"),
+        *(
+            _decimal(value, name=f"retained track {index} start")
+            for index, value in enumerate(retained_track_starts, start=1)
+        ),
+    )
+    origin = min(starts)
+    expected = tuple(value - origin for value in starts)
+    encoded_start = _decimal(encoded_video_start, name="encoded video start")
+    if sidecar_start_times is None:
+        sidecar_starts = starts[1:]
+    else:
+        sidecar_starts = tuple(
+            _decimal(value, name=f"sidecar {index} start")
+            for index, value in enumerate(sidecar_start_times, start=1)
+        )
+        if len(sidecar_starts) != len(retained_track_starts):
+            raise ValueError("sidecar starts must match retained track count")
+    return CommonTimelinePlan(
+        origin_seconds=origin,
+        expected_start_seconds=expected,
+        video_sync_offset_ms=(expected[0] - encoded_start) * Decimal(1000),
+        track_sync_offsets_ms=tuple(
+            (desired - sidecar_start) * Decimal(1000)
+            for desired, sidecar_start in zip(
+                expected[1:], sidecar_starts, strict=True
+            )
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +103,7 @@ class FinalVideoPolicy:
     color_transfer: str
     color_primaries: str
     chroma_location: str
+    level: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,20 +119,29 @@ def mkvmerge_command(
     audio_tracks: Sequence[MuxTrack] = (),
     subtitle_tracks: Sequence[MuxTrack] = (),
     chapters_path: Path | None = None,
-    tags_path: Path | None = None,
-    sanitized_log_path: Path | None = None,
     title: str | None = None,
+    video_sync_offset_ms: Decimal | str | int | float = Decimal(0),
     mkvmerge: str = "mkvmerge",
 ) -> list[str]:
+    policy_errors = validate_mux_track_policy(
+        audio_tracks=audio_tracks,
+        subtitle_tracks=subtitle_tracks,
+    )
+    if policy_errors:
+        raise ValueError("; ".join(policy_errors))
+    video_sync = _decimal(video_sync_offset_ms, name="video sync offset")
     command = [mkvmerge, "--output", str(output_path)]
     if title:
         command.extend(("--title", title))
     if chapters_path:
         command.extend(("--chapters", str(chapters_path)))
-    if tags_path:
-        command.extend(("--global-tags", str(tags_path)))
     command.extend(
         (
+            "--default-track-flag",
+            "0:yes",
+            "--forced-display-flag",
+            "0:no",
+            *(_sync_option(video_sync)),
             "--no-audio",
             "--no-subtitles",
             "--no-buttons",
@@ -98,19 +177,6 @@ def mkvmerge_command(
                 str(item.path),
             )
         )
-    if sanitized_log_path:
-        command.extend(
-            (
-                "--attachment-mime-type",
-                "text/plain; charset=utf-8",
-                "--attachment-name",
-                "encode.log",
-                "--attachment-description",
-                "Sanitized BDEncode log; comparison evidence remains external",
-                "--attach-file",
-                str(sanitized_log_path),
-            )
-        )
     return command
 
 
@@ -122,10 +188,145 @@ def _track_options(item: MuxTrack) -> tuple[str, ...]:
         f"0:{'yes' if item.default else 'no'}",
         "--forced-display-flag",
         f"0:{'yes' if item.forced else 'no'}",
+        *_sync_option(item.sync_offset_ms),
     ]
     if item.name:
         values.extend(("--track-name", f"0:{item.name}"))
     return tuple(values)
+
+
+def _decimal(value: object, *, name: str) -> Decimal:
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not result.is_finite():
+        raise ValueError(f"{name} must be a finite number")
+    return result
+
+
+def _decimal_token(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    token = format(value, "f")
+    if "." in token:
+        token = token.rstrip("0").rstrip(".")
+    return token
+
+
+def _sync_option(offset_ms: Decimal) -> tuple[str, ...]:
+    if offset_ms == 0:
+        return ()
+    return ("--sync", f"0:{_decimal_token(offset_ms)}")
+
+
+def validate_mux_track_policy(
+    *,
+    audio_tracks: Sequence[MuxTrack],
+    subtitle_tracks: Sequence[MuxTrack],
+) -> tuple[str, ...]:
+    """Reject ambiguous defaults and unreviewed forced-subtitle declarations."""
+
+    errors: list[str] = []
+    if audio_tracks and sum(item.default for item in audio_tracks) != 1:
+        errors.append("exactly one retained audio track must be default")
+    for index, item in enumerate(audio_tracks, start=1):
+        if item.forced:
+            errors.append(f"audio track {index} cannot be forced")
+        if item.subtitle_kind is not None:
+            errors.append(f"audio track {index} cannot declare subtitle_kind")
+    for index, item in enumerate(subtitle_tracks, start=1):
+        if item.forced:
+            if item.subtitle_kind == "full":
+                errors.append(f"full subtitle track {index} cannot be forced")
+            elif item.subtitle_kind != "forced":
+                errors.append(
+                    f"subtitle track {index} cannot be forced without an explicit "
+                    "reviewed-forced classification"
+                )
+        elif item.subtitle_kind == "forced":
+            errors.append(
+                f"reviewed forced subtitle track {index} must set the forced flag"
+            )
+    return tuple(errors)
+
+
+def stream_start_probe_command(
+    input_path: Path, *, ffprobe: str = "ffprobe"
+) -> list[str]:
+    """Probe the absolute presentation start of every reference-remux stream."""
+
+    return [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=index,codec_type,start_time",
+        "-of",
+        "json",
+        str(input_path),
+    ]
+
+
+def parse_stream_start_times(document: Mapping[str, Any]) -> dict[int, Decimal]:
+    """Read a stream-index to absolute-start mapping without guessing gaps."""
+
+    streams = document.get("streams")
+    if not isinstance(streams, list):
+        raise ValueError("ffprobe stream-start report has no streams array")
+    result: dict[int, Decimal] = {}
+    for position, stream in enumerate(streams):
+        if not isinstance(stream, Mapping):
+            raise ValueError(f"stream-start entry {position} is not an object")
+        raw_index = stream.get("index")
+        if isinstance(raw_index, bool):
+            raise ValueError(f"stream-start entry {position} has no numeric index")
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"stream-start entry {position} has no numeric index"
+            ) from exc
+        if index in result:
+            raise ValueError(f"duplicate stream index in start report: {index}")
+        raw_start = stream.get("start_time")
+        if raw_start is None or raw_start == "N/A":
+            raise ValueError(f"stream {index} has no presentation start_time")
+        result[index] = _decimal(raw_start, name=f"stream {index} start")
+    if not result:
+        raise ValueError("ffprobe stream-start report has no streams")
+    return result
+
+
+def parse_stream_start_times_by_type(
+    document: Mapping[str, Any],
+) -> dict[tuple[str, int], Decimal]:
+    """Resolve starts by FFmpeg type ordinal, independent of absolute indexes."""
+
+    streams = document.get("streams")
+    if not isinstance(streams, list):
+        raise ValueError("ffprobe stream-start report has no streams array")
+    ordinals: dict[str, int] = {}
+    result: dict[tuple[str, int], Decimal] = {}
+    for position, stream in enumerate(streams):
+        if not isinstance(stream, Mapping):
+            raise ValueError(f"stream-start entry {position} is not an object")
+        codec_type = stream.get("codec_type")
+        if not isinstance(codec_type, str) or not codec_type:
+            raise ValueError(f"stream-start entry {position} has no codec_type")
+        ordinal = ordinals.get(codec_type, 0)
+        ordinals[codec_type] = ordinal + 1
+        raw_start = stream.get("start_time")
+        if raw_start is None or raw_start == "N/A":
+            raise ValueError(
+                f"{codec_type} stream ordinal {ordinal} has no presentation start_time"
+            )
+        result[(codec_type, ordinal)] = _decimal(
+            raw_start, name=f"{codec_type} stream ordinal {ordinal} start"
+        )
+    if not result:
+        raise ValueError("ffprobe stream-start report has no streams")
+    return result
 
 
 def inspection_commands(
@@ -158,7 +359,7 @@ def inspection_commands(
                 "error",
                 "-show_streams",
                 "-show_entries",
-                "stream=index,codec_name,profile,codec_type,width,height,pix_fmt,color_range,color_space,color_transfer,color_primaries,chroma_location,bits_per_raw_sample:stream_side_data",
+                "stream=index,codec_name,profile,level,codec_type,start_time,duration,width,height,pix_fmt,color_range,color_space,color_transfer,color_primaries,chroma_location,bits_per_raw_sample:stream_disposition:stream_side_data",
                 "-of",
                 "json",
                 str(output_path),
@@ -218,6 +419,12 @@ def validate_mkvmerge_identification(
     """Compare final Matroska topology and flags with the reviewed mux plan."""
 
     errors: list[str] = []
+    errors.extend(
+        validate_mux_track_policy(
+            audio_tracks=audio_tracks,
+            subtitle_tracks=subtitle_tracks,
+        )
+    )
     tracks = document.get("tracks")
     if not isinstance(tracks, list):
         return ("mkvmerge identification has no track array",)
@@ -231,6 +438,28 @@ def validate_mkvmerge_identification(
         errors.append(
             f"track topology differs: expected {expected_types}, got {actual_types}"
         )
+
+    actual_video = next(
+        (
+            item
+            for item in tracks
+            if isinstance(item, Mapping) and item.get("type") == "video"
+        ),
+        None,
+    )
+    video_properties = (
+        actual_video.get("properties", {})
+        if isinstance(actual_video, Mapping)
+        else {}
+    )
+    if not isinstance(video_properties, Mapping) or not bool(
+        video_properties.get("default_track", False)
+    ):
+        errors.append("the sole video track is not default")
+    if isinstance(video_properties, Mapping) and bool(
+        video_properties.get("forced_track", False)
+    ):
+        errors.append("the video track is unexpectedly forced")
 
     expected_media = [*audio_tracks, *subtitle_tracks]
     actual_media = [
@@ -261,12 +490,10 @@ def validate_mkvmerge_identification(
     if not isinstance(attachments, list):
         attachments = []
     names = [item.get("file_name") for item in attachments if isinstance(item, Mapping)]
-    if names != ["encode.log"]:
+    if names:
         errors.append(
-            f"attachment policy differs: expected only encode.log, got {names}"
+            f"attachment policy differs: public releases must have none, got {names}"
         )
-    elif not str(attachments[0].get("content_type", "")).startswith("text/plain"):
-        errors.append("encode.log attachment MIME type is not text/plain")
 
     container = document.get("container", {})
     properties = (
@@ -300,9 +527,9 @@ def validate_ffprobe_stream_policy(
     raw_streams = document.get("streams")
     if not isinstance(raw_streams, list):
         return ("ffprobe stream report has no streams array",)
-    # FFprobe represents the separately validated encode.log attachment as an
-    # ``attachment`` stream.  MKVToolNix identification above enforces that
-    # attachment exactly; this policy compares only playable media streams.
+    # Attachments are never emitted by v2.  Ignore one here only so the media
+    # topology diagnostic can report playable-stream differences independently;
+    # the MKVToolNix topology validator rejects attachments separately.
     streams = [
         item
         for item in raw_streams
@@ -329,6 +556,8 @@ def validate_ffprobe_stream_policy(
         "color_primaries": video.color_primaries,
         "chroma_location": video.chroma_location,
     }
+    if video.level is not None:
+        expected_video["level"] = video.level
     for key, expected in expected_video.items():
         actual = actual_video.get(key)
         if key == "codec_name":
@@ -347,6 +576,95 @@ def validate_ffprobe_stream_policy(
             errors.append(
                 f"track {index} codec differs: expected {expected.codec_name}, "
                 f"got {actual.get('codec_name')}"
+            )
+    return tuple(errors)
+
+
+def validate_stream_start_times(
+    document: Mapping[str, Any],
+    *,
+    expected_start_times: Sequence[Decimal | str | int | float],
+    tolerances: Sequence[Decimal | str | int | float] | None = None,
+    zero_tolerance: Decimal | str | int | float = Decimal("0.001"),
+) -> tuple[str, ...]:
+    """Validate final media starts and their offsets on a common zero timeline.
+
+    ``expected_start_times`` uses final playable-stream order (video, audios,
+    subtitles).  Both expected and actual values are compared relative to
+    their earliest stream, while the final container is separately required
+    to place that earliest stream at zero.  Attachments are ignored.
+    """
+
+    raw_streams = document.get("streams")
+    if not isinstance(raw_streams, list):
+        return ("ffprobe stream report has no streams array",)
+    streams = [
+        item
+        for item in raw_streams
+        if isinstance(item, Mapping) and item.get("codec_type") != "attachment"
+    ]
+    expected = tuple(
+        _decimal(value, name=f"expected stream {index} start")
+        for index, value in enumerate(expected_start_times)
+    )
+    if len(streams) != len(expected):
+        return (
+            "stream-start topology differs: "
+            f"expected {len(expected)} media streams, got {len(streams)}",
+        )
+    if not expected:
+        return ("stream-start policy has no media streams",)
+    if tolerances is None:
+        tolerance_values = (Decimal("0.001"),) * len(expected)
+    else:
+        tolerance_values = tuple(
+            _decimal(value, name=f"stream {index} start tolerance")
+            for index, value in enumerate(tolerances)
+        )
+        if len(tolerance_values) != len(expected):
+            raise ValueError("start tolerances must match expected stream count")
+    if any(value < 0 for value in tolerance_values):
+        raise ValueError("stream start tolerances cannot be negative")
+    allowed_zero_delta = _decimal(zero_tolerance, name="zero tolerance")
+    if allowed_zero_delta < 0:
+        raise ValueError("zero tolerance cannot be negative")
+
+    actual: list[Decimal] = []
+    errors: list[str] = []
+    for index, stream in enumerate(streams):
+        raw_start = stream.get("start_time")
+        if raw_start is None or raw_start == "N/A":
+            errors.append(f"stream {index} has no start_time")
+            continue
+        try:
+            actual.append(_decimal(raw_start, name=f"stream {index} start"))
+        except ValueError as exc:
+            errors.append(str(exc))
+    if errors:
+        return tuple(errors)
+
+    actual_origin = min(actual)
+    expected_origin = min(expected)
+    if abs(actual_origin) > allowed_zero_delta:
+        errors.append(
+            "final media timeline does not start at zero: "
+            f"earliest stream starts at {_decimal_token(actual_origin)}s"
+        )
+    normalized_actual = tuple(value - actual_origin for value in actual)
+    normalized_expected = tuple(value - expected_origin for value in expected)
+    for index, (actual_start, expected_start, tolerance) in enumerate(
+        zip(
+            normalized_actual,
+            normalized_expected,
+            tolerance_values,
+            strict=True,
+        )
+    ):
+        delta = actual_start - expected_start
+        if abs(delta) > tolerance:
+            errors.append(
+                f"stream {index} relative start differs by "
+                f"{_decimal_token(delta)}s (allowed {_decimal_token(tolerance)}s)"
             )
     return tuple(errors)
 

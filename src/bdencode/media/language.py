@@ -120,6 +120,10 @@ _ISO639_2T_TO_BCP47: dict[str, str | None] = {
     "urd": "ur",
     "vie": "vi",
     "zho": "zh",
+    # Matroska/BCP-47 can carry the macrolanguage varieties that matter for
+    # original-track policy even though they are ISO 639-3 rather than 639-2.
+    "cmn": "cmn",
+    "yue": "yue",
     "mul": "mul",
     "zxx": "zxx",
 }
@@ -261,20 +265,36 @@ class LanguageResolver:
         mpls_code = self._code_for(valid, LanguageSource.MPLS)
         clpi_code = self._code_for(valid, LanguageSource.CLPI)
 
+        declared_codes = {item.normalized_code for item in declared}
+        strong_content = [item for item in content if item.confidence >= 0.85]
+        # Authored MPLS/CLPI/PMT tags often repeat the same wrong language.  A
+        # strong content result must therefore be allowed to contradict even a
+        # unanimous declaration instead of being silently discarded.
+        if len(declared_codes) == 1 and strong_content:
+            declared_code = next(iter(declared_codes))
+            disagreeing = [
+                item for item in strong_content if item.normalized_code != declared_code
+            ]
+            if disagreeing:
+                selected = max(disagreeing, key=lambda item: item.confidence)
+                return self._decision(
+                    selected.normalized_code,
+                    LanguageStatus.CONFLICT,
+                    selected.confidence,
+                    evidence,
+                    needs_review=True,
+                )
         if mpls_code and clpi_code and mpls_code == clpi_code:
             confirmations = sum(item.normalized_code == mpls_code for item in valid)
             confidence = min(0.99, 0.96 + max(0, confirmations - 2) * 0.01)
             return self._decision(
                 mpls_code, LanguageStatus.DECLARED, confidence, evidence
             )
-
-        declared_codes = {item.normalized_code for item in declared}
         if len(declared_codes) > 1:
             # A strong content result can choose a likely value, but the authored
             # contradiction remains visible and requires review.
-            strong = [item for item in content if item.confidence >= 0.85]
             corroborated = [
-                item for item in strong if item.normalized_code in declared_codes
+                item for item in strong_content if item.normalized_code in declared_codes
             ]
             selected = max(corroborated, key=lambda item: item.confidence, default=None)
             return self._decision(

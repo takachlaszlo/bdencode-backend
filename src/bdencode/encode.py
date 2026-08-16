@@ -7,8 +7,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from bdencode.audio import audio_encode_args
+from bdencode.audio import audio_decode_input_args, audio_encode_args
 from bdencode.media.profiles import EncoderSettings
+
+
+@dataclass(frozen=True, slots=True)
+class PcmBlurayAudio:
+    """One Blu-ray PCM stream that needs a Matroska-compatible representation."""
+
+    ordinal: int
+    bit_depth: int
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 0:
+            raise ValueError("audio stream ordinal must be non-negative")
+        if self.bit_depth not in {16, 20, 24}:
+            raise ValueError("Blu-ray PCM bit depth must be 16, 20 or 24")
+
+    @property
+    def ffmpeg_codec(self) -> str:
+        # FFmpeg has no packed 20-bit PCM encoder. pcm_s24le preserves all 20
+        # significant bits without loss; 16-bit material must not be padded.
+        return "pcm_s16le" if self.bit_depth == 16 else "pcm_s24le"
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,18 +37,15 @@ class ReferenceRemuxPlan:
     playlist_id: str
     output_path: Path
     angle: int = 1
-    pcm_bluray_audio_ordinals: tuple[int, ...] = ()
+    pcm_bluray_audio: tuple[PcmBlurayAudio, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.playlist_id.isdigit():
             raise ValueError("playlist_id must be numeric")
         if self.angle < 1:
             raise ValueError("angle must be at least one")
-        if any(item < 0 for item in self.pcm_bluray_audio_ordinals):
-            raise ValueError("audio stream ordinals must be non-negative")
-        if tuple(sorted(set(self.pcm_bluray_audio_ordinals))) != (
-            self.pcm_bluray_audio_ordinals
-        ):
+        ordinals = tuple(item.ordinal for item in self.pcm_bluray_audio)
+        if tuple(sorted(set(ordinals))) != ordinals:
             raise ValueError("audio stream ordinals must be sorted and unique")
 
 
@@ -61,8 +78,8 @@ def reference_remux_command(
     # Matroska cannot carry FFmpeg's pcm_bluray codec directly. Convert only
     # those audio streams to an equivalent lossless, container-native PCM
     # representation; video, subtitles, and other audio codecs stay bit-exact.
-    for ordinal in plan.pcm_bluray_audio_ordinals:
-        command.extend((f"-c:a:{ordinal}", "pcm_s24le"))
+    for stream in plan.pcm_bluray_audio:
+        command.extend((f"-c:a:{stream.ordinal}", stream.ffmpeg_codec))
     command.extend(
         [
             "-avoid_negative_ts",
@@ -126,7 +143,7 @@ def encode_pipeline_commands(
 
 def audio_track_command(
     reference_path: Path,
-    stream_index: int,
+    stream_ordinal: int,
     output_path: Path,
     *,
     action: str,
@@ -134,24 +151,19 @@ def audio_track_command(
     source_profile: str | None = None,
     source_channels: int | None = None,
     source_sample_rate: int | None = None,
+    source_bit_depth: int | None = None,
     ffmpeg: str = "ffmpeg",
 ) -> list[str]:
-    if stream_index < 0:
-        raise ValueError("stream_index cannot be negative")
-    source_codec_token = "".join(
-        character for character in source_codec.casefold() if character.isalnum()
-    )
-    decoder_args = (
-        ["-drc_scale", "0"]
-        if source_codec_token in {"ac3", "eac3", "eac3secondary"}
-        else []
-    )
+    if stream_ordinal < 0:
+        raise ValueError("stream_ordinal cannot be negative")
+    decoder_args = audio_decode_input_args(source_codec)
     codec_args = audio_encode_args(
         action,
         source_codec=source_codec,
         source_profile=source_profile,
         source_channels=source_channels,
         source_sample_rate=source_sample_rate,
+        source_bit_depth=source_bit_depth,
     )
     return [
         ffmpeg,
@@ -159,12 +171,15 @@ def audio_track_command(
         "-nostdin",
         "-v",
         "info",
+        "-xerror",
+        "-err_detect",
+        "explode",
         "-copyts",
         *decoder_args,
         "-i",
         str(reference_path),
         "-map",
-        f"0:{stream_index}",
+        f"0:a:{stream_ordinal}",
         "-vn",
         "-sn",
         "-dn",
@@ -182,24 +197,27 @@ def audio_track_command(
 
 def subtitle_track_command(
     reference_path: Path,
-    stream_index: int,
+    stream_ordinal: int,
     output_path: Path,
     *,
     ffmpeg: str = "ffmpeg",
 ) -> list[str]:
-    if stream_index < 0:
-        raise ValueError("stream_index cannot be negative")
+    if stream_ordinal < 0:
+        raise ValueError("stream_ordinal cannot be negative")
     return [
         ffmpeg,
         "-hide_banner",
         "-nostdin",
         "-v",
         "info",
+        "-xerror",
+        "-err_detect",
+        "explode",
         "-copyts",
         "-i",
         str(reference_path),
         "-map",
-        f"0:{stream_index}",
+        f"0:s:{stream_ordinal}",
         "-vn",
         "-an",
         "-dn",

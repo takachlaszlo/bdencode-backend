@@ -134,14 +134,14 @@ def sample_windows(
 
 def audio_sample_command(
     input_path: Path,
-    stream_index: int,
+    audio_ordinal: int,
     window: SampleWindow,
     output_wav: Path,
     *,
     ffmpeg: str = "ffmpeg",
 ) -> list[str]:
-    if stream_index < 0:
-        raise ValueError("stream index cannot be negative")
+    if audio_ordinal < 0:
+        raise ValueError("audio ordinal cannot be negative")
     return [
         ffmpeg,
         "-hide_banner",
@@ -155,7 +155,7 @@ def audio_sample_command(
         "-i",
         str(input_path),
         "-map",
-        f"0:{stream_index}",
+        f"0:a:{audio_ordinal}",
         "-vn",
         "-sn",
         "-dn",

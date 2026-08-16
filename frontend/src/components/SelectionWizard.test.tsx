@@ -76,7 +76,7 @@ describe("SelectionWizard", () => {
 
     await user.click(screen.getByRole("button", { name: "Tovább" }));
     expect(screen.getByRole("heading", { name: "Hangsávok" })).toBeInTheDocument();
-    expect(screen.getByDisplayValue("eng")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("forrás: eng")).toBeInTheDocument();
     for (const label of ["Copy", "FLAC", "AC-3", "E-AC-3", "DTS", "Kihagyás"]) {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
@@ -98,12 +98,12 @@ describe("SelectionWizard", () => {
       "job-1",
       expect.objectContaining({
         playlist_id: "00001",
-        output_name: "Mintafilm.BluRay.x264",
+        output_name: "Mintafilm.1080p.BluRay.x264",
         video: expect.objectContaining({
           detail_level: "beginner",
           settings: expect.objectContaining({ crf: 18 }),
         }),
-        tracks: [expect.objectContaining({ stream_id: "audio:4352", action: "eac3", language: "eng" })],
+        tracks: [expect.objectContaining({ stream_id: "audio:4352", action: "eac3", language: null })],
         image_upload_provider: "catbox",
         dual_type_match: true,
       }),
@@ -130,7 +130,7 @@ describe("SelectionWizard", () => {
     expect(screen.getByText("Playlist 00001")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Tovább" }));
     expect(screen.getByRole("heading", { name: "Hangsávok" })).toBeInTheDocument();
-    expect(screen.getByDisplayValue("eng")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("forrás: eng")).toBeInTheDocument();
   });
 
   it("lists missing source color fields and sends the explicitly confirmed BD defaults", async () => {

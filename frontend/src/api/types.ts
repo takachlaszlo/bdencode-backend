@@ -33,6 +33,7 @@ export interface HealthResponse {
 
 export interface CapabilitiesResponse {
   api_version: string;
+  backend_version: string;
   job_states: JobState[];
   terminal_states: JobState[];
   blocking_states: JobState[];
@@ -390,10 +391,12 @@ export interface TrackSelection {
   name: string | null;
   default: boolean;
   forced: boolean;
+  subtitle_kind: "unknown" | "full" | "forced" | null;
   order: number;
 }
 
 export interface SelectionPayload {
+  schema_version: 2;
   playlist_id: string;
   angle: number;
   output_name: string;

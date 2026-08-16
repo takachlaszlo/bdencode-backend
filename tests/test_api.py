@@ -192,7 +192,7 @@ def valid_selection() -> dict[str, object]:
         "video": {
             "detail_level": "advanced",
             "temporal_filter": "progressive",
-            "crop": {"left": "0", "top": "138", "right": "0", "bottom": "138"},
+            "crop": {"left": 0, "top": 138, "right": 0, "bottom": 138},
             "settings": {"crf": 17.5, "preset": "slow"},
         },
         "tracks": [],
@@ -204,6 +204,7 @@ def test_health_capabilities_and_job_flow(tmp_path):
     with make_client(tmp_path) as client:
         capabilities = client.get("/api/v1/capabilities")
         assert capabilities.status_code == 200
+        assert capabilities.json()["backend_version"] == "2.0.0"
         assert capabilities.json()["constraints"]["max_active_jobs"] == 1
         assert capabilities.json()["output_video_codecs"] == ["x264", "x265"]
         assert capabilities.json()["audio_actions"] == [

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -314,6 +315,14 @@ class EncodeProgressReporter:
 
     def _append_jsonl(self, progress: EncodeProgress) -> None:
         self.jsonl_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        if os.path.lexists(self.jsonl_path):
+            is_junction = getattr(self.jsonl_path, "is_junction", None)
+            if self.jsonl_path.is_symlink() or (
+                callable(is_junction) and is_junction()
+            ):
+                raise ValueError(
+                    "progress JSONL path cannot be a symbolic link or junction"
+                )
         record = {
             "timestamp": datetime.now(UTC).isoformat(timespec="microseconds"),
             **progress.details(),

@@ -9,6 +9,7 @@ export interface StoredTrackSelection {
   name?: string | null;
   default?: boolean;
   forced?: boolean;
+  subtitle_kind?: "unknown" | "full" | "forced" | null;
   order?: number;
 }
 
@@ -100,6 +101,14 @@ function normalizeTracks(value: unknown): StoredTrackSelection[] {
     }
     if (typeof candidate.default === "boolean") normalized.default = candidate.default;
     if (typeof candidate.forced === "boolean") normalized.forced = candidate.forced;
+    if (
+      candidate.subtitle_kind === null
+      || candidate.subtitle_kind === "unknown"
+      || candidate.subtitle_kind === "full"
+      || candidate.subtitle_kind === "forced"
+    ) {
+      normalized.subtitle_kind = candidate.subtitle_kind;
+    }
     normalized.order = typeof candidate.order === "number"
       && Number.isInteger(candidate.order)
       && candidate.order >= 0

@@ -28,7 +28,7 @@ def test_audio_sample_is_mono_16k_and_stream_specific() -> None:
     command = audio_sample_command(
         Path("reference.mkv"), 3, SampleWindow(90), Path("sample.wav")
     )
-    assert command[command.index("-map") + 1] == "0:3"
+    assert command[command.index("-map") + 1] == "0:a:3"
     assert command[command.index("-ac") + 1] == "1"
     assert command[command.index("-ar") + 1] == "16000"
 

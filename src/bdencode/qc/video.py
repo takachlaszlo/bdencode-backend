@@ -11,13 +11,54 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 
 
 FRAME_TYPES = ("I", "P", "B")
-COMPARISON_FONT_FILE = Path(
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-)
+MIN_STRONG_COMPARISON_PAIRS = 20
+DEFAULT_COMPARISON_PAIRS = 24
+MAX_STRONG_COMPARISON_PAIRS = 50
+DEFAULT_KEYFRAME_PREROLL_SECONDS = Decimal("12")
+COMPARISON_FONT_FILE = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 
 
 class FrameSelectionError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class CropMargins:
+    """Active-picture crop margins, expressed in decoded luma pixels."""
+
+    left: int = 0
+    top: int = 0
+    right: int = 0
+    bottom: int = 0
+
+    def __post_init__(self) -> None:
+        if min(self.left, self.top, self.right, self.bottom) < 0:
+            raise ValueError("crop margins cannot be negative")
+
+    @property
+    def applied(self) -> bool:
+        return any((self.left, self.top, self.right, self.bottom))
+
+    def validate_subsampled(
+        self, *, chroma_width: int = 2, chroma_height: int = 2
+    ) -> None:
+        """Reject margins which would shift a subsampled chroma plane."""
+
+        if chroma_width < 1 or chroma_height < 1:
+            raise ValueError("chroma subsampling factors must be positive")
+        if self.left % chroma_width or self.right % chroma_width:
+            raise ValueError("horizontal crop margins are not chroma aligned")
+        if self.top % chroma_height or self.bottom % chroma_height:
+            raise ValueError("vertical crop margins are not chroma aligned")
+
+    def ffmpeg_filter(self) -> str:
+        return (
+            f"crop=iw-{self.left + self.right}:ih-{self.top + self.bottom}:"
+            f"{self.left}:{self.top}"
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,12 +153,27 @@ class FrameProbeInterval:
     def end_seconds(self) -> Decimal:
         return self.start_seconds + self.duration_seconds
 
-    def ffprobe_value(self, pts_origin: Decimal) -> str:
-        """Render an absolute interval on one input's container timeline."""
+    def ffprobe_value(
+        self,
+        pts_origin: Decimal,
+        *,
+        decode_preroll_seconds: Decimal = Decimal(0),
+    ) -> str:
+        """Render an absolute interval with optional decoder-safe GOP preroll.
+
+        FFprobe seeks each ``read_intervals`` entry independently. Starting
+        exactly at a requested sample can therefore expose an open-GOP B-frame
+        without its references. Seeking at least one maximum GOP earlier lets
+        the demuxer land on an earlier keyframe and warms the decoder before
+        the actual evidence window.
+        """
 
         if not pts_origin.is_finite():
             raise ValueError("sample PTS origin must be finite")
-        start = pts_origin + self.start_seconds
+        if not decode_preroll_seconds.is_finite() or decode_preroll_seconds < 0:
+            raise ValueError("decode preroll must be finite and non-negative")
+        normalized_start = max(Decimal(0), self.start_seconds - decode_preroll_seconds)
+        start = pts_origin + normalized_start
         end = pts_origin + self.end_seconds
         return f"{_format_decimal(start)}%{_format_decimal(end)}"
 
@@ -196,13 +252,15 @@ def _format_decimal(value: Decimal) -> str:
 def plan_sample_intervals(
     info: VapourSynthInfo,
     *,
-    distributed_windows: int = 10,
-    window_seconds: Decimal = Decimal("3"),
+    distributed_windows: int = DEFAULT_COMPARISON_PAIRS,
+    window_seconds: Decimal = Decimal("2"),
     opening_seconds: Decimal = Decimal("6"),
 ) -> tuple[FrameProbeInterval, ...]:
     """Plan a short opening sample plus bounded samples across the title.
 
-    The union of returned intervals is never longer than
+    The default provides 24 independent regions for a release-grade 20--50
+    frame comparison instead of clustering adjacent P/B frames. The union of
+    returned intervals is never longer than
     ``opening_seconds + distributed_windows * window_seconds``. Overlapping
     windows on short clips are merged, so they do not decode the same region
     twice. The opening sample is important: it gives sampled frame parsing a
@@ -242,6 +300,22 @@ def plan_sample_intervals(
             prior.start_seconds, min(end, clip_duration) - prior.start_seconds
         )
     return tuple(merged)
+
+
+def recommended_comparison_pair_count(requested: int = DEFAULT_COMPARISON_PAIRS) -> int:
+    """Validate a release-grade visual sample count.
+
+    The helper is deliberately independent of title length so configuration
+    validation is cheap and deterministic. Very short clips which cannot
+    supply the requested unique frames still fail explicitly at selection.
+    """
+
+    if not MIN_STRONG_COMPARISON_PAIRS <= requested <= MAX_STRONG_COMPARISON_PAIRS:
+        raise ValueError(
+            "comparison pair count must be between "
+            f"{MIN_STRONG_COMPARISON_PAIRS} and {MAX_STRONG_COMPARISON_PAIRS}"
+        )
+    return requested
 
 
 def parse_ffprobe_frames(
@@ -438,6 +512,70 @@ def _evenly_spaced_on_timeline(
     return sorted(selected, key=lambda item: item.presentation_index)
 
 
+def _balanced_type_counts(total: int) -> dict[str, int]:
+    """Allocate evidence evenly while retaining the historical 1I/2P/2B split."""
+
+    base, remainder = divmod(total, len(FRAME_TYPES))
+    requested = {name: base for name in FRAME_TYPES}
+    # Predicted frames remain slightly more useful when the total is not a
+    # multiple of three, but large plans no longer collapse to a single I-frame.
+    for category in ("P", "B", "I")[:remainder]:
+        requested[category] += 1
+    return requested
+
+
+def _category_schedule(requested: Mapping[str, int]) -> list[str]:
+    remaining = dict(requested)
+    schedule: list[str] = []
+    while any(remaining.values()):
+        for category in ("P", "B", "I"):
+            if remaining[category]:
+                schedule.append(category)
+                remaining[category] -= 1
+    return schedule
+
+
+def _globally_distributed_frames(
+    candidates: Mapping[str, Sequence[FrameRecord]],
+    requested: Mapping[str, int],
+    *,
+    timeline_frames: int,
+    minimum_separation_frames: int,
+) -> list[FrameRecord]:
+    """Select one type at each global target instead of clustered type groups."""
+
+    schedule = _category_schedule(requested)
+    selected: list[FrameRecord] = []
+    used_indexes: set[int] = set()
+    for position, category in enumerate(schedule, start=1):
+        target = position * (timeline_frames - 1) / (len(schedule) + 1)
+        eligible = [
+            item
+            for item in candidates[category]
+            if item.presentation_index not in used_indexes
+            and all(
+                abs(item.presentation_index - prior.presentation_index)
+                >= minimum_separation_frames
+                for prior in selected
+            )
+        ]
+        if not eligible:
+            raise FrameSelectionError(
+                f"need a unique separated {category} frame near timeline target "
+                f"{position}/{len(schedule)}"
+            )
+        chosen = min(
+            eligible,
+            key=lambda item: (
+                abs(item.presentation_index - target),
+                item.presentation_index,
+            ),
+        )
+        selected.append(chosen)
+        used_indexes.add(chosen.presentation_index)
+    return sorted(selected, key=lambda item: item.presentation_index)
+
+
 def select_frame_pairs(
     encoded: Sequence[FrameRecord],
     reference: Sequence[FrameRecord],
@@ -447,6 +585,7 @@ def select_frame_pairs(
     dual_type_match: bool = False,
     total_pairs: int | None = None,
     timeline_frames: int | None = None,
+    minimum_separation_frames: int | None = None,
 ) -> list[FramePair]:
     """Select identical presentation frames, categorized by final encode type.
 
@@ -460,6 +599,8 @@ def select_frame_pairs(
         raise ValueError("total_pairs must leave room for mandatory I/P/B frames")
     if timeline_frames is not None and timeline_frames < 1:
         raise ValueError("timeline_frames must be positive")
+    if minimum_separation_frames is not None and minimum_separation_frames < 1:
+        raise ValueError("minimum frame separation must be positive")
     reference_by_index = {frame.presentation_index: frame for frame in reference}
     if len(reference_by_index) != len(reference):
         raise FrameSelectionError("reference presentation indexes are not unique")
@@ -480,24 +621,48 @@ def select_frame_pairs(
     if total_pairs is None:
         requested = {name: per_type for name in FRAME_TYPES}
     else:
-        requested = {name: 1 for name in FRAME_TYPES}
-        # Extra visual evidence is more useful for predicted/bidirectional
-        # frames than for additional I-frames. For five total pairs this yields
-        # exactly 1 I + 2 P + 2 B.
-        for offset in range(total_pairs - len(FRAME_TYPES)):
-            requested["P" if offset % 2 == 0 else "B"] += 1
+        requested = _balanced_type_counts(total_pairs)
+
+    if timeline_frames is not None:
+        pair_total = sum(requested.values())
+        separation = minimum_separation_frames or max(
+            1, timeline_frames // (pair_total * 4)
+        )
+        try:
+            selected_frames = _globally_distributed_frames(
+                candidates,
+                requested,
+                timeline_frames=timeline_frames,
+                minimum_separation_frames=separation,
+            )
+        except FrameSelectionError as exc:
+            qualifier = "aligned dual-type" if dual_type_match else "aligned"
+            raise FrameSelectionError(
+                f"missing mandatory {qualifier} comparison frames: {exc}"
+            ) from exc
+        pairs = []
+        for frame in selected_frames:
+            category = frame.pict_type
+            assert category in FRAME_TYPES
+            source = reference_by_index[frame.presentation_index]
+            pairs.append(
+                FramePair(
+                    category=category,
+                    presentation_index=frame.presentation_index,
+                    encoded_pts_seconds=frame.pts_seconds,
+                    reference_pts_seconds=source.pts_seconds,
+                    encoded_pict_type=category,
+                    source_pict_type=source.pict_type,
+                    dual_type_match=source.pict_type == category,
+                )
+            )
+        return pairs
 
     pairs: list[FramePair] = []
     for category in FRAME_TYPES:
         try:
             count = requested[category]
-            selected = (
-                _evenly_spaced(candidates[category], count)
-                if timeline_frames is None
-                else _evenly_spaced_on_timeline(
-                    candidates[category], count, timeline_frames
-                )
-            )
+            selected = _evenly_spaced(candidates[category], count)
         except FrameSelectionError as exc:
             qualifier = " aligned dual-type" if dual_type_match else " aligned"
             raise FrameSelectionError(
@@ -540,9 +705,10 @@ def ffprobe_sampled_frame_command(
     intervals: Sequence[FrameProbeInterval],
     *,
     pts_origin: Decimal,
+    decode_preroll_seconds: Decimal = DEFAULT_KEYFRAME_PREROLL_SECONDS,
     ffprobe: str = "ffprobe",
 ) -> list[str]:
-    """Probe decoded frame metadata only inside explicitly bounded intervals."""
+    """Probe bounded windows after warming the decoder from an earlier GOP."""
 
     if not intervals:
         raise ValueError("at least one frame probe interval is required")
@@ -550,6 +716,8 @@ def ffprobe_sampled_frame_command(
     for left, right in zip(ordered, ordered[1:]):
         if left.end_seconds > right.start_seconds:
             raise ValueError("frame probe intervals must not overlap")
+    if not decode_preroll_seconds.is_finite() or decode_preroll_seconds < 0:
+        raise ValueError("decode preroll must be finite and non-negative")
     return [
         ffprobe,
         "-v",
@@ -557,7 +725,12 @@ def ffprobe_sampled_frame_command(
         "-select_streams",
         "v:0",
         "-read_intervals",
-        ",".join(item.ffprobe_value(pts_origin) for item in ordered),
+        ",".join(
+            item.ffprobe_value(
+                pts_origin, decode_preroll_seconds=decode_preroll_seconds
+            )
+            for item in ordered
+        ),
         "-show_frames",
         "-show_entries",
         "frame=media_type,best_effort_timestamp_time,pts_time,pict_type,key_frame,coded_picture_number",
@@ -637,9 +810,11 @@ def extract_png_command(
         "0:v:0",
         "-vf",
         ",".join(filters),
-        "-vsync",
-        "0",
+        "-fps_mode",
+        "passthrough",
         "-frames:v",
+        "1",
+        "-update",
         "1",
         "-compression_level",
         "6",
@@ -659,18 +834,36 @@ def extract_png_at_timestamp_command(
     color_transfer: str | None = None,
     color_matrix: str | None = None,
     color_range: str = "limited",
+    decode_start_seconds: Decimal | None = None,
+    decode_preroll_seconds: Decimal = DEFAULT_KEYFRAME_PREROLL_SECONDS,
     ffmpeg: str = "ffmpeg",
 ) -> list[str]:
     """Seek to and decode one known sampled presentation timestamp.
 
-    FFmpeg's default accurate input seek decodes from the preceding keyframe and
-    discards frames before the requested timestamp. This avoids the old
-    ``select=n`` behavior, which decoded from frame zero for every comparison
-    image.
+    A coarse input seek is placed one maximum GOP before the target, then an
+    accurate output seek decodes/discards the preroll. This prevents open-GOP
+    recovery warnings from contaminating the selected frame without decoding
+    from frame zero for every comparison image. ``decode_start_seconds`` lets a
+    caller supply an exact earlier keyframe timestamp when one is known.
     """
 
     if not pts_seconds.is_finite():
         raise ValueError("PNG seek timestamp must be finite")
+    if not decode_preroll_seconds.is_finite() or decode_preroll_seconds < 0:
+        raise ValueError("decode preroll must be finite and non-negative")
+    if decode_start_seconds is not None:
+        if not decode_start_seconds.is_finite():
+            raise ValueError("PNG decode start timestamp must be finite")
+        if decode_start_seconds > pts_seconds:
+            raise ValueError("PNG decode start cannot follow the target timestamp")
+        seek_start = decode_start_seconds
+    elif pts_seconds > 0:
+        seek_start = max(Decimal(0), pts_seconds - decode_preroll_seconds)
+    else:
+        seek_start = None
+    discard_seconds = (
+        Decimal(0) if seek_start is None else max(Decimal(0), pts_seconds - seek_start)
+    )
     color_primaries = color_primaries or ("bt2020" if source_hdr10 else "bt709")
     color_transfer = color_transfer or ("smpte2084" if source_hdr10 else "bt709")
     color_matrix = color_matrix or ("bt2020nc" if source_hdr10 else "bt709")
@@ -682,35 +875,48 @@ def extract_png_at_timestamp_command(
         color_matrix=color_matrix,
         color_range=color_range,
     )
-    return [
+    command = [
         ffmpeg,
         "-hide_banner",
         "-nostdin",
         "-v",
         "warning",
-        "-seek_timestamp",
-        "1",
-        "-ss",
-        _format_decimal(pts_seconds),
-        "-accurate_seek",
-        "-i",
-        str(input_path),
-        "-map",
-        "0:v:0",
-        "-an",
-        "-sn",
-        "-dn",
-        "-vf",
-        ",".join(filters),
-        "-vsync",
-        "0",
-        "-frames:v",
-        "1",
-        "-compression_level",
-        "6",
-        "-y",
-        str(output_path),
     ]
+    if seek_start is not None:
+        command.extend(
+            [
+                "-seek_timestamp",
+                "1",
+                "-ss",
+                _format_decimal(seek_start),
+                "-accurate_seek",
+            ]
+        )
+    command.extend(["-i", str(input_path)])
+    if discard_seconds:
+        command.extend(["-ss", _format_decimal(discard_seconds)])
+    command.extend(
+        [
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            ",".join(filters),
+            "-fps_mode",
+            "passthrough",
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+            "-compression_level",
+            "6",
+            "-y",
+            str(output_path),
+        ]
+    )
+    return command
 
 
 def annotate_comparison_png_command(
@@ -771,6 +977,10 @@ def annotate_comparison_png_command(
         filters,
         "-frames:v",
         "1",
+        "-fps_mode",
+        "passthrough",
+        "-update",
+        "1",
         "-c:v",
         "png",
         "-pix_fmt",
@@ -788,9 +998,14 @@ def metric_command(
     output_json: Path,
     *,
     include_vmaf: bool,
+    crop: CropMargins | None = None,
     ffmpeg: str = "ffmpeg",
 ) -> list[str]:
-    filters = "[0:v]settb=AVTB,setpts=PTS-STARTPTS[ref];[1:v]settb=AVTB,setpts=PTS-STARTPTS[enc];"
+    active_filter = f",{crop.ffmpeg_filter()}" if crop and crop.applied else ""
+    filters = (
+        f"[0:v]settb=AVTB,setpts=PTS-STARTPTS{active_filter}[ref];"
+        f"[1:v]settb=AVTB,setpts=PTS-STARTPTS{active_filter}[enc];"
+    )
     if include_vmaf:
         filters += f"[enc][ref]libvmaf=log_fmt=json:log_path={_escape_filter_path(output_json)}"
     else:
@@ -812,6 +1027,179 @@ def metric_command(
         "null",
         "-",
     ]
+
+
+def extract_y4m_at_timestamp_command(
+    input_path: Path,
+    pts_seconds: Decimal,
+    output_path: Path,
+    *,
+    crop: CropMargins | None = None,
+    decode_start_seconds: Decimal | None = None,
+    decode_preroll_seconds: Decimal = DEFAULT_KEYFRAME_PREROLL_SECONDS,
+    ffmpeg: str = "ffmpeg",
+) -> list[str]:
+    """Decode one native-YUV evidence frame with open-GOP-safe preroll."""
+
+    if not pts_seconds.is_finite():
+        raise ValueError("Y4M seek timestamp must be finite")
+    if not decode_preroll_seconds.is_finite() or decode_preroll_seconds < 0:
+        raise ValueError("decode preroll must be finite and non-negative")
+    if decode_start_seconds is not None:
+        if not decode_start_seconds.is_finite():
+            raise ValueError("Y4M decode start timestamp must be finite")
+        if decode_start_seconds > pts_seconds:
+            raise ValueError("Y4M decode start cannot follow the target timestamp")
+        seek_start = decode_start_seconds
+    elif pts_seconds > 0:
+        seek_start = max(Decimal(0), pts_seconds - decode_preroll_seconds)
+    else:
+        seek_start = None
+    discard_seconds = (
+        Decimal(0) if seek_start is None else max(Decimal(0), pts_seconds - seek_start)
+    )
+    command = [ffmpeg, "-hide_banner", "-nostdin", "-v", "warning"]
+    if seek_start is not None:
+        command.extend(
+            [
+                "-seek_timestamp",
+                "1",
+                "-ss",
+                _format_decimal(seek_start),
+                "-accurate_seek",
+            ]
+        )
+    command.extend(["-i", str(input_path)])
+    if discard_seconds:
+        command.extend(["-ss", _format_decimal(discard_seconds)])
+    command.extend(["-map", "0:v:0", "-an", "-sn", "-dn"])
+    if crop and crop.applied:
+        crop.validate_subsampled()
+        command.extend(["-vf", crop.ffmpeg_filter()])
+    command.extend(
+        [
+            "-frames:v",
+            "1",
+            "-f",
+            "yuv4mpegpipe",
+            "-y",
+            str(output_path),
+        ]
+    )
+    return command
+
+
+def native_yuv_metric_command(
+    reference_y4m: Path,
+    encoded_y4m: Path,
+    ssim_output: Path,
+    psnr_output: Path,
+    *,
+    crop: CropMargins | None = None,
+    pixel_format: str | None = None,
+    ffmpeg: str = "ffmpeg",
+) -> list[str]:
+    """Measure SSIM/PSNR on native Y/U/V planes and write per-plane stats.
+
+    No RGB transform is inserted. ``pixel_format`` is optional and should only
+    be supplied when both inputs must be normalized to the known source format.
+    """
+
+    if pixel_format is not None and not re.fullmatch(r"[a-z0-9_]+", pixel_format):
+        raise ValueError("invalid FFmpeg pixel format")
+    if crop and crop.applied:
+        crop.validate_subsampled()
+    active_filter = f",{crop.ffmpeg_filter()}" if crop and crop.applied else ""
+    format_filter = f",format={pixel_format}" if pixel_format else ""
+    ssim_stats = _escape_filter_path(ssim_output)
+    psnr_stats = _escape_filter_path(psnr_output)
+    filters = (
+        f"[0:v]settb=AVTB,setpts=PTS-STARTPTS{active_filter}{format_filter},"
+        "split=2[ref_ssim][ref_psnr];"
+        f"[1:v]settb=AVTB,setpts=PTS-STARTPTS{active_filter}{format_filter},"
+        "split=2[enc_ssim][enc_psnr];"
+        f"[enc_ssim][ref_ssim]ssim=stats_file={ssim_stats}[ssimout];"
+        f"[enc_psnr][ref_psnr]psnr=stats_file={psnr_stats}[psnrout]"
+    )
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "info",
+        "-i",
+        str(reference_y4m),
+        "-i",
+        str(encoded_y4m),
+        "-filter_complex",
+        filters,
+        "-map",
+        "[ssimout]",
+        "-map",
+        "[psnrout]",
+        "-f",
+        "null",
+        "-",
+    ]
+
+
+def parse_ffmpeg_metric_stats(text: str) -> dict[str, float | str]:
+    """Parse the final FFmpeg SSIM/PSNR stats row, including Y/U/V fields."""
+
+    parsed: dict[str, float | str] = {}
+    for line in text.splitlines():
+        values: dict[str, float | str] = {}
+        for name, raw in re.findall(r"(?:^|\s)([A-Za-z][A-Za-z0-9_]*):([^\s]+)", line):
+            normalized = raw.strip("()")
+            try:
+                numeric = float(normalized)
+            except ValueError:
+                values[name] = normalized
+            else:
+                values[name] = numeric if numeric == numeric else normalized
+        if values:
+            parsed = values
+    if not parsed:
+        raise ValueError("FFmpeg metric stats contain no key/value row")
+    return parsed
+
+
+_CROPDETECT_PATTERN = re.compile(
+    r"(?:^|\s)crop=(?P<width>\d+):(?P<height>\d+):(?P<x>\d+):(?P<y>\d+)"
+)
+
+
+def parse_cropdetect(
+    text: str,
+    *,
+    source_width: int,
+    source_height: int,
+    minimum_observations: int = 3,
+) -> CropMargins:
+    """Return the modal active-picture crop from a distributed cropdetect log."""
+
+    if source_width < 1 or source_height < 1:
+        raise ValueError("source dimensions must be positive")
+    if minimum_observations < 1:
+        raise ValueError("minimum crop observations must be positive")
+    counts: dict[tuple[int, int, int, int], int] = {}
+    for match in _CROPDETECT_PATTERN.finditer(text):
+        value = tuple(int(match.group(name)) for name in ("width", "height", "x", "y"))
+        counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        raise ValueError("cropdetect log contains no crop observations")
+    (width, height, x, y), observations = max(
+        counts.items(), key=lambda item: (item[1], item[0][0] * item[0][1])
+    )
+    if observations < minimum_observations:
+        raise ValueError("cropdetect result is not supported by enough observations")
+    right = source_width - width - x
+    bottom = source_height - height - y
+    if min(right, bottom) < 0:
+        raise ValueError("cropdetect result exceeds the source canvas")
+    result = CropMargins(left=x, top=y, right=right, bottom=bottom)
+    result.validate_subsampled()
+    return result
 
 
 def standalone_vmaf_command(

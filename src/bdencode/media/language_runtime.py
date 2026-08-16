@@ -153,7 +153,7 @@ class AudioLanguageRuntime:
     def infer(
         self,
         reference_mkv: Path,
-        stream_index: int,
+        audio_ordinal: int,
         duration_seconds: float,
         work_dir: Path,
         runner: CommandRunner,
@@ -167,11 +167,11 @@ class AudioLanguageRuntime:
         source/model/sample fingerprints still match.
         """
         if (
-            isinstance(stream_index, bool)
-            or not isinstance(stream_index, int)
-            or stream_index < 0
+            isinstance(audio_ordinal, bool)
+            or not isinstance(audio_ordinal, int)
+            or audio_ordinal < 0
         ):
-            raise ValueError("stream_index must be a non-negative integer")
+            raise ValueError("audio_ordinal must be a non-negative integer")
         if (
             isinstance(duration_seconds, bool)
             or not isinstance(duration_seconds, (int, float))
@@ -184,7 +184,7 @@ class AudioLanguageRuntime:
             raise ValueError("reference_mkv must be an existing Matroska file")
         root = work_dir.expanduser().resolve(strict=False)
         root.mkdir(mode=0o750, parents=True, exist_ok=True)
-        stream_root = root / "language" / f"stream-{stream_index:05d}"
+        stream_root = root / "language" / f"audio-{audio_ordinal:05d}"
         stream_root.mkdir(mode=0o750, parents=True, exist_ok=True)
 
         source_stat = source.stat()
@@ -199,7 +199,7 @@ class AudioLanguageRuntime:
             "path": str(source),
             "sha256": (source_sha256 or sha256_file(source)).lower(),
             "size_bytes": source_stat.st_size,
-            "stream_index": stream_index,
+            "audio_ordinal": audio_ordinal,
             "duration_seconds": float(duration_seconds),
         }
         windows = sample_windows(
@@ -209,7 +209,7 @@ class AudioLanguageRuntime:
         )
         samples = self._extract_samples(
             source,
-            stream_index,
+            audio_ordinal,
             windows,
             stream_root,
             runner,
@@ -227,7 +227,7 @@ class AudioLanguageRuntime:
             "condition_on_previous_text": False,
         }
         inference_input = {
-            "schema_version": 1,
+            "schema_version": 2,
             "source": source_record,
             "engine": engine,
             "samples": [
@@ -268,7 +268,7 @@ class AudioLanguageRuntime:
             )
         consensus = language_consensus(detections)
         result: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "input_sha256": input_hash,
             "source": source_record,
             "engine": engine,
@@ -278,7 +278,7 @@ class AudioLanguageRuntime:
                 "sample_count_requested": SAMPLE_COUNT,
                 "sample_duration_seconds": SAMPLE_DURATION_SECONDS,
                 "sample_count_actual": len(samples),
-                "stream_addressing": "global_input_stream_index",
+                "stream_addressing": "audio_type_ordinal",
                 "sample_audio": "pcm_s16le_mono_16000_hz",
                 "result_path": str(result_path),
             },
@@ -289,7 +289,7 @@ class AudioLanguageRuntime:
     def _extract_samples(
         self,
         source: Path,
-        stream_index: int,
+        audio_ordinal: int,
         windows: Sequence[SampleWindow],
         stream_root: Path,
         runner: CommandRunner,
@@ -302,11 +302,11 @@ class AudioLanguageRuntime:
             stem = f"sample-{index:02d}-{start_ms:010d}-{duration_ms:06d}"
             wav_path = stream_root / f"{stem}.wav"
             marker_path = stream_root / f"{stem}.json"
-            command = audio_sample_command(source, stream_index, window, wav_path)
+            command = audio_sample_command(source, audio_ordinal, window, wav_path)
             marker_input = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "source_sha256": source_record["sha256"],
-                "stream_index": stream_index,
+                "audio_ordinal": audio_ordinal,
                 "window": _window_value(window),
                 "command": command,
             }
@@ -384,7 +384,7 @@ class AudioLanguageRuntime:
 
 def infer_audio_language(
     reference_mkv: Path,
-    stream_index: int,
+    audio_ordinal: int,
     duration_seconds: float,
     work_dir: Path,
     runner: CommandRunner,
@@ -395,7 +395,7 @@ def infer_audio_language(
     """One-shot integration helper; prefer a shared runtime in a worker."""
     return AudioLanguageRuntime(data_root, model_factory=model_factory).infer(
         reference_mkv,
-        stream_index,
+        audio_ordinal,
         duration_seconds,
         work_dir,
         runner,

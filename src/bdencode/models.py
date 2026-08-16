@@ -347,6 +347,7 @@ class HealthResponse(StrictModel):
 
 class CapabilitiesResponse(StrictModel):
     api_version: str
+    backend_version: str
     job_states: list[JobState]
     terminal_states: list[JobState]
     blocking_states: list[JobState]

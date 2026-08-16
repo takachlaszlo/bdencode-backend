@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from bdencode.process import CommandRunner, ProcessInterrupted
+from bdencode.process import (
+    CommandRunner,
+    DiagnosticCategory,
+    DiagnosticSeverity,
+    ProcessInterrupted,
+    classify_media_diagnostics,
+)
 
 
 def test_pipeline_tees_last_stderr_and_delivers_lines(tmp_path: Path) -> None:
@@ -153,3 +159,165 @@ def test_stop_request_wins_race_with_already_exited_child(tmp_path: Path) -> Non
 
     assert raised.value.results[0].returncode != 0
     assert (tmp_path / "commands.jsonl").is_file()
+
+
+def test_retried_command_preserves_prior_stderr_and_keeps_latest_at_base(
+    tmp_path: Path,
+) -> None:
+    stderr = tmp_path / "reference-remux.log"
+    runner = CommandRunner(tmp_path / "commands.jsonl")
+    for value in ("first failure", "successful retry"):
+        runner.run(
+            [
+                sys.executable,
+                "-c",
+                f"import sys; sys.stderr.write({value!r})",
+            ],
+            stderr_path=stderr,
+        )
+
+    assert stderr.read_text(encoding="utf-8") == "successful retry"
+    assert (tmp_path / "reference-remux.attempt-01.log").read_text(
+        encoding="utf-8"
+    ) == "first failure"
+
+
+def test_retried_pipeline_preserves_prior_stderr(tmp_path: Path) -> None:
+    stderr = tmp_path / "comparison.stderr.log"
+    runner = CommandRunner()
+    for value in ("attempt one", "attempt two"):
+        runner.run_pipeline(
+            [[sys.executable, "-c", f"import sys; sys.stderr.write({value!r})"]],
+            stderr_paths=[stderr],
+        )
+    assert stderr.read_text(encoding="utf-8") == "attempt two"
+    assert (tmp_path / "comparison.stderr.attempt-01.log").read_text(
+        encoding="utf-8"
+    ) == "attempt one"
+
+
+@pytest.mark.parametrize("path_argument", ["stdout_path", "stderr_path"])
+def test_run_rejects_linked_output_before_starting_command(
+    tmp_path: Path,
+    path_argument: str,
+) -> None:
+    external = tmp_path / "external-output.txt"
+    external.write_text("SENTINEL\n", encoding="utf-8")
+    linked_output = tmp_path / "predictable-output.log"
+    command_marker = tmp_path / "command-ran.txt"
+    try:
+        linked_output.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path; "
+            f"Path({str(command_marker)!r}).write_text('ran')"
+        ),
+    ]
+    with pytest.raises(ValueError, match=f"{path_argument[:-5]} path cannot be"):
+        CommandRunner().run(command, **{path_argument: linked_output})
+
+    assert external.read_text(encoding="utf-8") == "SENTINEL\n"
+    assert not command_marker.exists()
+
+
+def test_pipeline_rejects_linked_stderr_before_starting_command(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external-stderr.txt"
+    external.write_text("SENTINEL\n", encoding="utf-8")
+    linked_stderr = tmp_path / "encode.log"
+    command_marker = tmp_path / "pipeline-ran.txt"
+    try:
+        linked_stderr.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="stderr path cannot be"):
+        CommandRunner().run_pipeline(
+            [
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        f"Path({str(command_marker)!r}).write_text('ran')"
+                    ),
+                ]
+            ],
+            stderr_paths=[linked_stderr],
+        )
+
+    assert external.read_text(encoding="utf-8") == "SENTINEL\n"
+    assert not command_marker.exists()
+
+
+@pytest.mark.parametrize("use_pipeline", [False, True])
+def test_runner_rejects_linked_audit_before_starting_command(
+    tmp_path: Path,
+    use_pipeline: bool,
+) -> None:
+    external = tmp_path / "external-audit.txt"
+    external.write_text("SENTINEL\n", encoding="utf-8")
+    linked_audit = tmp_path / "commands.jsonl"
+    command_marker = tmp_path / "audited-command-ran.txt"
+    try:
+        linked_audit.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path; "
+            f"Path({str(command_marker)!r}).write_text('ran')"
+        ),
+    ]
+
+    runner = CommandRunner(linked_audit)
+    with pytest.raises(ValueError, match="audit path cannot be"):
+        if use_pipeline:
+            runner.run_pipeline([command])
+        else:
+            runner.run(command)
+
+    assert external.read_text(encoding="utf-8") == "SENTINEL\n"
+    assert not command_marker.exists()
+
+
+def test_media_diagnostics_distinguish_corruption_from_sample_seek_noise() -> None:
+    source = classify_media_diagnostics(
+        "\n".join(
+            (
+                "PES packet size mismatch",
+                "Packet corrupt (stream = 20, dts = 5906869)",
+                "Packet corrupt (stream = 20, dts = 5906900)",
+            )
+        ),
+        context="source",
+    )
+    by_code = {item.code: item for item in source}
+    assert by_code["pes_packet_size_mismatch"].requires_review
+    assert by_code["corrupt_packet"].count == 2
+    assert by_code["corrupt_packet"].category is DiagnosticCategory.SOURCE_CORRUPTION
+
+    sampled = classify_media_diagnostics(
+        "mmco: unref short failure\nMissing reference picture, default is 0",
+        context="sampled",
+    )
+    assert len(sampled) == 1
+    assert sampled[0].count == 2
+    assert sampled[0].category is DiagnosticCategory.OPEN_GOP_SEEK
+    assert sampled[0].severity is DiagnosticSeverity.WARNING
+    assert not sampled[0].requires_review
+
+    final = classify_media_diagnostics(
+        "Missing reference picture, default is 0", context="final_decode"
+    )
+    assert final[0].category is DiagnosticCategory.DECODE_INTEGRITY
+    assert final[0].severity is DiagnosticSeverity.ERROR
+    assert final[0].requires_review

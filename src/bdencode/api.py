@@ -11,6 +11,7 @@ from typing import Annotated
 from fastapi import FastAPI, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+from . import __version__
 from .audio import AUDIO_ACTIONS, audio_presets_payload
 from .db import (
     Database,
@@ -95,7 +96,7 @@ def create_app(
 
     application = FastAPI(
         title="BDEncode Backend",
-        version=API_VERSION,
+        version=__version__,
         docs_url=f"{API_PREFIX}/docs",
         redoc_url=f"{API_PREFIX}/redoc",
         openapi_url=f"{API_PREFIX}/openapi.json",
@@ -160,6 +161,7 @@ def create_app(
         }
         return CapabilitiesResponse(
             api_version=API_VERSION,
+            backend_version=__version__,
             job_states=list(JobState),
             terminal_states=sorted(TERMINAL_STATES, key=lambda item: item.value),
             blocking_states=sorted(BLOCKING_STATES, key=lambda item: item.value),

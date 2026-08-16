@@ -6,6 +6,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import threading
 from dataclasses import replace
 from decimal import Decimal
@@ -42,7 +43,8 @@ from bdencode.models import (
     ScanState,
     ScanUpdate,
 )
-from bdencode.process import ProcessInterrupted
+from bdencode.process import CommandRunner, ProcessInterrupted
+from bdencode.qc.integrity import require_video_cadence as real_require_video_cadence
 from bdencode.qc.image_upload import ImageUploadError, UploadedImage
 from bdencode.queue import JobQueue
 from bdencode.utils import sha256_file
@@ -51,7 +53,12 @@ from bdencode.worker import (
     PipelineWorker,
     ReviewRequired,
     _FFPROBE_PROFILE_NAMES,
+    _activate_source_log_generation,
+    _assert_public_sidecar_safe,
     _current_comparison_pngs,
+    _ensure_contained_directory,
+    _public_diagnostic_summary,
+    _sticky_source_diagnostics,
     parse_selection,
     run_worker,
 )
@@ -291,6 +298,316 @@ def test_recorded_output_digest_rejects_same_size_in_place_change(
     assert worker_module._recorded_output_sha256(marker, output) is None
 
 
+def test_comparison_png_allowlist_rejects_external_symlink(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "storage"
+    source_root.mkdir()
+    settings = Settings(
+        data_root=tmp_path / "encode",
+        source_roots=(source_root,),
+    ).validate()
+    settings.create_directories()
+    paths = JobPaths.create(settings, "symlink-evidence-test")
+    outside = tmp_path / "private.png"
+    outside.write_bytes(_png())
+    linked = paths.comparison / "proof.png"
+    try:
+        linked.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+    (paths.comparison / "video-comparison.json").write_text(
+        json.dumps(
+            {
+                "pairs": [
+                    {
+                        "reference_png": linked.name,
+                        "reference_sha256": sha256_file(outside),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (paths.analysis / "audio-comparison.json").write_text(
+        json.dumps({"tracks": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be a link"):
+        _current_comparison_pngs(paths)
+
+
+def test_comparison_evidence_root_rejects_external_directory_link(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "storage"
+    source_root.mkdir()
+    settings = Settings(
+        data_root=tmp_path / "encode",
+        source_roots=(source_root,),
+    ).validate()
+    settings.create_directories()
+    paths = JobPaths.create(settings, "directory-link-test")
+    external = tmp_path / "external-comparison"
+    external.mkdir()
+    paths.comparison.rmdir()
+    try:
+        paths.comparison.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="evidence root cannot be a link"):
+        _current_comparison_pngs(paths)
+
+
+def test_job_paths_reject_precreated_external_job_root_link(tmp_path: Path) -> None:
+    source_root = tmp_path / "storage"
+    source_root.mkdir()
+    settings = Settings(
+        data_root=tmp_path / "encode",
+        source_roots=(source_root,),
+    ).validate()
+    settings.create_directories()
+    external = tmp_path / "external-job-root"
+    external.mkdir()
+    linked_root = settings.job_root("linked-job")
+    try:
+        linked_root.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(ReviewRequired, match="job root cannot be"):
+        JobPaths.create(settings, "linked-job")
+    assert list(external.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "relative_parts",
+    [
+        ("logs", "source-history", "a" * 64),
+        ("work", "video-mux-integrity"),
+        ("work", "track-mux-integrity"),
+        ("analysis", "container"),
+        ("work", "spectrum", "audio-01"),
+        ("work", "comparison-metric-frames"),
+        ("work", "comparison-native-yuv"),
+    ],
+)
+def test_contained_workspace_directory_rejects_external_component_link(
+    tmp_path: Path,
+    relative_parts: tuple[str, ...],
+) -> None:
+    source_root = tmp_path / "storage"
+    source_root.mkdir()
+    settings = Settings(
+        data_root=tmp_path / "encode",
+        source_roots=(source_root,),
+    ).validate()
+    settings.create_directories()
+    paths = JobPaths.create(settings, "nested-link-test")
+    target = paths.root.joinpath(*relative_parts)
+    target.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    external = tmp_path / ("external-" + "-".join(relative_parts))
+    external.mkdir()
+    try:
+        target.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(ReviewRequired, match="cannot be created safely"):
+        _ensure_contained_directory(
+            target,
+            root=paths.root,
+            description="test workspace directory",
+        )
+    assert list(external.iterdir()) == []
+
+
+def test_qc_rejects_external_container_directory_link(context, tmp_path: Path) -> None:
+    database, settings, scan, _scanner, _runner, worker = context
+    job = _enqueue(database, scan.source)
+    current = JobQueue(database).claim_next()
+    assert current is not None
+    current = worker.process_one_stage(current)
+    current = database.set_selection(current.id, _selection())
+    while current.state is not JobState.QC:
+        current = worker.process_one_stage(current)
+
+    paths = JobPaths.create(settings, job.id)
+    external = tmp_path / "external-container-qc"
+    external.mkdir()
+    linked_container = paths.analysis / "container"
+    try:
+        linked_container.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    result = worker.process_job(current)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.QC
+    assert "container QC directory cannot be created safely" in (
+        result.status_message or ""
+    )
+    assert list(external.iterdir()) == []
+
+
+@pytest.mark.parametrize("sink", ["container-report", "command-audit"])
+def test_qc_rejects_external_command_file_link(
+    context,
+    tmp_path: Path,
+    sink: str,
+) -> None:
+    database, settings, scan, _scanner, _runner, worker = context
+    job = _enqueue(database, scan.source)
+    current = JobQueue(database).claim_next()
+    assert current is not None
+    current = worker.process_one_stage(current)
+    current = database.set_selection(current.id, _selection())
+    while current.state is not JobState.QC:
+        current = worker.process_one_stage(current)
+
+    paths = JobPaths.create(settings, job.id)
+    external = tmp_path / f"external-{sink}.txt"
+    external.write_text("SENTINEL\n", encoding="utf-8")
+    if sink == "container-report":
+        container = paths.analysis / "container"
+        container.mkdir(mode=0o750, exist_ok=True)
+        linked_path = container / "ffprobe-streams.json"
+    else:
+        linked_path = paths.logs / "commands.jsonl"
+    try:
+        linked_path.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    if sink == "container-report":
+
+        class LinkCheckingRunner(FakeRunner):
+            def run(
+                self,
+                argv: Sequence[str | os.PathLike[str]],
+                **kwargs: Any,
+            ) -> Any:
+                if kwargs.get("stdout_path") == linked_path:
+                    return CommandRunner().run(
+                        [sys.executable, "-c", "print('{}')"],
+                        stdout_path=linked_path,
+                    )
+                return super().run(argv, **kwargs)
+
+        protected_runner: Any = LinkCheckingRunner()
+    else:
+        protected_runner = CommandRunner(linked_path)
+    worker._runners[str(paths.root)] = protected_runner
+
+    result = worker.process_job(current)
+
+    assert result.state is JobState.FAILED
+    assert external.read_text(encoding="utf-8") == "SENTINEL\n"
+    assert linked_path.is_symlink()
+
+
+def test_source_diagnostics_are_sticky_only_within_one_remux_generation(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    analysis = tmp_path / "analysis"
+    stages = tmp_path / "stages"
+    logs.mkdir()
+    analysis.mkdir()
+    stages.mkdir()
+    generation_record = analysis / "source-integrity-generation.json"
+    remux_marker = stages / "reference-remux.json"
+    generation_a = "a" * 64
+    generation_b = "b" * 64
+
+    _activate_source_log_generation(
+        logs_root=logs,
+        generation_record=generation_record,
+        remux_marker=remux_marker,
+        generation=generation_a,
+    )
+    corrupt = logs / "reference-remux.attempt-01.log"
+    corrupt.write_text("Packet corrupt in stream 0\n", encoding="utf-8")
+
+    _activate_source_log_generation(
+        logs_root=logs,
+        generation_record=generation_record,
+        remux_marker=remux_marker,
+        generation=generation_a,
+    )
+    assert corrupt.is_file()
+
+    _activate_source_log_generation(
+        logs_root=logs,
+        generation_record=generation_record,
+        remux_marker=remux_marker,
+        generation=generation_b,
+    )
+    assert not corrupt.exists()
+    assert (
+        logs / "source-history" / generation_a / "reference-remux.attempt-01.log"
+    ).is_file()
+    assert not list(logs.glob("reference-remux*.log"))
+    assert json.loads(generation_record.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "generation": generation_b,
+    }
+
+
+def test_sticky_source_history_blocks_corruption_but_not_transient_environment() -> (
+    None
+):
+    environment = worker_module.classify_media_diagnostics(
+        "No space left on device while writing output",
+        context="source",
+    )
+    corruption = worker_module.classify_media_diagnostics(
+        "Packet corrupt (stream=0, dts=123)",
+        context="source",
+    )
+
+    assert _sticky_source_diagnostics(environment) == ()
+    assert len(_sticky_source_diagnostics(corruption)) == 1
+
+
+def test_public_diagnostic_summary_never_contains_raw_source_paths() -> None:
+    windows_path = r"C:\Users\private-user\Videos\Secret Title\00001.m2ts"
+    posix_path = "/home/private-user/Videos/Secret Title/00001.m2ts"
+    diagnostics = worker_module.classify_media_diagnostics(
+        f"Error opening input file {windows_path}\nPermission denied: {posix_path}",
+        context="source",
+    )
+
+    public_text = json.dumps(_public_diagnostic_summary(diagnostics))
+    assert windows_path not in public_text
+    assert posix_path not in public_text
+    assert "private-user" not in public_text
+    assert {item["code"] for item in _public_diagnostic_summary(diagnostics)} == {
+        "storage_or_io_failure",
+        "unclassified_error",
+    }
+
+
+@pytest.mark.parametrize(
+    "private_field",
+    ["source_path", "job_id", "api_key", "delete_url", "host", "hostname", "cpu"],
+)
+def test_public_json_private_field_denylist_is_fail_closed(
+    tmp_path: Path, private_field: str
+) -> None:
+    sidecar = tmp_path / "public.json"
+    sidecar.write_text(
+        json.dumps({"schema_version": 2, private_field: "private-value"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReviewRequired, match="private field"):
+        _assert_public_sidecar_safe(sidecar)
+
+
 def _png() -> bytes:
     return (
         b"\x89PNG\r\n\x1a\n"
@@ -299,6 +616,11 @@ def _png() -> bytes:
         + struct.pack(">IIBBBBB", 1920, 1080, 16, 2, 0, 0, 0)
         + b"\x00\x00\x00\x00"
     )
+
+
+FAKE_REFERENCE_FRAMES = 172_627
+FAKE_REFERENCE_FPS_NUMERATOR = 24_000
+FAKE_REFERENCE_FPS_DENOMINATOR = 1_001
 
 
 class FakeScanner:
@@ -329,18 +651,71 @@ class FakeRunner:
 
     @staticmethod
     def _frames() -> str:
-        types = "IBPBPBPBIPBB"
+        sample_count = 720
         return json.dumps(
             {
                 "frames": [
                     {
                         "media_type": "video",
-                        "best_effort_timestamp_time": f"{index / 25:.3f}",
-                        "pict_type": pict_type,
-                        "key_frame": int(pict_type == "I"),
+                        "best_effort_timestamp_time": format(
+                            presentation_index
+                            * FAKE_REFERENCE_FPS_DENOMINATOR
+                            / FAKE_REFERENCE_FPS_NUMERATOR,
+                            ".6f",
+                        ),
+                        "pict_type": "IPB"[sample_index % 3],
+                        "key_frame": int(sample_index % 3 == 0),
                     }
-                    for index, pict_type in enumerate(types)
+                    for sample_index in range(sample_count)
+                    for presentation_index in (
+                        round(
+                            sample_index
+                            * (FAKE_REFERENCE_FRAMES - 1)
+                            / (sample_count - 1)
+                        ),
+                    )
                 ]
+            }
+        )
+
+    @staticmethod
+    def _audio_frames(*, internal_gap: bool = False) -> str:
+        middle_pts = "200.032000" if internal_gap else "200.000000"
+        return json.dumps(
+            {
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_type": "audio",
+                        "codec_name": "eac3",
+                        "sample_rate": "48000",
+                        "time_base": "1/1000",
+                        "nb_read_frames": "3",
+                    }
+                ],
+                "frames": [
+                    {
+                        "media_type": "audio",
+                        "stream_index": 0,
+                        "pts_time": "0.000000",
+                        "nb_samples": 9_600_000,
+                        "sample_rate": "48000",
+                    },
+                    {
+                        "media_type": "audio",
+                        "stream_index": 0,
+                        "pts_time": middle_pts,
+                        "nb_samples": 9_600_000,
+                        "sample_rate": "48000",
+                    },
+                    {
+                        "media_type": "audio",
+                        "stream_index": 0,
+                        "pts_time": "400.000000",
+                        "nb_samples": 9_648_000,
+                        "sample_rate": "48000",
+                    },
+                ],
             }
         )
 
@@ -360,9 +735,147 @@ class FakeRunner:
         self.commands.append(command)
         if stderr_path is not None:
             self._write(stderr_path, "")
+            if stderr_path.name.endswith("-analysis.log"):
+                self._write(
+                    stderr_path,
+                    """
+[Parsed_astats_1] Overall
+[Parsed_astats_1] Peak level dB: -1.2
+[Parsed_astats_1] Peak count: 2
+[Parsed_astats_1] Number of NaNs: 0
+[Parsed_astats_1] Number of Infs: 0
+[Parsed_astats_1] Number of denormals: 0
+[Parsed_ebur128_0] Summary:
+[Parsed_ebur128_0]   Integrated loudness:
+[Parsed_ebur128_0]     I: -18.0 LUFS
+[Parsed_ebur128_0]   Loudness range:
+[Parsed_ebur128_0]     LRA: 7.0 LU
+[Parsed_ebur128_0]   True peak:
+[Parsed_ebur128_0]     Peak: -1.0 dBFS
+""",
+                )
+            if any("cropdetect=" in item for item in command):
+                self._write(
+                    stderr_path,
+                    "\n".join(
+                        "[Parsed_cropdetect_0] crop=1920:1080:0:0" for _ in range(30)
+                    )
+                    + "\n",
+                )
         if stdout_path is not None:
-            if command[0] == "vspipe" and "--info" in command:
-                self._write(stdout_path, "Frames: 12\nFPS: 25/1 (25.000 fps)\n")
+            if command[0] == "ffmpeg" and "streamhash" in command:
+                stream_type = command[command.index("-map") + 1].split(":")[1]
+                self._write(
+                    stdout_path,
+                    f"0,{stream_type},SHA256=" + ("ab" * 32) + "\n",
+                )
+            elif command[0] == "vspipe" and "--info" in command:
+                self._write(
+                    stdout_path,
+                    "Frames: 172627\nFPS: 24000/1001 (23.976 fps)\n",
+                )
+            elif (
+                command[0] == "ffprobe"
+                and "stream=index,codec_type,start_time" in command
+            ):
+                media_path = Path(command[-1])
+                indexes = range(16) if media_path.name == "reference.mkv" else range(1)
+                self._write(
+                    stdout_path,
+                    json.dumps(
+                        {
+                            "streams": [
+                                {
+                                    "index": index,
+                                    "codec_type": "video" if index == 0 else "audio",
+                                    "start_time": "0.000000",
+                                }
+                                for index in indexes
+                            ]
+                        }
+                    ),
+                )
+            elif command[0] == "ffprobe" and "packet=size" in command:
+                media_path = Path(command[-1])
+                packet_size = 900 if media_path.name == "video-encoded.mkv" else 1000
+                self._write(
+                    stdout_path,
+                    f"{packet_size}\n" * FAKE_REFERENCE_FRAMES,
+                )
+            elif (
+                command[0] == "ffprobe"
+                and "packet=pts_time,dts_time,duration_time,size" in command
+            ):
+                frame_duration = Decimal(1001) / Decimal(24000)
+                title_duration = Decimal(FAKE_REFERENCE_FRAMES) * frame_duration
+                middle = title_duration / Decimal(2)
+                last = title_duration - frame_duration
+                self._write(
+                    stdout_path,
+                    json.dumps(
+                        {
+                            "packets": [
+                                {
+                                    "pts_time": "0.000000000",
+                                    "dts_time": "0.000000000",
+                                    "duration_time": f"{frame_duration:.9f}",
+                                    "size": "100",
+                                },
+                                {
+                                    "pts_time": f"{middle:.9f}",
+                                    "dts_time": f"{middle:.9f}",
+                                    "duration_time": f"{frame_duration:.9f}",
+                                    "size": "100",
+                                },
+                                {
+                                    "pts_time": f"{last:.9f}",
+                                    "dts_time": f"{last:.9f}",
+                                    "duration_time": f"{frame_duration:.9f}",
+                                    "size": "100",
+                                },
+                            ]
+                        }
+                    ),
+                )
+            elif (
+                command[0] == "ffprobe"
+                and "-show_frames" in command
+                and "-select_streams" in command
+                and command[command.index("-select_streams") + 1].startswith("a:")
+            ):
+                self._write(stdout_path, self._audio_frames())
+            elif (
+                command[0] == "ffprobe"
+                and "-show_frames" in command
+                and "-select_streams" in command
+                and command[command.index("-select_streams") + 1].startswith("s:")
+            ):
+                subtitle_ordinal = int(
+                    command[command.index("-select_streams") + 1].split(":", 1)[1]
+                )
+                self._write(
+                    stdout_path,
+                    json.dumps(
+                        {
+                            "streams": [
+                                {
+                                    "index": subtitle_ordinal + 1,
+                                    "codec_type": "subtitle",
+                                    "codec_name": "hdmv_pgs_subtitle",
+                                }
+                            ],
+                            "frames": [
+                                {
+                                    "media_type": "subtitle",
+                                    "pts_time": "12.000000",
+                                    "start_display_time": 0,
+                                    "end_display_time": 2000,
+                                    "num_rects": 1,
+                                }
+                            ],
+                        }
+                    ),
+                )
             elif (
                 command[0] == "ffprobe"
                 and "-show_frames" in command
@@ -374,14 +887,20 @@ class FakeRunner:
                     stdout_path,
                     json.dumps(
                         {
-                            "container": {"properties": {"title": "Movie.Encode"}},
-                            "tracks": [{"id": 0, "type": "video", "properties": {}}],
-                            "attachments": [
+                            "container": {
+                                "properties": {"title": "Movie.2026.1080p.BluRay.x264"}
+                            },
+                            "tracks": [
                                 {
-                                    "file_name": "encode.log",
-                                    "content_type": "text/plain; charset=utf-8",
+                                    "id": 0,
+                                    "type": "video",
+                                    "properties": {
+                                        "default_track": True,
+                                        "forced_track": False,
+                                    },
                                 }
                             ],
+                            "attachments": [],
                         }
                     ),
                 )
@@ -395,7 +914,9 @@ class FakeRunner:
                                     "index": 0,
                                     "codec_name": "h264",
                                     "profile": "High",
+                                    "level": 41,
                                     "codec_type": "video",
+                                    "start_time": "0.000000",
                                     "width": 1920,
                                     "height": 1080,
                                     "pix_fmt": "yuv420p",
@@ -424,6 +945,19 @@ class FakeRunner:
             self._write(
                 Path(command[command.index("--output") + 1]),
                 '{"version":"mock","frames":[{"frameNum":0}]}\n',
+            )
+        elif command[0] == "ffmpeg" and any(
+            "ssim=stats_file=" in item for item in command
+        ):
+            graph = next(item for item in command if "ssim=stats_file=" in item)
+            matches = re.findall(r"(?:ssim|psnr)=stats_file=([^\[]+)", graph)
+            self._write(
+                Path(matches[0].replace("\\:", ":")),
+                "n:1 Y:0.990 U:0.995 V:0.994 All:0.991 (20.0)\n",
+            )
+            self._write(
+                Path(matches[1].replace("\\:", ":")),
+                "n:1 mse_avg:1.0 psnr_avg:44.0 psnr_y:43.0 psnr_u:46.0 psnr_v:45.0\n",
             )
         elif command[0] == "ffmpeg" and command[-1] != "-" and stdout_path is None:
             output = Path(command[-1])
@@ -467,6 +1001,17 @@ def context(tmp_path: Path, monkeypatch):
         worker_module,
         "capability_snapshot",
         lambda _names: {"host": {"hostname": "test"}, "tools": {}},
+    )
+    # FakeRunner intentionally emits a three-packet compact timeline instead
+    # of 172,627 records.  Cadence math has exhaustive unit coverage; worker
+    # tests exercise the checkpoint/wiring without materializing gigabytes of
+    # repetitive JSON across the suite.
+    monkeypatch.setattr(
+        worker_module,
+        "require_video_cadence",
+        lambda timeline, *_args, **_kwargs: worker_module.compare_packet_timelines(
+            timeline, timeline
+        ),
     )
     source_root = tmp_path / "storage"
     source = source_root / "Movie"
@@ -548,7 +1093,7 @@ def _selection(**updates: Any) -> dict[str, Any]:
             "temporal_filter": "progressive",
         },
         "tracks": [],
-        "output_name": "Movie.Encode",
+        "output_name": "Movie.2026.1080p.BluRay.x264",
         "upload_images": False,
     }
     value.update(updates)
@@ -630,7 +1175,11 @@ def test_completed_job_stays_completed_when_work_cleanup_fails(context, monkeypa
     result = worker.process_job(ready)
 
     assert result.state is JobState.COMPLETED
-    assert (settings.completed_root / "Movie.Encode" / "Movie.Encode.mkv").is_file()
+    assert (
+        settings.completed_root
+        / "Movie.2026.1080p.BluRay.x264"
+        / "Movie.2026.1080p.BluRay.x264.mkv"
+    ).is_file()
     assert (settings.job_root(job.id) / "work").is_dir()
     warnings = [
         item
@@ -750,20 +1299,22 @@ def test_video_encode_promotes_only_successful_temporary_output(context):
     ]
 
 
-def test_invalid_duration_disables_only_progress_observation(context):
-    database, settings, scan, scanner, _runner, worker = context
+def test_invalid_duration_requires_review_before_distributed_qc(context):
+    database, _settings, scan, scanner, _runner, worker = context
     scanner.result = replace(
         scan,
         playlists=(replace(scan.playlists[0], duration_seconds=0),),
     )
-    job, encoding = _prepare_encoding(context)
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
 
-    result = worker.process_one_stage(encoding)
-    paths = JobPaths.create(settings, job.id)
+    result = worker.process_job(ready)
 
-    assert result.state is JobState.MUXING
-    assert paths.encoded_video.is_file()
-    assert not (paths.logs / "video-progress.jsonl").exists()
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.READY
 
 
 def test_api_cancellation_interrupts_encode_without_failed_transition(context):
@@ -965,6 +1516,437 @@ def test_invalid_selection_pauses_in_needs_review(context):
     assert "missing selection" in (result.status_message or "")
 
 
+def test_dense_subtitle_declared_forced_fails_closed_before_mux(context):
+    database, settings, scan, scanner, runner, worker = context
+    subtitle = MediaStream(
+        id="subtitle:4608",
+        index=1,
+        pid=4608,
+        kind=StreamKind.SUBTITLE,
+        codec="hdmv_pgs_subtitle",
+    )
+    scanner.result = replace(
+        scan,
+        playlists=(
+            replace(
+                scan.playlists[0],
+                streams=(*scan.playlists[0].streams, subtitle),
+            ),
+        ),
+    )
+    real_run = runner.run
+
+    def run_with_dense_subtitle_probe(argv, **kwargs):
+        real_run(argv, **kwargs)
+        stdout_path = kwargs.get("stdout_path")
+        if stdout_path is None or stdout_path.name != "subtitle-01-probe.json":
+            return
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "streams": [
+                        {
+                            "codec_type": "subtitle",
+                            "codec_name": "hdmv_pgs_subtitle",
+                            "nb_read_packets": "1200",
+                            "start_time": "0.000",
+                            "duration": "7000.000",
+                        }
+                    ],
+                    "format": {"start_time": "0.000", "duration": "7200.000"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    runner.run = run_with_dense_subtitle_probe
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(
+        job.id,
+        _selection(
+            schema_version=2,
+            tracks=[
+                {
+                    "stream_id": subtitle.id,
+                    "action": "copy",
+                    "language": "eng",
+                    "subtitle_kind": "forced",
+                    "order": 0,
+                }
+            ],
+        ),
+    )
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.MUXING
+    assert "classification requires review" in (result.status_message or "")
+    assert not any(
+        command[0] == "mkvmerge" and "--output" in command
+        for command in runner.commands
+    )
+    probe = json.loads(
+        (settings.job_root(job.id) / "analysis" / "subtitle-01-probe.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert probe["streams"][0]["nb_read_packets"] == "1200"
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "decode",
+        "stderr",
+        "mux_payload",
+        "mux_timeline",
+        "extract_payload",
+        "extract_timeline",
+    ],
+)
+def test_final_subtitle_payload_integrity_is_fail_closed(context, failure_mode):
+    database, settings, scan, scanner, _runner, _worker = context
+    subtitle = MediaStream(
+        id="subtitle:4608",
+        index=1,
+        pid=4608,
+        kind=StreamKind.SUBTITLE,
+        codec="hdmv_pgs_subtitle",
+    )
+    scanner.result = replace(
+        scan,
+        playlists=(
+            replace(
+                scan.playlists[0],
+                streams=(*scan.playlists[0].streams, subtitle),
+            ),
+        ),
+    )
+
+    class EmptyDecodedSubtitleRunner(FakeRunner):
+        def run(self, argv, **kwargs):
+            result = super().run(argv, **kwargs)
+            command = tuple(os.fspath(item) for item in argv)
+            stdout_path = kwargs.get("stdout_path")
+            if not isinstance(stdout_path, Path):
+                return result
+            if (
+                command[0] == "ffprobe"
+                and "stream=index,codec_type,start_time" in command
+                and Path(command[-1]).name == "reference.mkv"
+            ):
+                self._write(
+                    stdout_path,
+                    json.dumps(
+                        {
+                            "streams": [
+                                {
+                                    "index": 0,
+                                    "codec_type": "video",
+                                    "start_time": "0.000000",
+                                },
+                                {
+                                    "index": 1,
+                                    "codec_type": "subtitle",
+                                    "start_time": "0.000000",
+                                },
+                            ]
+                        }
+                    ),
+                )
+            elif stdout_path.name == "subtitle-01-probe.json":
+                self._write(
+                    stdout_path,
+                    json.dumps(
+                        {
+                            "streams": [
+                                {
+                                    "codec_type": "subtitle",
+                                    "codec_name": "hdmv_pgs_subtitle",
+                                    "nb_read_packets": "20",
+                                    "start_time": "10.000",
+                                    "duration": "6000.000",
+                                }
+                            ],
+                            "format": {
+                                "start_time": "10.000",
+                                "duration": "6000.000",
+                            },
+                        }
+                    ),
+                )
+            elif command[0] == "mkvmerge" and "--identify" in command:
+                self._write(
+                    stdout_path,
+                    json.dumps(
+                        {
+                            "container": {
+                                "properties": {"title": "Movie.2026.1080p.BluRay.x264"}
+                            },
+                            "tracks": [
+                                {
+                                    "id": 0,
+                                    "type": "video",
+                                    "properties": {
+                                        "default_track": True,
+                                        "forced_track": False,
+                                    },
+                                },
+                                {
+                                    "id": 1,
+                                    "type": "subtitles",
+                                    "properties": {
+                                        "language": "en",
+                                        "track_name": "English Full",
+                                        "default_track": False,
+                                        "forced_track": False,
+                                    },
+                                },
+                            ],
+                            "attachments": [],
+                        }
+                    ),
+                )
+            elif stdout_path.name == "ffprobe-streams.json":
+                self._write(
+                    stdout_path,
+                    json.dumps(
+                        {
+                            "streams": [
+                                {
+                                    "index": 0,
+                                    "codec_name": "h264",
+                                    "profile": "High",
+                                    "level": 41,
+                                    "codec_type": "video",
+                                    "start_time": "0.000000",
+                                    "width": 1920,
+                                    "height": 1080,
+                                    "pix_fmt": "yuv420p",
+                                    "color_range": "tv",
+                                    "color_space": "bt709",
+                                    "color_transfer": "bt709",
+                                    "color_primaries": "bt709",
+                                    "chroma_location": "left",
+                                },
+                                {
+                                    "index": 1,
+                                    "codec_name": "hdmv_pgs_subtitle",
+                                    "codec_type": "subtitle",
+                                    "start_time": "0.000000",
+                                },
+                            ]
+                        }
+                    ),
+                )
+            elif (
+                stdout_path.name == "track-01-s-final.streamhash"
+                and failure_mode == "mux_payload"
+            ):
+                self._write(
+                    stdout_path,
+                    "0,s,SHA256=" + ("cd" * 32) + "\n",
+                )
+            elif (
+                stdout_path.name == "track-01-s-final-timeline.json"
+                and failure_mode == "mux_timeline"
+            ):
+                document = json.loads(stdout_path.read_text(encoding="utf-8"))
+                document["packets"][1]["pts_time"] = "3601.000000000"
+                document["packets"][1]["dts_time"] = "3601.000000000"
+                self._write(stdout_path, json.dumps(document))
+            elif (
+                stdout_path.name == "track-01-s-reference.streamhash"
+                and failure_mode == "extract_payload"
+            ):
+                self._write(
+                    stdout_path,
+                    "0,s,SHA256=" + ("cd" * 32) + "\n",
+                )
+            elif (
+                stdout_path.name == "track-01-s-reference-timeline.json"
+                and failure_mode == "extract_timeline"
+            ):
+                document = json.loads(stdout_path.read_text(encoding="utf-8"))
+                document["packets"][1]["pts_time"] = "3601.000000000"
+                document["packets"][1]["dts_time"] = "3601.000000000"
+                self._write(stdout_path, json.dumps(document))
+            elif (
+                stdout_path.name == "subtitle-01-decode.json"
+                and failure_mode == "decode"
+            ):
+                self._write(
+                    stdout_path,
+                    json.dumps(
+                        {
+                            "streams": [
+                                {
+                                    "index": 1,
+                                    "codec_type": "subtitle",
+                                    "codec_name": "hdmv_pgs_subtitle",
+                                }
+                            ],
+                            "frames": [],
+                        }
+                    ),
+                )
+            if (
+                stdout_path.name == "subtitle-01-decode.json"
+                and failure_mode == "stderr"
+            ):
+                stderr_path = kwargs.get("stderr_path")
+                assert isinstance(stderr_path, Path)
+                self._write(stderr_path, "decoder error despite rc=0\n")
+            return result
+
+    runner = EmptyDecodedSubtitleRunner()
+    worker = PipelineWorker(
+        database,
+        settings,
+        scanner_factory=lambda _settings: scanner,
+        runner_factory=lambda _paths: runner,
+    )
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(
+        job.id,
+        _selection(
+            schema_version=2,
+            tracks=[
+                {
+                    "stream_id": subtitle.id,
+                    "action": "copy",
+                    "language": "eng",
+                    "subtitle_kind": "full",
+                    "order": 0,
+                }
+            ],
+        ),
+    )
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.QC
+    if failure_mode in {
+        "mux_payload",
+        "mux_timeline",
+        "extract_payload",
+        "extract_timeline",
+    }:
+        report = json.loads(
+            (
+                settings.job_root(job.id) / "analysis" / "track-mux-integrity.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert report["status"] == "needs_review"
+        if failure_mode == "mux_payload":
+            assert "changed a retained audio/subtitle" in (result.status_message or "")
+            assert report["tracks"][0]["payloads_match"] is False
+        elif failure_mode == "mux_timeline":
+            assert "changed a retained audio/subtitle" in (result.status_message or "")
+            assert report["tracks"][0]["payloads_match"] is True
+            assert report["tracks"][0]["timeline_verdict"]["passed"] is False
+        elif failure_mode == "extract_payload":
+            assert "copy extraction changed" in (result.status_message or "")
+            assert report["tracks"][0]["extraction_payloads_match"] is False
+        else:
+            assert "copy extraction changed" in (result.status_message or "")
+            assert report["tracks"][0]["extraction_payloads_match"] is True
+            assert report["tracks"][0]["extraction_timeline_verdict"]["passed"] is False
+        assert not any(
+            command[0] == "ffprobe"
+            and "-show_frames" in command
+            and "-select_streams" in command
+            and command[command.index("-select_streams") + 1] == "s:0"
+            for command in runner.commands
+        )
+    else:
+        assert "subtitle payload decode" in (result.status_message or "")
+        decode_command = next(
+            command
+            for command in runner.commands
+            if command[0] == "ffprobe"
+            and "-select_streams" in command
+            and command[command.index("-select_streams") + 1] == "s:0"
+            and "-show_frames" in command
+        )
+        assert "-err_detect" in decode_command
+        assert "-c:s" not in decode_command
+        assert "copy" not in decode_command
+        report = json.loads(
+            (
+                settings.job_root(job.id)
+                / "analysis"
+                / "container"
+                / "subtitle-integrity.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert report["status"] == "needs_review"
+        expected_error = (
+            "error-level diagnostics"
+            if failure_mode == "stderr"
+            else "zero frames/events"
+        )
+        assert expected_error in report["tracks"][0]["error"]
+
+
+@pytest.mark.parametrize(
+    "output_name",
+    (
+        "Movie.Encode",
+        "After.We.Fell.2021.COMPLETE.BLURAY-iNTEGRUM.BluRay.x264",
+        "ARMOUR_OF_GOD_HONG_KONG_CUT_BD.BluRay.x264",
+        "Movie.2026.DTS-HD.MA.1080p.BluRay.x264",
+    ),
+)
+def test_release_name_policy_rejects_source_tags_and_false_codec_claims(
+    context, output_name
+):
+    _database, _settings, scan, _scanner, _runner, _worker = context
+    job = _enqueue(_database, scan.source).model_copy(
+        update={"selection": _selection(output_name=output_name)}
+    )
+
+    with pytest.raises(ReviewRequired, match="output_name"):
+        parse_selection(job, scan)
+
+
+@pytest.mark.parametrize("value", (False, 2.9, "2"))
+def test_parse_selection_rejects_coerced_crop_values(context, value: object) -> None:
+    database, _settings, scan, _scanner, _runner, _worker = context
+    selection = _selection()
+    selection["video"]["crop"]["top"] = value
+    job = _enqueue(database, scan.source).model_copy(update={"selection": selection})
+
+    with pytest.raises(ReviewRequired, match="non-boolean integers"):
+        parse_selection(job, scan)
+
+
+@pytest.mark.parametrize("value", (True, 1.5, "1", -1))
+def test_parse_selection_rejects_coerced_track_order(context, value: object) -> None:
+    database, _settings, scan, _scanner, _runner, _worker = context
+    selection = _selection(
+        tracks=[
+            {
+                "stream_id": "audio:unknown",
+                "action": "omit",
+                "order": value,
+            }
+        ]
+    )
+    job = _enqueue(database, scan.source).model_copy(update={"selection": selection})
+
+    with pytest.raises(ReviewRequired, match="non-negative integer"):
+        parse_selection(job, scan)
+
+
 def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     database, settings, scan, _scanner, runner, worker = context
     job = _enqueue(database, scan.source)
@@ -990,20 +1972,54 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     result = worker.process_job(ready)
 
     assert result.state is JobState.COMPLETED
-    completed = settings.completed_root / "Movie.Encode"
-    assert (completed / "Movie.Encode.mkv").is_file()
+    completed = settings.completed_root / "Movie.2026.1080p.BluRay.x264"
+    final_output = completed / "Movie.2026.1080p.BluRay.x264.mkv"
+    assert final_output.is_file()
     assert (completed / "comparison" / "video-comparison.json").is_file()
     assert (completed / "analysis" / "audio-comparison.json").is_file()
-    manifest = json.loads((completed / "manifest.json").read_text(encoding="utf-8"))
+    assert not (completed / "manifest.json").exists()
+    assert not (completed / "logs").exists()
+    assert {path.name for path in (completed / "analysis").iterdir()} == {
+        "audio-comparison.json"
+    }
+    owner = json.loads((completed / ".bdencode-owner.json").read_text(encoding="utf-8"))
+    assert owner == {
+        "schema_version": 2,
+        "output_name": "Movie.2026.1080p.BluRay.x264",
+        "mux_sha256": sha256_file(final_output),
+    }
+    public_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in completed.rglob("*")
+        if path.is_file()
+        and path.suffix.casefold() in {".json", ".log", ".bbcode", ".txt"}
+    )
+    assert job.id not in public_text
+    assert '"job_id"' not in public_text
+    assert '"source_path"' not in public_text
+    assert scan.fingerprint not in public_text
+    assert not any(path.name == "encode.log" for path in completed.rglob("*"))
+    manifest = json.loads(job_paths.manifest_json.read_text(encoding="utf-8"))
     assert manifest["comparison_attached_to_mkv"] is False
+    assert manifest["manifest_registered_separately"] is True
+    assert not any(
+        artifact["path"] == str(job_paths.manifest_json.resolve())
+        for artifact in manifest["artifacts"]
+    )
     comparison = json.loads(
         (completed / "comparison" / "video-comparison.json").read_text(encoding="utf-8")
     )
-    assert comparison["counts"] == {"B": 2, "I": 1, "P": 2}
+    assert comparison["counts"] == {"B": 8, "I": 8, "P": 8}
     assert comparison["sampling"]["full_title_scan"] is False
-    assert comparison["sampling"]["selected_pair_count"] == 5
-    assert comparison["metrics"]["backend"] == "ffmpeg-sampled-ssim-psnr"
-    assert comparison["metrics"]["sample_count"] == 5
+    assert comparison["sampling"]["selected_pair_count"] == 24
+    assert comparison["frame_completeness"]["status"] == "passed"
+    completeness = comparison["frame_completeness"]["verdict"]
+    assert completeness["reference_frame_count"] == FAKE_REFERENCE_FRAMES
+    assert completeness["encoded_packet_count"] == FAKE_REFERENCE_FRAMES
+    assert completeness["packet_count_matches"] is True
+    assert completeness["duration_matches"] is True
+    assert comparison["metrics"]["backend"] == "ffmpeg-native-yuv-sampled-ssim-psnr"
+    assert comparison["metrics"]["sample_count"] == 24
     assert set(comparison["metrics"]["aggregate"]) == {
         "psnr_average_db_mean",
         "ssim_all_mean",
@@ -1018,6 +2034,7 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
             "comparison_frame_type",
         ],
         "metrics_use_unannotated_pixels": True,
+        "metrics_use_native_yuv_planes": True,
     }
     assert all(
         pair["visual_label"]
@@ -1034,9 +2051,10 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     metrics = json.loads(
         (completed / "comparison" / "video-metrics.json").read_text(encoding="utf-8")
     )
-    assert metrics["backend"] == "ffmpeg-sampled-ssim-psnr"
+    assert metrics["backend"] == "ffmpeg-native-yuv-sampled-ssim-psnr"
     assert metrics["full_title_measurement"] is False
-    assert metrics["sample_count"] == 5
+    assert metrics["sample_count"] == 24
+    assert metrics["quality_gate"]["status"] == "passed"
     assert set(metrics["aggregate"]) == {
         "psnr_average_db_mean",
         "ssim_all_mean",
@@ -1048,8 +2066,8 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
         "source_spectrum_sha256" in track and "encode_spectrum_sha256" in track
         for track in audio_comparison["tracks"]
     )
-    assert len(list((completed / "comparison").glob("*-reference.png"))) == 5
-    assert len(list((completed / "comparison").glob("*-encode.png"))) == 5
+    assert len(list((completed / "comparison").glob("*-reference.png"))) == 24
+    assert len(list((completed / "comparison").glob("*-encode.png"))) == 24
     assert not (completed / "comparison" / "encoded-frames.json").exists()
     assert not (completed / "comparison" / "source-frames.json").exists()
     assert not (completed / "comparison" / "sampled-encoded-frames.json").exists()
@@ -1075,7 +2093,7 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
         and "comparison-metric-frames" in command[-1]
         and command[-1].endswith("-encode-native.png")
     ]
-    assert len(encoded_png_commands) == 5
+    assert len(encoded_png_commands) == 24
     assert all(
         command.index("-ss") < command.index("-i") for command in encoded_png_commands
     )
@@ -1089,7 +2107,7 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
         and command[-1].endswith(("-reference.png", "-encode.png"))
         and "drawtext=" in command[command.index("-vf") + 1]
     ]
-    assert len(annotation_commands) == 10
+    assert len(annotation_commands) == 48
     assert all(
         "pad=iw:ih+max(40\\,ih/16)" in command[command.index("-vf") + 1]
         and "format=rgb48be" in command[command.index("-vf") + 1]
@@ -1121,11 +2139,18 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
         if command[0] == "ffmpeg"
         and any("ssim=stats_file=" in value for value in command)
     ]
-    assert len(metric_commands) == 5
+    assert len(metric_commands) == 24
     assert all(
-        "comparison-metric-frames" in command[command.index("-i") + 1]
+        "comparison-native-yuv" in command[command.index("-i") + 1]
         for command in metric_commands
     )
+    mux_command = next(
+        command
+        for command in runner.commands
+        if command[0] == "mkvmerge" and "--output" in command
+    )
+    assert "--attach-file" not in mux_command
+    assert "--global-tags" not in mux_command
     assert not (completed / "comparison" / stale.name).exists()
     assert not (settings.job_root(job.id) / "work").exists()
     cleanup = [
@@ -1139,11 +2164,356 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
         Path(artifact.path).is_file()
         for artifact in database.list_artifacts(job_id=job.id, limit=1000)
     )
+    artifacts = database.list_artifacts(job_id=job.id, limit=1000)
+    assert any(
+        artifact.kind is ArtifactKind.MANIFEST
+        and Path(artifact.path) == job_paths.manifest_json
+        for artifact in artifacts
+    )
+    assert not any(Path(artifact.path).suffix == ".mks" for artifact in artifacts)
 
     tampered = next(job_paths.comparison.glob("*-reference.png"))
     tampered.write_bytes(tampered.read_bytes() + b"tampered")
     with pytest.raises(RuntimeError, match="hash differs"):
         _current_comparison_pngs(job_paths)
+
+
+def test_comparison_rejects_truncated_encoded_video_before_sampling(context):
+    database, settings, scan, scanner, _runner, _worker = context
+
+    class TruncatedVideoRunner(FakeRunner):
+        def run(self, argv, **kwargs):
+            result = super().run(argv, **kwargs)
+            stdout_path = kwargs.get("stdout_path")
+            if (
+                isinstance(stdout_path, Path)
+                and stdout_path.name == "final-video-packet-sizes.csv"
+            ):
+                self._write(stdout_path, "900\n" * (FAKE_REFERENCE_FRAMES - 1))
+            return result
+
+    runner = TruncatedVideoRunner()
+    worker = PipelineWorker(
+        database,
+        settings,
+        scanner_factory=lambda _settings: scanner,
+        runner_factory=lambda _paths: runner,
+    )
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.COMPARISON
+    assert "completeness" in (result.status_message or "")
+    report = json.loads(
+        (
+            settings.job_root(job.id) / "analysis" / "video-frame-completeness.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert report["status"] == "needs_review"
+    assert "packet count does not match" in report["error"]
+    assert not any(
+        command[0] == "ffprobe"
+        and "-show_frames" in command
+        and "sampled-encoded" in " ".join(command)
+        for command in runner.commands
+    )
+
+
+def test_comparison_rejects_wrong_final_video_timeline_duration(context):
+    database, settings, scan, scanner, _runner, _worker = context
+
+    class RetimedVideoRunner(FakeRunner):
+        def run(self, argv, **kwargs):
+            result = super().run(argv, **kwargs)
+            stdout_path = kwargs.get("stdout_path")
+            if isinstance(stdout_path, Path) and stdout_path.name in {
+                "encoded-video-timeline.json",
+                "final-video-timeline.json",
+            }:
+                document = json.loads(stdout_path.read_text(encoding="utf-8"))
+                document["packets"][1]["pts_time"] = "1800.000000000"
+                document["packets"][1]["dts_time"] = "1800.000000000"
+                document["packets"][2]["pts_time"] = "3600.000000000"
+                document["packets"][2]["dts_time"] = "3600.000000000"
+                self._write(stdout_path, json.dumps(document))
+            return result
+
+    runner = RetimedVideoRunner()
+    worker = PipelineWorker(
+        database,
+        settings,
+        scanner_factory=lambda _settings: scanner,
+        runner_factory=lambda _paths: runner,
+    )
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.COMPARISON
+    assert "completeness" in (result.status_message or "")
+    report = json.loads(
+        (
+            settings.job_root(job.id) / "analysis" / "video-frame-completeness.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert report["status"] == "needs_review"
+    assert "packet-timeline duration" in report["error"]
+
+
+def test_comparison_rejects_irregular_final_video_cadence(context, monkeypatch):
+    database, settings, scan, scanner, _runner, _worker = context
+    scanner.result = replace(
+        scan,
+        playlists=(replace(scan.playlists[0], duration_seconds=3),),
+    )
+    monkeypatch.setattr(
+        worker_module, "require_video_cadence", real_require_video_cadence
+    )
+
+    class IrregularCadenceRunner(FakeRunner):
+        def run(self, argv, **kwargs):
+            result = super().run(argv, **kwargs)
+            command = tuple(os.fspath(item) for item in argv)
+            stdout_path = kwargs.get("stdout_path")
+            if not isinstance(stdout_path, Path):
+                return result
+            if command[0] == "vspipe" and "--info" in command:
+                self._write(stdout_path, "Frames: 3\nFPS: 1/1 (1.000 fps)\n")
+            elif command[0] == "ffprobe" and "packet=size" in command:
+                packet_size = (
+                    "900" if Path(command[-1]).name == "video-encoded.mkv" else "1000"
+                )
+                self._write(stdout_path, f"{packet_size}\n" * 3)
+            elif (
+                command[0] == "ffprobe"
+                and "packet=pts_time,dts_time,duration_time,size" in command
+                and "video" in stdout_path.name
+            ):
+                self._write(
+                    stdout_path,
+                    json.dumps(
+                        {
+                            "packets": [
+                                {
+                                    "pts_time": "0.000",
+                                    "dts_time": "0.000",
+                                    "duration_time": "1.000",
+                                    "size": "100",
+                                },
+                                {
+                                    "pts_time": "1.500",
+                                    "dts_time": "1.500",
+                                    "duration_time": "1.000",
+                                    "size": "100",
+                                },
+                                {
+                                    "pts_time": "2.000",
+                                    "dts_time": "2.000",
+                                    "duration_time": "1.000",
+                                    "size": "100",
+                                },
+                            ]
+                        }
+                    ),
+                )
+            return result
+
+    runner = IrregularCadenceRunner()
+    worker = PipelineWorker(
+        database,
+        settings,
+        scanner_factory=lambda _settings: scanner,
+        runner_factory=lambda _paths: runner,
+    )
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.COMPARISON
+    report = json.loads(
+        (
+            settings.job_root(job.id) / "analysis" / "video-frame-completeness.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert report["status"] == "needs_review"
+    assert "CFR grid" in report["error"]
+
+
+def test_finalize_publishes_only_manifest_pinned_metric_and_spectrum_files(
+    context,
+):
+    database, settings, scan, _scanner, _runner, worker = context
+    job = _enqueue(database, scan.source)
+    current = JobQueue(database).claim_next()
+    assert current is not None
+    current = worker.process_one_stage(current)
+    current = database.set_selection(current.id, _selection())
+    for _stage in range(8):
+        if current.state is JobState.UPLOADING:
+            break
+        current = worker.process_one_stage(current)
+    assert current.state is JobState.UPLOADING
+
+    paths = JobPaths.create(settings, job.id)
+    private_metric = paths.comparison / "private.ssim.log"
+    private_spectrum = paths.analysis / "audio-secret-spectrum.png"
+    private_metric.write_text(
+        r"private source C:\Users\operator\Videos\Title" + "\n",
+        encoding="utf-8",
+    )
+    private_spectrum.write_bytes(_png())
+
+    result = worker.process_job(current)
+
+    assert result.state is JobState.COMPLETED
+    completed = settings.completed_root / "Movie.2026.1080p.BluRay.x264"
+    assert not (completed / "comparison" / private_metric.name).exists()
+    assert not (completed / "analysis" / private_spectrum.name).exists()
+
+
+def test_finalize_rejects_precreated_output_symlink(context, tmp_path: Path):
+    database, settings, scan, _scanner, _runner, worker = context
+    job = _enqueue(database, scan.source)
+    current = JobQueue(database).claim_next()
+    assert current is not None
+    current = worker.process_one_stage(current)
+    current = database.set_selection(current.id, _selection())
+    for _stage in range(8):
+        if current.state is JobState.UPLOADING:
+            break
+        current = worker.process_one_stage(current)
+    assert current.state is JobState.UPLOADING
+
+    paths = JobPaths.create(settings, job.id)
+    completed = settings.completed_root / "Movie.2026.1080p.BluRay.x264"
+    completed.mkdir()
+    (completed / ".bdencode-owner.json").write_text(
+        json.dumps({"schema_version": 1, "job_id": job.id}),
+        encoding="utf-8",
+    )
+    external = tmp_path / "external-final.mkv"
+    external.write_bytes(paths.muxed_output.read_bytes())
+    external_before = external.read_bytes()
+    linked_output = completed / "Movie.2026.1080p.BluRay.x264.mkv"
+    try:
+        linked_output.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    result = worker.process_job(current)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.UPLOADING
+    assert "cannot be a link" in (result.status_message or "")
+    assert linked_output.is_symlink()
+    assert external.read_bytes() == external_before
+
+
+def test_finalize_rejects_external_completed_root_link(context, tmp_path: Path):
+    database, settings, scan, _scanner, _runner, worker = context
+    _enqueue(database, scan.source)
+    current = JobQueue(database).claim_next()
+    assert current is not None
+    current = worker.process_one_stage(current)
+    current = database.set_selection(current.id, _selection())
+    for _stage in range(8):
+        if current.state is JobState.UPLOADING:
+            break
+        current = worker.process_one_stage(current)
+    assert current.state is JobState.UPLOADING
+
+    settings.completed_root.rmdir()
+    external = tmp_path / "external-completed-root"
+    external.mkdir()
+    try:
+        settings.completed_root.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    result = worker.process_job(current)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.UPLOADING
+    assert "completed root cannot be" in (result.status_message or "")
+    assert list(external.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure_mode", ["payload", "timeline"])
+def test_qc_rejects_video_changed_by_final_mux(context, failure_mode):
+    database, settings, scan, scanner, _runner, _worker = context
+
+    class MutatedMuxRunner(FakeRunner):
+        def run(self, argv, **kwargs):
+            result = super().run(argv, **kwargs)
+            stdout_path = kwargs.get("stdout_path")
+            if (
+                isinstance(stdout_path, Path)
+                and stdout_path.name == "final-video.streamhash"
+                and failure_mode == "payload"
+            ):
+                self._write(
+                    stdout_path,
+                    "0,v,SHA256=" + ("cd" * 32) + "\n",
+                )
+            elif (
+                isinstance(stdout_path, Path)
+                and stdout_path.name == "final-video-timeline.json"
+                and failure_mode == "timeline"
+            ):
+                document = json.loads(stdout_path.read_text(encoding="utf-8"))
+                document["packets"][1]["pts_time"] = "3601.000000000"
+                document["packets"][1]["dts_time"] = "3601.000000000"
+                self._write(stdout_path, json.dumps(document))
+            return result
+
+    runner = MutatedMuxRunner()
+    worker = PipelineWorker(
+        database,
+        settings,
+        scanner_factory=lambda _settings: scanner,
+        runner_factory=lambda _paths: runner,
+    )
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    result = worker.process_job(ready)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.QC
+    assert "changed the compressed video" in (result.status_message or "")
+    report = json.loads(
+        (settings.job_root(job.id) / "analysis" / "video-mux-integrity.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["status"] == "needs_review"
+    if failure_mode == "payload":
+        assert report["payloads_match"] is False
+    else:
+        assert report["payloads_match"] is True
+        assert report["timeline_verdict"]["passed"] is False
+    assert not (
+        settings.job_root(job.id) / "stages" / "video-mux-integrity.json"
+    ).exists()
 
 
 def test_fast_comparison_timeout_requests_review_without_losing_resume_stage(context):
@@ -1203,7 +2573,7 @@ def test_upload_fails_closed_for_legacy_unannotated_comparison(context):
     assert "required visible SOURCE/ENCODE" in (result.status_message or "")
     assert result.error is None
     assert paths.work.is_dir()
-    assert not (settings.completed_root / "Movie.Encode").exists()
+    assert not (settings.completed_root / "Movie.2026.1080p.BluRay.x264").exists()
 
 
 def test_mux_chapters_come_from_reviewed_playlist(context):
@@ -1251,8 +2621,101 @@ def test_mux_omits_chapter_option_when_playlist_has_none(context):
     assert "--chapters" not in mux_command
 
 
+def test_mkvmerge_warning_never_creates_a_resumable_success_marker(context):
+    database, settings, scan, scanner, _runner, _worker = context
+
+    class WarningMuxRunner(FakeRunner):
+        def run(self, argv, **kwargs):
+            super().run(argv, **kwargs)
+            command = tuple(os.fspath(item) for item in argv)
+            return subprocess.CompletedProcess(
+                command,
+                1 if command[0] == "mkvmerge" and "--output" in command else 0,
+            )
+
+    runner = WarningMuxRunner()
+    worker = PipelineWorker(
+        database,
+        settings,
+        scanner_factory=lambda _settings: scanner,
+        runner_factory=lambda _paths: runner,
+    )
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    first = worker.process_job(ready)
+    paths = JobPaths.create(settings, job.id)
+    assert first.state is JobState.NEEDS_REVIEW
+    assert first.resume_state is JobState.MUXING
+    assert not (paths.stages / "mux.json").exists()
+
+    resumed = worker.queue.resume_review(job.id)
+    second = worker.process_job(resumed)
+
+    assert second.state is JobState.NEEDS_REVIEW
+    assert second.resume_state is JobState.MUXING
+    assert not (paths.stages / "mux.json").exists()
+    assert (
+        sum(
+            command[0] == "mkvmerge" and "--output" in command
+            for command in runner.commands
+        )
+        == 2
+    )
+
+
+def test_mkvmerge_identify_warning_blocks_every_qc_resume(context):
+    database, settings, scan, scanner, _runner, _worker = context
+
+    class WarningIdentifyRunner(FakeRunner):
+        def run(self, argv, **kwargs):
+            super().run(argv, **kwargs)
+            command = tuple(os.fspath(item) for item in argv)
+            return subprocess.CompletedProcess(
+                command,
+                1 if command[0] == "mkvmerge" and "--identify" in command else 0,
+            )
+
+    runner = WarningIdentifyRunner()
+    worker = PipelineWorker(
+        database,
+        settings,
+        scanner_factory=lambda _settings: scanner,
+        runner_factory=lambda _paths: runner,
+    )
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    ready = database.set_selection(job.id, _selection())
+
+    first = worker.process_job(ready)
+    paths = JobPaths.create(settings, job.id)
+    identify_marker = paths.stages / "qc-mkvmerge-identify.json"
+    assert first.state is JobState.NEEDS_REVIEW
+    assert first.resume_state is JobState.QC
+    assert not identify_marker.exists()
+
+    resumed = worker.queue.resume_review(job.id)
+    second = worker.process_job(resumed)
+
+    assert second.state is JobState.NEEDS_REVIEW
+    assert second.resume_state is JobState.QC
+    assert not identify_marker.exists()
+    assert (
+        sum(
+            command[0] == "mkvmerge" and "--identify" in command
+            for command in runner.commands
+        )
+        == 2
+    )
+
+
 def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
-    database, _settings, scan, scanner, runner, worker = context
+    database, settings, scan, scanner, runner, worker = context
     audio = MediaStream(
         id="audio:4352",
         index=1,
@@ -1286,30 +2749,65 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
         stdout_path = kwargs.get("stdout_path")
         if stdout_path is None:
             return
-        if command[0] == "mkvmerge" and "--identify" in command:
+        if command[0] == "ffprobe" and "stream=index,codec_type,start_time" in command:
+            media_name = Path(command[-1]).name
+            if media_name == "reference.mkv":
+                streams = [
+                    {
+                        "index": 0,
+                        "codec_type": "video",
+                        "start_time": "0.040000",
+                    },
+                    {
+                        "index": 1,
+                        "codec_type": "audio",
+                        "start_time": "0.040000",
+                    },
+                ]
+            else:
+                streams = [
+                    {
+                        "index": 0,
+                        "codec_type": (
+                            "video" if media_name == "video-encoded.mkv" else "audio"
+                        ),
+                        "start_time": (
+                            "0.000000"
+                            if media_name == "video-encoded.mkv"
+                            else "0.040000"
+                        ),
+                    }
+                ]
+            runner._write(stdout_path, json.dumps({"streams": streams}))
+        elif command[0] == "mkvmerge" and "--identify" in command:
             runner._write(
                 stdout_path,
                 json.dumps(
                     {
-                        "container": {"properties": {"title": "Movie.Encode"}},
+                        "container": {
+                            "properties": {"title": "Movie.2026.1080p.BluRay.x264"}
+                        },
                         "tracks": [
-                            {"id": 0, "type": "video", "properties": {}},
+                            {
+                                "id": 0,
+                                "type": "video",
+                                "properties": {
+                                    "default_track": True,
+                                    "forced_track": False,
+                                },
+                            },
                             {
                                 "id": 1,
                                 "type": "audio",
                                 "properties": {
                                     "language": "en",
-                                    "default_track": False,
+                                    "track_name": "English Original Mix",
+                                    "default_track": True,
                                     "forced_track": False,
                                 },
                             },
                         ],
-                        "attachments": [
-                            {
-                                "file_name": "encode.log",
-                                "content_type": "text/plain; charset=utf-8",
-                            }
-                        ],
+                        "attachments": [],
                     }
                 ),
             )
@@ -1323,7 +2821,9 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
                                 "index": 0,
                                 "codec_name": "h264",
                                 "profile": "High",
+                                "level": 41,
                                 "codec_type": "video",
+                                "start_time": "0.000000",
                                 "width": 1920,
                                 "height": 1080,
                                 "pix_fmt": "yuv420p",
@@ -1333,12 +2833,20 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
                                 "color_primaries": "bt709",
                                 "chroma_location": "left",
                             },
-                            {"index": 1, "codec_name": "ac3", "codec_type": "audio"},
+                            {
+                                "index": 1,
+                                "codec_name": "ac3",
+                                "codec_type": "audio",
+                                "start_time": "0.000000",
+                            },
                         ]
                     }
                 ),
             )
         elif stdout_path.name.endswith("-probe.json"):
+            start_time = (
+                "0.040000" if "source-probe" in stdout_path.name else "0.000000"
+            )
             runner._write(
                 stdout_path,
                 json.dumps(
@@ -1351,7 +2859,7 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
                                 "channels": 2,
                                 "channel_layout": "stereo",
                                 "nb_samples": "28848000",
-                                "start_time": "0",
+                                "start_time": start_time,
                                 "duration": "601",
                             }
                         ]
@@ -1370,10 +2878,49 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
             tracks=[{"stream_id": "audio:4352", "action": "copy", "language": "eng"}]
         ),
     )
+    paths = JobPaths.create(settings, job.id)
 
     result = worker.process_job(ready)
 
     assert result.state is JobState.COMPLETED, result.status_message
+    timeline = json.loads(paths.timeline_json.read_text(encoding="utf-8"))
+    assert timeline["origin_seconds"] == "0.040000"
+    assert timeline["track_sync_offsets_ms"] == ["-40.000000"]
+    mux_command = next(
+        command
+        for command in runner.commands
+        if command[0] == "mkvmerge" and "--output" in command
+    )
+    assert "0:-40" in mux_command
+    audio_report = json.loads(
+        (paths.analysis / "audio-comparison.json").read_text(encoding="utf-8")
+    )["tracks"][0]
+    assert audio_report["source_probe"]["start_time"] == "0.040000"
+    assert audio_report["source_timeline_probe"]["start_time"] == "0.000000"
+    assert audio_report["encode_probe"]["start_time"] == "0.000000"
+    assert audio_report["comparison"]["delay_seconds"] == "0.000000"
+    pcm_decode_commands = [
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg"
+        and "-c:a" in command
+        and command[command.index("-c:a") + 1] == "pcm_s32le"
+    ]
+    analysis_commands = [
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg" and "-af" in command
+    ]
+    assert len(pcm_decode_commands) == 2
+    assert len(analysis_commands) == 2
+    assert all("-drc_scale" in command for command in pcm_decode_commands)
+    assert all("-drc_scale" in command for command in analysis_commands)
+    track_mux = json.loads(
+        (paths.analysis / "track-mux-integrity.json").read_text(encoding="utf-8")
+    )
+    assert track_mux["status"] == "passed"
+    assert track_mux["tracks"][0]["stream_type"] == "a"
+    assert track_mux["tracks"][0]["payloads_match"] is True
     spectra = [
         artifact
         for artifact in database.list_artifacts(job_id=job.id, limit=1000)
@@ -1389,6 +2936,7 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
     assert len(spectrum_invocations) == 6
     for command, stderr_path in spectrum_invocations:
         output_path = Path(command[-1])
+        assert "-drc_scale" in command
         assert Decimal(command[command.index("-t") + 1]) <= Decimal("300")
         assert stderr_path is not None
         assert stderr_path != output_path
@@ -1418,7 +2966,10 @@ def test_audio_spectrum_pngs_are_registered_as_spectrogram_artifacts(context):
             assert content.content.startswith(b"\x89PNG\r\n\x1a\n")
 
 
-def test_lossy_audio_transcode_uses_target_qc_without_pcm_hash_gate(context):
+@pytest.mark.parametrize("internal_final_audio_gap", [False, True])
+def test_lossy_audio_transcode_uses_target_qc_without_pcm_hash_gate(
+    context, internal_final_audio_gap: bool
+):
     database, settings, scan, scanner, runner, worker = context
     audio = MediaStream(
         id="audio:4352",
@@ -1454,30 +3005,37 @@ def test_lossy_audio_transcode_uses_target_qc_without_pcm_hash_gate(context):
         stdout_path = kwargs.get("stdout_path")
         if stdout_path is None:
             return
+        if internal_final_audio_gap and stdout_path.name == "final-frames.json":
+            runner._write(stdout_path, runner._audio_frames(internal_gap=True))
         if command[0] == "mkvmerge" and "--identify" in command:
             runner._write(
                 stdout_path,
                 json.dumps(
                     {
-                        "container": {"properties": {"title": "Movie.Encode"}},
+                        "container": {
+                            "properties": {"title": "Movie.2026.1080p.BluRay.x264"}
+                        },
                         "tracks": [
-                            {"id": 0, "type": "video", "properties": {}},
+                            {
+                                "id": 0,
+                                "type": "video",
+                                "properties": {
+                                    "default_track": True,
+                                    "forced_track": False,
+                                },
+                            },
                             {
                                 "id": 1,
                                 "type": "audio",
                                 "properties": {
                                     "language": "en",
-                                    "default_track": False,
+                                    "track_name": "English Original Mix",
+                                    "default_track": True,
                                     "forced_track": False,
                                 },
                             },
                         ],
-                        "attachments": [
-                            {
-                                "file_name": "encode.log",
-                                "content_type": "text/plain; charset=utf-8",
-                            }
-                        ],
+                        "attachments": [],
                     }
                 ),
             )
@@ -1491,7 +3049,9 @@ def test_lossy_audio_transcode_uses_target_qc_without_pcm_hash_gate(context):
                                 "index": 0,
                                 "codec_name": "h264",
                                 "profile": "High",
+                                "level": 41,
                                 "codec_type": "video",
+                                "start_time": "0.000000",
                                 "width": 1920,
                                 "height": 1080,
                                 "pix_fmt": "yuv420p",
@@ -1501,7 +3061,12 @@ def test_lossy_audio_transcode_uses_target_qc_without_pcm_hash_gate(context):
                                 "color_primaries": "bt709",
                                 "chroma_location": "left",
                             },
-                            {"index": 1, "codec_name": "eac3", "codec_type": "audio"},
+                            {
+                                "index": 1,
+                                "codec_name": "eac3",
+                                "codec_type": "audio",
+                                "start_time": "0.000000",
+                            },
                         ]
                     }
                 ),
@@ -1518,7 +3083,9 @@ def test_lossy_audio_transcode_uses_target_qc_without_pcm_hash_gate(context):
                                 "codec_name": "truehd" if source_probe else "eac3",
                                 "sample_rate": "48000",
                                 "channels": 8 if source_probe else 6,
-                                "channel_layout": "7.1" if source_probe else "5.1(side)",
+                                "channel_layout": "7.1"
+                                if source_probe
+                                else "5.1(side)",
                                 "bit_rate": None if source_probe else "1024000",
                                 "start_time": "0",
                                 "duration": "601" if source_probe else "601.016",
@@ -1536,30 +3103,83 @@ def test_lossy_audio_transcode_uses_target_qc_without_pcm_hash_gate(context):
     ready = database.set_selection(
         job.id,
         _selection(
-            tracks=[
-                {"stream_id": "audio:4352", "action": "eac3", "language": "eng"}
-            ]
+            tracks=[{"stream_id": "audio:4352", "action": "eac3", "language": "eng"}]
         ),
     )
+    paths = JobPaths.create(settings, job.id)
 
     result = worker.process_job(ready)
+
+    if internal_final_audio_gap:
+        assert result.state is JobState.NEEDS_REVIEW
+        assert "sample-cursor continuity failed" in result.status_message
+        assert not list(paths.analysis.glob("*frames.json"))
+        assert not any(
+            artifact.name.endswith("frames.json")
+            for artifact in database.list_artifacts(job_id=job.id, limit=1000)
+        )
+        return
 
     assert result.state is JobState.COMPLETED, result.status_message
     manifest = json.loads(
         (
             settings.completed_root
-            / "Movie.Encode"
+            / "Movie.2026.1080p.BluRay.x264"
             / "analysis"
             / "audio-comparison.json"
         ).read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     track = manifest["tracks"][0]
     assert track["verification_mode"] == "lossy_transcode"
     assert track["decoded_pcm_sha256_required"] is False
     assert track["decoded_pcm_sha256_match"] is None
     assert track["verification"]["passed"] is True
     assert track["effective_target"]["codec_name"] == "eac3"
+    assert track["decoded_frame_continuity_required"] is True
+    assert track["source_to_sidecar_continuity"]["passed"] is True
+    assert track["source_to_final_continuity"]["passed"] is True
+    assert track["source_frame_continuity"]["continuous"] is True
+    assert track["sidecar_frame_continuity"]["continuous"] is True
+    assert track["final_frame_continuity"]["continuous"] is True
+    assert not list(
+        (settings.completed_root / "Movie.2026.1080p.BluRay.x264" / "analysis").glob(
+            "*frames.json"
+        )
+    )
+    assert not any(
+        artifact.name.endswith("frames.json")
+        for artifact in database.list_artifacts(job_id=job.id, limit=1000)
+    )
+    analysis_commands = [
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg" and "-af" in command
+    ]
+    spectrum_commands = [
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg" and any("showspectrumpic" in item for item in command)
+    ]
+    assert len(analysis_commands) == 2
+    assert len(spectrum_commands) == 6
+    for command in (*analysis_commands, *spectrum_commands):
+        input_name = Path(command[command.index("-i") + 1]).name
+        if input_name == "reference.mkv":
+            assert "-drc_scale" not in command
+        else:
+            assert "-drc_scale" in command
+    frame_commands = [
+        command
+        for command in runner.commands
+        if command[0] == "ffprobe"
+        and "-show_frames" in command
+        and "-select_streams" in command
+        and command[command.index("-select_streams") + 1].startswith("a:")
+    ]
+    assert len(frame_commands) == 3
+    assert "-drc_scale" not in frame_commands[0]
+    assert all("-drc_scale" in command for command in frame_commands[1:])
     audio_command = next(
         command
         for command in runner.commands
@@ -1630,11 +3250,23 @@ class _FakeUploadClient:
                 provider_may_have_committed=self.provider_may_have_committed,
             )
         digest = sha256_file(path)
-        image_url = f"https://{self.provider_name}.example/{path.name}"
+        if self.provider_name == "imgbb":
+            image_url = f"https://i.ibb.co/test/{path.name}"
+            viewer_url = f"https://ibb.co/{path.stem}"
+        elif self.provider_name == "catbox":
+            image_url = f"https://files.catbox.moe/{path.name}"
+            viewer_url = image_url
+        elif self.provider_name == "freeimage":
+            image_url = f"https://iili.io/{path.name}"
+            viewer_url = f"https://freeimage.host/i/{path.stem}"
+        else:
+            raise AssertionError(
+                f"unsupported fake upload provider: {self.provider_name}"
+            )
         return UploadedImage(
             provider=self.provider_name,
             image_url=image_url,
-            viewer_url=image_url,
+            viewer_url=viewer_url,
             local_sha256=digest,
             remote_sha256=digest,
             bbcode=f"[img]{image_url}[/img]",
@@ -1671,6 +3303,185 @@ def _advance_to_uploading(
 
 def _read_upload_checkpoint(paths: JobPaths) -> dict[str, Any]:
     return json.loads((paths.comparison / "uploads.json").read_text(encoding="utf-8"))
+
+
+def test_public_json_private_fields_block_before_any_image_upload(context):
+    client = _FakeUploadClient("imgbb")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: client,),
+    )
+    video_manifest_path = paths.comparison / "video-comparison.json"
+    video_metrics_path = paths.comparison / "video-metrics.json"
+    audio_manifest_path = paths.analysis / "audio-comparison.json"
+
+    metrics = json.loads(video_metrics_path.read_text(encoding="utf-8"))
+    metrics["api_key"] = "do-not-publish"
+    video_metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+    video_manifest = json.loads(video_manifest_path.read_text(encoding="utf-8"))
+    video_manifest["job_id"] = uploading.id
+    video_manifest["metrics"]["sha256"] = sha256_file(video_metrics_path)
+    video_manifest_path.write_text(json.dumps(video_manifest), encoding="utf-8")
+    audio_manifest = json.loads(audio_manifest_path.read_text(encoding="utf-8"))
+    audio_manifest["source_path"] = r"C:\Users\secret\Videos\private-title.m2ts"
+    audio_manifest_path.write_text(json.dumps(audio_manifest), encoding="utf-8")
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.UPLOADING
+    assert "evidence changed" in (result.status_message or "")
+    assert client.calls == []
+    assert not (paths.comparison / "uploads.json").exists()
+
+
+@pytest.mark.parametrize("tampered", [b"evil-mux", b"tampered-after-qc"])
+def test_post_qc_final_mkv_tamper_blocks_before_any_upload(context, tampered: bytes):
+    client = _FakeUploadClient("imgbb")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: client,),
+    )
+    paths.muxed_output.write_bytes(tampered)
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.UPLOADING
+    assert "changed after its validated mux checkpoint" in (result.status_message or "")
+    assert client.calls == []
+    assert not (
+        worker.settings.completed_root
+        / "Movie.2026.1080p.BluRay.x264"
+        / "Movie.2026.1080p.BluRay.x264.mkv"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "field", "value", "expected_stage"),
+    [
+        (
+            ("analysis", "audio-comparison.json"),
+            "summary",
+            "forged-audio-metric",
+            "audio QC",
+        ),
+        (
+            ("comparison", "video-comparison.json"),
+            "summary",
+            "forged-video-aggregate",
+            "video comparison",
+        ),
+    ],
+)
+def test_post_qc_public_evidence_tamper_blocks_before_upload(
+    context,
+    relative_path: tuple[str, str],
+    field: str,
+    value: str,
+    expected_stage: str,
+):
+    client = _FakeUploadClient("imgbb")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: client,),
+    )
+    target = paths.root.joinpath(*relative_path)
+    document = json.loads(target.read_text(encoding="utf-8"))
+    document[field] = value
+    target.write_text(json.dumps(document), encoding="utf-8")
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.UPLOADING
+    assert f"{expected_stage} evidence changed" in (result.status_message or "")
+    assert client.calls == []
+
+
+def test_public_evidence_mutated_during_upload_never_reaches_completed(context):
+    paths_holder: list[JobPaths] = []
+    mutated = False
+
+    def mutate_audio_manifest(_path: Path) -> None:
+        nonlocal mutated
+        if mutated:
+            return
+        mutated = True
+        paths = paths_holder[0]
+        manifest_path = paths.analysis / "audio-comparison.json"
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        document["host"] = {
+            "hostname": "private-encoder-host",
+            "os": "Windows 11",
+            "cpu": "private-cpu-model",
+        }
+        manifest_path.write_text(json.dumps(document), encoding="utf-8")
+
+    client = _FakeUploadClient("imgbb", on_call=mutate_audio_manifest)
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: client,),
+    )
+    paths_holder.append(paths)
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.UPLOADING
+    assert "audio QC evidence changed" in (result.status_message or "")
+    assert client.calls
+    assert not (
+        worker.settings.completed_root / "Movie.2026.1080p.BluRay.x264"
+    ).exists()
+
+
+def test_public_evidence_mutated_during_final_mkv_copy_is_not_published(
+    context,
+    monkeypatch,
+):
+    client = _FakeUploadClient("imgbb")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: client,),
+    )
+    real_copy2 = shutil.copy2
+    mutated = False
+
+    def mutate_after_revalidation(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+        *args: Any,
+        **kwargs: Any,
+    ):
+        nonlocal mutated
+        destination_path = Path(destination)
+        if not mutated and destination_path.name.endswith(".mkv.partial"):
+            mutated = True
+            manifest_path = paths.analysis / "audio-comparison.json"
+            document = json.loads(manifest_path.read_text(encoding="utf-8"))
+            document["host"] = {
+                "hostname": "post-revalidation-private-host",
+                "cpu": "private-cpu-model",
+            }
+            manifest_path.write_text(json.dumps(document), encoding="utf-8")
+        return real_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(worker_module.shutil, "copy2", mutate_after_revalidation)
+
+    result = worker.process_job(uploading)
+
+    completed = worker.settings.completed_root / "Movie.2026.1080p.BluRay.x264"
+    assert mutated is True
+    assert client.calls
+    assert result.state is JobState.NEEDS_REVIEW
+    assert result.resume_state is JobState.UPLOADING
+    assert "public analysis sidecar changed after validation" in (
+        result.status_message or ""
+    )
+    assert not (completed / "analysis" / "audio-comparison.json").exists()
+    assert not (completed / ".analysis.partial").exists()
+    assert not (completed / ".comparison.partial").exists()
 
 
 def test_upload_falls_back_only_before_the_first_success(context):
@@ -1924,13 +3735,14 @@ def test_schema_v1_upload_checkpoint_resumes_as_imgbb_without_mixing(context):
     pngs = _current_comparison_pngs(paths)
     first = pngs[0]
     digest = sha256_file(first)
-    legacy_url = f"https://legacy-imgbb.example/{first.name}"
+    legacy_url = f"https://i.ibb.co/legacy/{first.name}"
+    legacy_viewer = f"https://ibb.co/{first.stem}"
     legacy_item = {
         "image_url": legacy_url,
-        "viewer_url": legacy_url,
+        "viewer_url": legacy_viewer,
         "local_sha256": digest,
         "remote_sha256": digest,
-        "bbcode": f"[img]{legacy_url}[/img]",
+        "bbcode": f"[url={legacy_viewer}][img]{legacy_url}[/img][/url]",
     }
     (paths.comparison / "uploads.json").write_text(
         json.dumps(
@@ -1970,11 +3782,16 @@ def test_mixed_provider_checkpoint_requires_review_before_any_upload(context):
     mixed: dict[str, dict[str, str]] = {}
     for path, provider in zip(pngs[:2], ("imgbb", "catbox"), strict=True):
         digest = sha256_file(path)
-        image_url = f"https://{provider}.example/{path.name}"
+        image_url = (
+            f"https://i.ibb.co/test/{path.name}"
+            if provider == "imgbb"
+            else f"https://files.catbox.moe/{path.name}"
+        )
+        viewer_url = f"https://ibb.co/{path.stem}" if provider == "imgbb" else image_url
         mixed[path.name] = {
             "provider": provider,
             "image_url": image_url,
-            "viewer_url": image_url,
+            "viewer_url": viewer_url,
             "local_sha256": digest,
             "remote_sha256": digest,
             "bbcode": f"[img]{image_url}[/img]",
@@ -1993,9 +3810,48 @@ def test_mixed_provider_checkpoint_requires_review_before_any_upload(context):
     result = worker.process_job(uploading)
 
     assert result.state is JobState.NEEDS_REVIEW
-    assert "mixes image providers" in (result.status_message or "")
+    assert "provider conflicts with checkpoint" in (result.status_message or "")
     assert primary.calls == []
     assert fallback.calls == []
+
+
+def test_tampered_upload_checkpoint_never_reaches_public_package(context):
+    client = _FakeUploadClient("imgbb")
+    worker, uploading, paths = _advance_to_uploading(
+        context,
+        (lambda: client,),
+    )
+    first = _current_comparison_pngs(paths)[0]
+    digest = sha256_file(first)
+    image_url = f"https://i.ibb.co/test/{first.name}"
+    viewer_url = f"https://ibb.co/{first.stem}"
+    tampered = {
+        "schema_version": 2,
+        "provider": "imgbb",
+        "images": {
+            first.name: {
+                "provider": "imgbb",
+                "image_url": image_url,
+                "viewer_url": viewer_url,
+                "local_sha256": digest,
+                "remote_sha256": digest,
+                "bbcode": "[img]https://attacker.invalid/injected.png[/img]",
+                "delete_url": "https://ibb.co/delete/private-token",
+            }
+        },
+    }
+    checkpoint = paths.comparison / "uploads.json"
+    checkpoint.write_text(json.dumps(tampered), encoding="utf-8")
+
+    result = worker.process_job(uploading)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert "unsafe" in (result.status_message or "")
+    assert client.calls == []
+    assert json.loads(checkpoint.read_text(encoding="utf-8")) == tampered
+    assert not (
+        worker.settings.completed_root / "Movie.2026.1080p.BluRay.x264"
+    ).exists()
 
 
 def test_parse_selection_rejects_path_traversal(context):
@@ -2033,6 +3889,117 @@ def test_parser_accepts_legacy_top_level_video_fields_and_rejects_conflict(conte
     legacy["video"]["crop"] = {"left": 2, "top": 0, "right": 0, "bottom": 0}
     with pytest.raises(ReviewRequired, match="conflict"):
         parse_selection(job.model_copy(update={"selection": legacy}), scan)
+
+
+def test_selection_schema_v1_chroma_offset_migrates_to_v2_effective_value(context):
+    database, _settings, scan, _scanner, _runner, _worker = context
+    job = _enqueue(database, scan.source)
+    legacy = _selection()
+    legacy["video"]["settings"] = {"chroma_qp_offset": 0}
+
+    parsed_legacy = parse_selection(job.model_copy(update={"selection": legacy}), scan)
+
+    assert parsed_legacy.schema_version == 2
+    assert parsed_legacy.settings.chroma_qp_offset == -2
+    assert parsed_legacy.settings.private_params()["chroma-qp-offset"] == 0
+
+    current = _selection(schema_version=2)
+    current["video"]["settings"] = {"chroma_qp_offset": 0}
+    parsed_current = parse_selection(
+        job.model_copy(update={"selection": current}), scan
+    )
+
+    assert parsed_current.schema_version == 2
+    assert parsed_current.settings.chroma_qp_offset == 0
+    assert parsed_current.settings.private_params()["chroma-qp-offset"] == 2
+
+
+def test_parse_selection_applies_automatic_level_4_1_vbv_ref_and_gop(context):
+    database, _settings, scan, _scanner, _runner, _worker = context
+    job = _enqueue(database, scan.source).model_copy(
+        update={"selection": _selection(schema_version=2)}
+    )
+
+    parsed = parse_selection(job, scan)
+
+    assert parsed.schema_version == 2
+    assert parsed.settings.level == "4.1"
+    assert parsed.settings.ref == 4
+    assert (parsed.settings.keyint, parsed.settings.min_keyint) == (240, 24)
+    assert parsed.settings.vbv is not None
+    assert parsed.settings.vbv.maxrate_kbps == 62_500
+    assert parsed.settings.vbv.bufsize_kbps == 78_125
+    args = parsed.settings.ffmpeg_video_args()
+    assert args[args.index("-level:v") + 1] == "4.1"
+    private = args[args.index("-x264-params") + 1]
+    assert "ref=4" in private
+    assert "keyint=240" in private
+    assert "min-keyint=24" in private
+    assert "vbv-maxrate=62500" in private
+    assert "vbv-bufsize=78125" in private
+
+
+def test_native_yuv_metric_gate_accepts_all_exact_policy_boundaries() -> None:
+    samples = [
+        {"category": "I", "ssim_all": 0.97, "psnr_average_db": 35.0},
+        {"category": "P", "ssim_all": 0.95, "psnr_average_db": 39.0},
+        {"category": "B", "ssim_all": 0.93, "psnr_average_db": 40.0},
+    ]
+
+    assert worker_module._sampled_video_metric_errors(samples) == ()
+    assert (
+        worker_module._sampled_video_metric_errors(
+            [{"category": "I", "ssim_all": 1.0, "psnr_average_db": "inf"}]
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    ("samples", "message"),
+    (
+        (
+            [{"category": "I", "ssim_all": 0.929, "psnr_average_db": 40.0}],
+            "SSIM is below 0.93",
+        ),
+        (
+            [
+                {"category": kind, "ssim_all": 0.949, "psnr_average_db": 40.0}
+                for kind in "IPB"
+            ],
+            "mean sampled SSIM is below 0.95",
+        ),
+        (
+            [{"category": "I", "ssim_all": 0.96, "psnr_average_db": 34.9}],
+            "PSNR is below 35 dB",
+        ),
+        (
+            [
+                {"category": kind, "ssim_all": 0.96, "psnr_average_db": 37.9}
+                for kind in "IPB"
+            ],
+            "mean sampled PSNR is below 38 dB",
+        ),
+        (
+            [
+                {"category": "I", "ssim_all": 0.98, "psnr_average_db": 40.0},
+                {"category": "P", "ssim_all": 0.98, "psnr_average_db": 40.0},
+                {"category": "B", "ssim_all": 0.949, "psnr_average_db": 40.0},
+            ],
+            "B-frame sampled SSIM trails P-frames by more than 0.03",
+        ),
+        (
+            [{"category": "I", "ssim_all": "nan", "psnr_average_db": "nan"}],
+            "no finite SSIM value",
+        ),
+    ),
+)
+def test_native_yuv_metric_gate_rejects_each_quality_failure(
+    samples: list[dict[str, object]], message: str
+) -> None:
+    errors = worker_module._sampled_video_metric_errors(samples)
+
+    assert any(message in error for error in errors)
 
 
 def test_selection_propagates_scanned_sdr_color_without_retagging(context):
@@ -2153,8 +4120,12 @@ def test_color_confirmation_cannot_override_known_scan_fields(context):
     }
 
 
-def test_manual_hdr10_settings_can_complete_incomplete_uhd_scan(context):
-    database, _settings, scan, _scanner, _runner, _worker = context
+_HDR10_MASTERING = (
+    "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
+)
+
+
+def _uhd_hdr10_scan(scan: DiscScan, static: HdrStaticMetadata) -> DiscScan:
     source_stream = scan.playlists[0].video_streams[0]
     uhd_stream = replace(
         source_stream,
@@ -2171,24 +4142,39 @@ def test_manual_hdr10_settings_can_complete_incomplete_uhd_scan(context):
             color_transfer="smpte2084",
             color_matrix="bt2020nc",
             hdr10=True,
-            hdr10_static=HdrStaticMetadata(),
+            hdr10_static=static,
             hdr10_base_layer=True,
         ),
     )
-    uhd_scan = replace(
+    return replace(
         scan,
         disc_kind=DiscKind.UHD,
         playlists=(replace(scan.playlists[0], streams=(uhd_stream,)),),
     )
+
+
+def _uhd_hdr10_selection(
+    **metadata_updates: object,
+) -> dict[str, Any]:
     selection = _selection()
-    selection["video"]["settings"] = {
-        "hdr10": {
-            "enabled": True,
-            "mastering_display": "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)",
-            "max_cll": 1000,
-            "max_fall": 400,
-        }
+    selection["output_name"] = "Movie.2026.2160p.UHD.BluRay.x265"
+    metadata: dict[str, object] = {
+        "enabled": True,
+        "mastering_display": _HDR10_MASTERING,
+        "max_cll": 1000,
+        "max_fall": 400,
     }
+    metadata.update(metadata_updates)
+    selection["video"]["settings"] = {
+        "hdr10": metadata,
+    }
+    return selection
+
+
+def test_manual_hdr10_settings_can_complete_incomplete_uhd_scan(context):
+    database, _settings, scan, _scanner, _runner, _worker = context
+    uhd_scan = _uhd_hdr10_scan(scan, HdrStaticMetadata())
+    selection = _uhd_hdr10_selection()
     job = _enqueue(database, scan.source).model_copy(update={"selection": selection})
 
     parsed = parse_selection(job, uhd_scan)
@@ -2196,3 +4182,93 @@ def test_manual_hdr10_settings_can_complete_incomplete_uhd_scan(context):
     assert parsed.settings.encoder.value == "x265"
     assert parsed.settings.hdr10.enabled is True
     assert parsed.settings.hdr10.max_cll == 1000
+
+
+def test_manual_hdr10_must_exactly_match_complete_uhd_scan(context) -> None:
+    database, _settings, scan, _scanner, _runner, _worker = context
+    static = HdrStaticMetadata(_HDR10_MASTERING, 1000, 400)
+    uhd_scan = _uhd_hdr10_scan(scan, static)
+    selection = _uhd_hdr10_selection()
+    job = _enqueue(database, scan.source).model_copy(update={"selection": selection})
+
+    parsed = parse_selection(job, uhd_scan)
+
+    assert parsed.settings.hdr10.mastering_display == static.mastering_display
+    assert parsed.settings.hdr10.max_cll == static.max_cll
+    assert parsed.settings.hdr10.max_fall == static.max_fall
+    assert parsed.settings.hdr10.hdr10_opt is True
+
+
+@pytest.mark.parametrize(
+    ("field_name", "selected_value"),
+    [
+        (
+            "mastering_display",
+            "G(13251,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)",
+        ),
+        ("max_cll", 1001),
+        ("max_fall", 401),
+    ],
+)
+def test_manual_hdr10_conflict_with_complete_scan_requires_review(
+    context,
+    field_name: str,
+    selected_value: object,
+) -> None:
+    database, _settings, scan, _scanner, _runner, _worker = context
+    static = HdrStaticMetadata(_HDR10_MASTERING, 1000, 400)
+    uhd_scan = _uhd_hdr10_scan(scan, static)
+    selection = _uhd_hdr10_selection(**{field_name: selected_value})
+    job = _enqueue(database, scan.source).model_copy(update={"selection": selection})
+
+    with pytest.raises(ReviewRequired) as error:
+        parse_selection(job, uhd_scan)
+
+    assert error.value.details["code"] == "source_hdr10_metadata_conflict"
+    assert error.value.details["scan_complete"] is True
+    assert error.value.details["conflicts"][field_name] == {
+        "scanned": getattr(static, field_name),
+        "selected": selected_value,
+    }
+
+
+@pytest.mark.parametrize("field_name", ["enabled", "hdr10_opt"])
+def test_source_hdr10_cannot_disable_required_hdr_policy(
+    context,
+    field_name: str,
+) -> None:
+    database, _settings, scan, _scanner, _runner, _worker = context
+    static = HdrStaticMetadata(_HDR10_MASTERING, 1000, 400)
+    uhd_scan = _uhd_hdr10_scan(scan, static)
+    if field_name == "enabled":
+        selection = _uhd_hdr10_selection()
+        selection["video"]["settings"]["hdr10"] = {"enabled": False}
+    else:
+        selection = _uhd_hdr10_selection(hdr10_opt=False)
+    job = _enqueue(database, scan.source).model_copy(update={"selection": selection})
+
+    with pytest.raises(ReviewRequired) as error:
+        parse_selection(job, uhd_scan)
+
+    assert error.value.details["code"] == "source_hdr10_metadata_conflict"
+    assert error.value.details["conflicts"][field_name] == {
+        "required": True,
+        "selected": False,
+    }
+
+
+def test_manual_hdr10_can_only_fill_missing_scan_fields(context) -> None:
+    database, _settings, scan, _scanner, _runner, _worker = context
+    partial = HdrStaticMetadata(_HDR10_MASTERING, None, None)
+    uhd_scan = _uhd_hdr10_scan(scan, partial)
+    changed_mastering = (
+        "G(13251,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
+    )
+    selection = _uhd_hdr10_selection(mastering_display=changed_mastering)
+    job = _enqueue(database, scan.source).model_copy(update={"selection": selection})
+
+    with pytest.raises(ReviewRequired) as error:
+        parse_selection(job, uhd_scan)
+
+    assert error.value.details["scan_complete"] is False
+    assert "mastering_display" in error.value.details["conflicts"]

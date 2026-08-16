@@ -53,3 +53,21 @@ def atomic_write_json(path: Path, value: Any, *, mode: int = 0o640) -> None:
         _fsync_directory(path.parent)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def atomic_write_text(path: Path, text: str, *, mode: int = 0o640) -> None:
+    """Replace a UTF-8 text file via an unpredictable same-directory inode."""
+
+    path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)

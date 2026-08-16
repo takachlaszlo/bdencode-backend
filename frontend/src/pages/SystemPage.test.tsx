@@ -20,6 +20,7 @@ vi.mock("../api/client", async (importOriginal) => {
 
 const capabilities = {
   api_version: "1",
+  backend_version: "2.0.0",
   constraints: { cpu_budget_fraction: 0.8 },
 } as CapabilitiesResponse;
 
