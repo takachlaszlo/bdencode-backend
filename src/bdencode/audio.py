@@ -10,6 +10,16 @@ from typing import Any
 AUDIO_ACTIONS = ("copy", "flac", "ac3", "eac3", "dts", "omit")
 LOSSLESS_AUDIO_ACTIONS = frozenset({"copy", "flac"})
 LOSSY_AUDIO_ACTIONS = frozenset({"ac3", "eac3", "dts"})
+AUDIO_DECODE_POLICY_SCHEMA_VERSION = 1
+
+_AUDIO_CODEC_ALIASES = {
+    "ac3": "ac3",
+    "ac3fixed": "ac3",
+    "dolbydigital": "ac3",
+    "eac3": "eac3",
+    "eac3secondary": "eac3",
+    "dolbydigitalplus": "eac3",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +75,7 @@ class EffectiveAudioPolicy:
     bitrate_kbps: int | None
     sample_rate: int | None
     channels: int | None
+    bit_depth: int | None = None
 
     @property
     def pcm_match_required(self) -> bool:
@@ -81,6 +92,35 @@ def normalize_audio_action(action: str) -> str:
     if normalized not in AUDIO_ACTIONS:
         raise ValueError("audio action must be copy, flac, ac3, eac3, dts or omit")
     return normalized
+
+
+def normalize_audio_codec_name(codec: str) -> str:
+    """Return a stable codec token for decoder-policy decisions.
+
+    FFprobe, MediaInfo, and Blu-ray scanners use several punctuation and alias
+    variants for AC-3 and E-AC-3.  Canonicalization is deliberately based on
+    exact normalized tokens so an unrelated codec name containing ``ac3`` can
+    never accidentally enable an AC-3 decoder option.
+    """
+
+    if not isinstance(codec, str):
+        raise ValueError("audio codec name must be a string")
+    value = codec.strip().casefold()
+    if not value:
+        raise ValueError("audio codec name must not be empty")
+    token = "".join(
+        character for character in value if character.isascii() and character.isalnum()
+    )
+    if not token:
+        raise ValueError("audio codec name has no ASCII alphanumeric token")
+    return _AUDIO_CODEC_ALIASES.get(token, token)
+
+
+def audio_decode_input_args(input_codec: str) -> list[str]:
+    """Return codec-aware FFmpeg input options for deterministic PCM decode."""
+
+    normalized = normalize_audio_codec_name(input_codec)
+    return ["-drc_scale", "0"] if normalized in {"ac3", "eac3"} else []
 
 
 def is_lossless_audio_action(action: str) -> bool:
@@ -140,6 +180,7 @@ def effective_audio_policy(
     source_profile: str | None = None,
     source_channels: int | None = None,
     source_sample_rate: int | None = None,
+    source_bit_depth: int | None = None,
 ) -> EffectiveAudioPolicy:
     normalized = normalize_audio_action(action)
     if normalized == "omit":
@@ -154,6 +195,7 @@ def effective_audio_policy(
             None,
             source_sample_rate,
             source_channels,
+            source_bit_depth,
         )
     if normalized == "flac":
         return EffectiveAudioPolicy(
@@ -165,6 +207,7 @@ def effective_audio_policy(
             None,
             source_sample_rate,
             source_channels,
+            source_bit_depth,
         )
     if normalized == "dts" and _is_dts_source(source_codec, source_profile):
         core_extract = _is_dts_hd_source(source_codec, source_profile)
@@ -182,6 +225,7 @@ def effective_audio_policy(
                 source_codec=source_codec,
                 source_profile=source_profile,
             ),
+            source_bit_depth,
         )
 
     preset = AUDIO_TRANSCODE_PRESETS[normalized]
@@ -199,6 +243,28 @@ def effective_audio_policy(
             source_codec=source_codec,
             source_profile=source_profile,
         ),
+        None,
+    )
+
+
+def flac_sample_format(source_bit_depth: int | None) -> str | None:
+    """Return the lossless FFmpeg sample format for a reviewed source depth.
+
+    FFmpeg represents 24-bit integer samples in its 32-bit sample format.  A
+    16-bit Blu-ray PCM source must stay ``s16``; promoting it to ``s32`` makes
+    the FLAC advertise 24 bits even though the extra low bits are only zero
+    padding.  Unknown depth remains automatic rather than being guessed.
+    """
+
+    if source_bit_depth is None:
+        return None
+    if source_bit_depth == 16:
+        return "s16"
+    if source_bit_depth == 24:
+        return "s32"
+    raise ValueError(
+        "FLAC source bit depth must be confirmed as 16 or 24 bits; "
+        f"got {source_bit_depth}"
     )
 
 
@@ -209,6 +275,7 @@ def audio_encode_args(
     source_profile: str | None = None,
     source_channels: int | None = None,
     source_sample_rate: int | None = None,
+    source_bit_depth: int | None = None,
 ) -> list[str]:
     policy = effective_audio_policy(
         action,
@@ -216,13 +283,18 @@ def audio_encode_args(
         source_profile=source_profile,
         source_channels=source_channels,
         source_sample_rate=source_sample_rate,
+        source_bit_depth=source_bit_depth,
     )
     if policy.strategy == "copy":
         return ["-c:a", "copy"]
     if policy.strategy == "dts_core_extract":
         return ["-c:a", "copy", "-bsf:a", "dca_core"]
     if policy.action == "flac":
-        return ["-c:a", "flac", "-compression_level", "8"]
+        args = ["-c:a", "flac", "-compression_level", "8"]
+        sample_format = flac_sample_format(source_bit_depth)
+        if sample_format is not None:
+            args.extend(("-sample_fmt", sample_format))
+        return args
 
     preset = AUDIO_TRANSCODE_PRESETS[policy.action]
     assert policy.channels is not None

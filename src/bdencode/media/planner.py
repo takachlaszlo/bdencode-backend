@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
+from fractions import Fraction
 import os
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from ..audio import (
     AUDIO_TRANSCODE_PRESETS,
@@ -20,10 +21,17 @@ from .bluray import (
     MediaStream,
     PlaylistCandidate,
     StreamKind,
+    TrackRole,
     VideoCodec,
 )
 from .language import iso639_2_to_bcp47, normalize_iso639_2
-from .profiles import EncoderSettings, VideoEncoder
+from .profiles import (
+    EncoderSettings,
+    VideoEncoder,
+    format_frame_rate,
+    parse_frame_rate,
+    source_adapted_settings,
+)
 
 
 DEFAULT_WORK_ROOT = Path("/home/accofil/encode")
@@ -55,14 +63,72 @@ class Crop:
 
     def __post_init__(self) -> None:
         values = (self.left, self.top, self.right, self.bottom)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in values
+        ):
+            raise ValueError("crop values must be integers")
         if any(value < 0 for value in values):
             raise ValueError("crop values cannot be negative")
         if any(value % 2 for value in values):
             raise ValueError("4:2:0 crop values must be even")
 
+    @classmethod
+    def from_detected_borders(
+        cls,
+        *,
+        left: int = 0,
+        top: int = 0,
+        right: int = 0,
+        bottom: int = 0,
+        safety: int = 0,
+    ) -> Crop:
+        """Safely convert measured black borders into a 4:2:0 crop.
+
+        Each measurement is reduced by the optional safety margin and rounded
+        down to an even value.  The helper never crops an unmeasured pixel and
+        is therefore suitable for full-title border-union recommendations.
+        """
+
+        values = (left, top, right, bottom, safety)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in values
+        ):
+            raise ValueError("detected borders and safety must be integers")
+        if any(value < 0 for value in values):
+            raise ValueError("detected borders and safety cannot be negative")
+
+        def safe(value: int) -> int:
+            return (max(0, value - safety) // 2) * 2
+
+        return cls(safe(left), safe(top), safe(right), safe(bottom))
+
     @property
     def enabled(self) -> bool:
         return any((self.left, self.top, self.right, self.bottom))
+
+    def output_dimensions(self, width: int, height: int) -> tuple[int, int]:
+        """Validate and return cropped 4:2:0 dimensions."""
+
+        if (
+            isinstance(width, bool)
+            or isinstance(height, bool)
+            or not isinstance(width, int)
+            or not isinstance(height, int)
+            or width <= 0
+            or height <= 0
+        ):
+            raise ValueError("source dimensions must be positive integers")
+        if width % 2 or height % 2:
+            raise ValueError("4:2:0 source dimensions must be even")
+        output_width = width - self.left - self.right
+        output_height = height - self.top - self.bottom
+        if output_width < 16:
+            raise ValueError("horizontal crop must leave at least 16 pixels")
+        if output_height < 16:
+            raise ValueError("vertical crop must leave at least 16 pixels")
+        if output_width % 2 or output_height % 2:
+            raise ValueError("4:2:0 cropped dimensions must be even")
+        return output_width, output_height
 
     def ffmpeg_filter(self) -> str:
         return f"crop=iw-{self.left + self.right}:ih-{self.top + self.bottom}:{self.left}:{self.top}"
@@ -76,6 +142,7 @@ class TrackSelection:
     name: str | None = None
     default: bool | None = None
     forced: bool | None = None
+    subtitle_kind: str | None = None
     order: int = 0
 
     def __post_init__(self) -> None:
@@ -83,8 +150,18 @@ class TrackSelection:
             object.__setattr__(self, "action", TrackAction(self.action))
         if not self.stream_id:
             raise ValueError("track selection requires a stream_id")
+        for field_name in ("default", "forced"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"track {field_name} must be boolean or omitted")
+        if isinstance(self.order, bool) or not isinstance(self.order, int):
+            raise ValueError("track order must be an integer")
         if self.order < 0:
             raise ValueError("track order cannot be negative")
+        if self.subtitle_kind not in {None, "unknown", "full", "forced"}:
+            raise ValueError(
+                "subtitle_kind must be unknown, full, forced or omitted"
+            )
         if self.language:
             normalized = normalize_iso639_2(self.language)
             if normalized is None and not _BCP47_RE.fullmatch(self.language):
@@ -96,6 +173,94 @@ class TrackSelection:
         if stream.language and stream.language.bcp47:
             return stream.language.bcp47
         return "und"
+
+
+_LANGUAGE_NAMES = {
+    "cmn": "Mandarin",
+    "de": "German",
+    "deu": "German",
+    "en": "English",
+    "eng": "English",
+    "fr": "French",
+    "fra": "French",
+    "hu": "Hungarian",
+    "hun": "Hungarian",
+    "nl": "Dutch",
+    "nld": "Dutch",
+    "yue": "Cantonese",
+    "zh": "Chinese",
+    "zho": "Chinese",
+}
+
+
+def resolved_track_name(selection: TrackSelection, stream: MediaStream) -> str:
+    """Return the same meaningful public track name for plan and final mux."""
+
+    if selection.name:
+        return selection.name
+    if stream.title:
+        return stream.title
+    language = _LANGUAGE_NAMES.get(
+        selection.bcp47(stream).casefold(), selection.bcp47(stream)
+    )
+    if stream.kind is StreamKind.SUBTITLE:
+        if selection.subtitle_kind == "forced":
+            suffix = "Forced"
+        elif TrackRole.SDH in stream.roles:
+            suffix = "SDH"
+        else:
+            suffix = "Full"
+        return f"{language} {suffix}"
+    if TrackRole.COMMENTARY in stream.roles:
+        return f"{language} Commentary"
+    if TrackRole.AUDIO_DESCRIPTION in stream.roles:
+        return f"{language} Audio Description"
+    if TrackRole.DUB in stream.roles:
+        return f"{language} Dub"
+    return f"{language} Original Mix"
+
+
+def resolve_audio_defaults(
+    retained: Sequence[tuple[TrackSelection, MediaStream]],
+) -> dict[str, bool]:
+    """Resolve exactly one reviewed audio default for plan, mux and QC."""
+
+    audio = [entry for entry in retained if entry[1].kind is StreamKind.AUDIO]
+    if not audio:
+        return {}
+    selected = [
+        entry
+        for entry in audio
+        if entry[0].default is True
+        or (entry[0].default is None and entry[1].default)
+    ]
+    if len(selected) > 1:
+        raise ValueError("exactly one retained audio track may be default")
+    if not selected:
+        selected = [
+            next(
+                (
+                    entry
+                    for entry in audio
+                    if TrackRole.DUB not in entry[1].roles
+                    and TrackRole.COMMENTARY not in entry[1].roles
+                    and TrackRole.AUDIO_DESCRIPTION not in entry[1].roles
+                ),
+                audio[0],
+            )
+        ]
+    default_stream = selected[0][1]
+    if TrackRole.DUB in default_stream.roles and any(
+        TrackRole.DUB not in stream.roles
+        and TrackRole.COMMENTARY not in stream.roles
+        and TrackRole.AUDIO_DESCRIPTION not in stream.roles
+        for _selection, stream in audio
+    ):
+        raise ValueError(
+            "a dubbed audio track cannot be default while an original/main mix "
+            "is retained"
+        )
+    return {stream.id: stream.id == default_stream.id for _, stream in audio}
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,9 +400,30 @@ class EncodePlanner:
             )
             needs_review = True
         self._validate_crop(video_stream, request.crop)
+        output_dimensions = self._output_dimensions(video_stream, request.crop)
+        output_frame_rate = self._output_frame_rate(
+            video_stream.video.frame_rate,
+            request.field_handling,
+        )
+        effective_settings, video_policy = source_adapted_settings(
+            request.settings,
+            width=output_dimensions[0] if output_dimensions else None,
+            height=output_dimensions[1] if output_dimensions else None,
+            frame_rate=output_frame_rate,
+        )
+        level_policy = video_policy["h264_level_4_1"]
+        if level_policy.get("applied") and level_policy.get(
+            "reference_frames_adjusted"
+        ):
+            warnings.append(
+                "H.264 level 4.1 reduced reference frames from "
+                f"{level_policy['requested_reference_frames']} to "
+                f"{level_policy['effective_reference_frames']} for the cropped "
+                "macroblock geometry."
+            )
 
         selected = self._validate_tracks(playlist, request)
-        if request.settings.bframes == 0:
+        if effective_settings.bframes == 0:
             warnings.append(
                 "B-frames are disabled, so the mandatory B-frame comparison category cannot be populated."
             )
@@ -264,7 +450,7 @@ class EncodePlanner:
         ]
         if video_filters:
             video_argv.extend(("-vf", ",".join(video_filters)))
-        video_argv.extend(request.settings.ffmpeg_video_args())
+        video_argv.extend(effective_settings.ffmpeg_video_args())
         video_argv.extend(("-fps_mode", "passthrough", os.fspath(video_path)))
         commands: list[PlannedCommand] = [
             PlannedCommand(
@@ -305,6 +491,7 @@ class EncodePlanner:
                     source_profile=stream.codec_profile,
                     source_channels=stream.channels,
                     source_sample_rate=stream.sample_rate,
+                    source_bit_depth=stream.bit_depth,
                 )
                 argv.append("-sn")
                 argv.extend(
@@ -314,6 +501,7 @@ class EncodePlanner:
                         source_profile=stream.codec_profile,
                         source_channels=stream.channels,
                         source_sample_rate=stream.sample_rate,
+                        source_bit_depth=stream.bit_depth,
                     )
                 )
                 argv.extend(("-f", "matroska"))
@@ -360,23 +548,35 @@ class EncodePlanner:
             mux_inputs.append((intermediate, selection, stream))
 
         mux_argv = [self.mkvmerge, "--output", os.fspath(output), os.fspath(video_path)]
+        mux_track_pairs = [
+            (selection, stream) for _path, selection, stream in mux_inputs
+        ]
+        audio_defaults = resolve_audio_defaults(mux_track_pairs)
         for intermediate, selection, stream in mux_inputs:
             track_id = "0"
             mux_argv.extend(("--language", f"{track_id}:{selection.bcp47(stream)}"))
             default = (
-                selection.default if selection.default is not None else stream.default
+                audio_defaults[stream.id]
+                if stream.kind is StreamKind.AUDIO
+                else (
+                    selection.default
+                    if selection.default is not None
+                    else stream.default
+                )
             )
-            forced = selection.forced if selection.forced is not None else stream.forced
+            forced = (
+                stream.kind is StreamKind.SUBTITLE
+                and selection.subtitle_kind == "forced"
+            )
             mux_argv.extend(
                 ("--default-track-flag", f"{track_id}:{'yes' if default else 'no'}")
             )
             mux_argv.extend(
                 ("--forced-display-flag", f"{track_id}:{'yes' if forced else 'no'}")
             )
-            if selection.name or stream.title:
-                mux_argv.extend(
-                    ("--track-name", f"{track_id}:{selection.name or stream.title}")
-                )
+            mux_argv.extend(
+                ("--track-name", f"{track_id}:{resolved_track_name(selection, stream)}")
+            )
             mux_argv.append(os.fspath(intermediate))
         commands.append(
             PlannedCommand(
@@ -397,18 +597,35 @@ class EncodePlanner:
             "edition_label": playlist.edition_label,
             "episode_number": playlist.episode_number,
             "source_video": video_stream.to_dict(),
-            "encoder": request.settings.to_dict(),
+            "requested_encoder": request.settings.to_dict(),
+            "encoder": effective_settings.to_dict(),
+            "video_policy": video_policy,
             "field_handling": request.field_handling.value,
             "crop": asdict(request.crop),
             "dynamic_hdr_retained": False,
             "dolby_vision_retained": False,
             "three_d_retained": False,
-            "hdr10_static_retained": bool(request.settings.hdr10.enabled),
+            "hdr10_static_retained": bool(effective_settings.hdr10.enabled),
             "track_selections": [
                 {
                     **asdict(selection),
                     "action": selection.action.value,
                     "resolved_language": selection.bcp47(stream),
+                    "resolved_default": (
+                        audio_defaults[stream.id]
+                        if stream.kind is StreamKind.AUDIO
+                        and selection.action is not TrackAction.OMIT
+                        else (
+                            selection.default
+                            if selection.default is not None
+                            else stream.default
+                        )
+                    ),
+                    "resolved_forced": (
+                        stream.kind is StreamKind.SUBTITLE
+                        and selection.subtitle_kind == "forced"
+                    ),
+                    "resolved_name": resolved_track_name(selection, stream),
                     "source_track": stream.to_dict(),
                     "effective_audio_target": (
                         effective_audio_policy(
@@ -417,6 +634,7 @@ class EncodePlanner:
                             source_profile=stream.codec_profile,
                             source_channels=stream.channels,
                             source_sample_rate=stream.sample_rate,
+                            source_bit_depth=stream.bit_depth,
                         ).to_dict()
                         if stream.kind is StreamKind.AUDIO
                         and selection.action is not TrackAction.OMIT
@@ -429,7 +647,7 @@ class EncodePlanner:
         return EncodePlan(
             playlist_id=playlist.playlist_id,
             source_video_codec=video_stream.video.codec,
-            output_encoder=request.settings.encoder,
+            output_encoder=effective_settings.encoder,
             commands=tuple(commands),
             warnings=tuple(dict.fromkeys(warnings)),
             decisions=decisions,
@@ -496,16 +714,36 @@ class EncodePlanner:
     @staticmethod
     def _validate_crop(stream: MediaStream, crop: Crop) -> None:
         assert stream.video
-        if (
-            stream.video.width is not None
-            and crop.left + crop.right >= stream.video.width
-        ):
-            raise ValueError("horizontal crop removes the complete picture")
-        if (
-            stream.video.height is not None
-            and crop.top + crop.bottom >= stream.video.height
-        ):
-            raise ValueError("vertical crop removes the complete picture")
+        width = stream.video.width
+        height = stream.video.height
+        if crop.enabled and (width is None or height is None):
+            raise ValueError("crop requires known source width and height")
+        if width is not None and height is not None:
+            crop.output_dimensions(width, height)
+
+    @staticmethod
+    def _output_dimensions(stream: MediaStream, crop: Crop) -> tuple[int, int] | None:
+        assert stream.video
+        width = stream.video.width
+        height = stream.video.height
+        if width is None or height is None:
+            return None
+        return crop.output_dimensions(width, height)
+
+    @staticmethod
+    def _output_frame_rate(
+        frame_rate: str | None, field_handling: FieldHandling
+    ) -> str | None:
+        if frame_rate is None:
+            return None
+        rate: Fraction = parse_frame_rate(frame_rate)
+        if field_handling is FieldHandling.IVTC:
+            rate *= Fraction(4, 5)
+        elif field_handling is FieldHandling.HYBRID:
+            # Keep this advisory FFmpeg plan equivalent to the worker's
+            # HYBRID_SAFE_BOB VapourSynth graph: one output for every field.
+            rate *= 2
+        return format_frame_rate(rate)
 
     @staticmethod
     def _validate_tracks(
@@ -540,6 +778,29 @@ class EncodePlanner:
                 raise ValueError(
                     f"{selection.action.value} is valid only for audio tracks"
                 )
+            if stream.kind is StreamKind.AUDIO and (
+                selection.forced is not None or selection.subtitle_kind is not None
+            ):
+                raise ValueError(
+                    "audio tracks cannot define forced or subtitle_kind fields"
+                )
+            if (
+                stream.kind is StreamKind.SUBTITLE
+                and selection.action is not TrackAction.OMIT
+            ):
+                if selection.subtitle_kind not in {"full", "forced"}:
+                    raise ValueError(
+                        "retained subtitles require reviewed full/forced classification"
+                    )
+                if (
+                    selection.subtitle_kind == "forced"
+                    and selection.forced is False
+                ) or (
+                    selection.subtitle_kind == "full" and selection.forced is True
+                ):
+                    raise ValueError(
+                        "subtitle forced flag conflicts with subtitle_kind"
+                    )
             if (
                 stream.kind is StreamKind.AUDIO
                 and stream.codec.casefold() == "pcm_bluray"
@@ -575,11 +836,5 @@ class EncodePlanner:
         elif field_handling is FieldHandling.IVTC:
             result.extend(("fieldmatch=order=auto:combmatch=full", "decimate"))
         elif field_handling is FieldHandling.HYBRID:
-            result.extend(
-                (
-                    "fieldmatch=order=auto:combmatch=full",
-                    "bwdif=mode=send_frame:parity=auto:deint=interlaced",
-                    "decimate",
-                )
-            )
+            result.append("bwdif=mode=send_field:parity=auto:deint=all")
         return result

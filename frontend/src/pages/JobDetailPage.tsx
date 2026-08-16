@@ -215,7 +215,7 @@ export function JobDetailPage() {
       )}
       {job.state === "COMPLETED" && workspaceCleaned && (
         <Notice tone="success" title="A kódolás lezárult és a munkaterület kitakarítva">
-          A végleges MKV, valamint a logok, elemzések és comparison fájlok másolata a completed mappába került. A nagyméretű ideiglenes fájlok törlődtek; a scan, a terv, a stage rekordok és az ellenőrzési naplók a munka auditjában is megmaradtak.
+          A végleges MKV és a kiadható comparison bizonyítékok a completed mappába kerültek. A belső logok, útvonalak és teljes manifest kizárólag a privát munka auditjában maradtak meg; a nagyméretű ideiglenes fájlok törlődtek.
         </Notice>
       )}
       {job.state === "COMPLETED" && workspaceCleanupWarning && (

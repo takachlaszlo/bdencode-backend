@@ -7,9 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from bdencode.audio import effective_audio_policy
 from bdencode.qc.artifacts import inspect_png
 from bdencode.qc.audio import (
     AudioProbe,
+    analysis_command,
     audio_probe_command,
     compare_audio_probes,
     parse_audio_probe,
@@ -17,8 +19,10 @@ from bdencode.qc.audio import (
     plan_spectrum_windows,
     spectrum_command,
     spectrum_stitch_command,
+    verify_audio_output,
 )
 from bdencode.qc.video import (
+    CropMargins,
     FrameProbeInterval,
     FrameRecord,
     FrameSelectionError,
@@ -26,12 +30,17 @@ from bdencode.qc.video import (
     annotate_comparison_png_command,
     extract_png_command,
     extract_png_at_timestamp_command,
+    extract_y4m_at_timestamp_command,
     ffprobe_frame_origin_command,
     ffprobe_sampled_frame_command,
+    native_yuv_metric_command,
+    parse_cropdetect,
+    parse_ffmpeg_metric_stats,
     parse_ffprobe_frame_origin,
     parse_sampled_ffprobe_frames,
     parse_vspipe_info,
     plan_sample_intervals,
+    recommended_comparison_pair_count,
     select_frame_pairs,
     standalone_vmaf_command,
 )
@@ -93,7 +102,8 @@ def test_sample_interval_plan_is_distributed_and_hard_bounded() -> None:
     info = VapourSynthInfo(frames=158_750, fps_numerator=24_000, fps_denominator=1001)
     intervals = plan_sample_intervals(info)
     assert intervals[0].start_seconds == 0
-    assert sum(item.duration_seconds for item in intervals) <= Decimal("36")
+    assert len(intervals) == 25
+    assert sum(item.duration_seconds for item in intervals) <= Decimal("54")
     assert all(item.end_seconds <= info.duration_seconds for item in intervals)
     assert any(
         item.start_seconds > info.duration_seconds * Decimal("0.8")
@@ -119,7 +129,7 @@ def test_sampled_ffprobe_command_never_requests_an_unbounded_scan() -> None:
     command = ffprobe_sampled_frame_command(
         Path("encode.mkv"), intervals, pts_origin=Decimal("7")
     )
-    assert command[command.index("-read_intervals") + 1] == "7%13,127.5%130.5"
+    assert command[command.index("-read_intervals") + 1] == "7%13,115.5%130.5"
     assert "-show_frames" in command
     assert command[-1] == "encode.mkv"
 
@@ -241,26 +251,133 @@ def test_audio_structure_comparison() -> None:
     assert command[-1] == "spectrum.png"
 
 
-def test_audio_probe_falls_back_to_container_duration() -> None:
-    probe = parse_audio_probe(
+def _packet_audio_probe_document(
+    duration: Decimal, *, container_duration: Decimal = Decimal("100")
+) -> dict[str, object]:
+    packet_duration = Decimal("0.032")
+    return {
+        "streams": [
+            {
+                "index": 1,
+                "codec_type": "audio",
+                "codec_name": "ac3",
+                "sample_rate": "48000",
+                "channels": 6,
+                "channel_layout": "5.1(side)",
+                "start_time": "0",
+                "duration": str(duration),
+                "nb_read_packets": "2",
+            }
+        ],
+        "packets": [
+            {
+                "stream_index": 1,
+                "pts_time": "0",
+                "duration_time": str(packet_duration),
+            },
+            {
+                "stream_index": 1,
+                "pts_time": str(duration - packet_duration),
+                "duration_time": str(packet_duration),
+            },
+        ],
+        "format": {"duration": str(container_duration)},
+    }
+
+
+def test_audio_probe_uses_complete_track_packet_tail_not_container_duration() -> None:
+    source = parse_audio_probe(_packet_audio_probe_document(Decimal("100")))
+    truncated = parse_audio_probe(_packet_audio_probe_document(Decimal("90")))
+
+    assert source.duration == Decimal("100.000")
+    assert truncated.duration == Decimal("90.000")
+    assert truncated.duration_evidence == "complete_packet_tail"
+    assert truncated.packet_count == 2
+    policy = effective_audio_policy(
+        "copy",
+        source_codec="ac3",
+        source_channels=6,
+        source_sample_rate=48_000,
+    )
+    verification = verify_audio_output(
+        source, truncated, policy, decoded_pcm_sha256_match=True
+    )
+    assert verification.duration_within_tolerance is False
+    assert verification.passed is False
+
+
+def test_audio_probe_accepts_matching_full_track_packet_tail() -> None:
+    source = parse_audio_probe(_packet_audio_probe_document(Decimal("100")))
+    encode = parse_audio_probe(_packet_audio_probe_document(Decimal("100")))
+    policy = effective_audio_policy(
+        "copy",
+        source_codec="ac3",
+        source_channels=6,
+        source_sample_rate=48_000,
+    )
+
+    verification = verify_audio_output(
+        source, encode, policy, decoded_pcm_sha256_match=True
+    )
+
+    assert verification.duration_within_tolerance is True
+    assert verification.passed is True
+
+
+def test_audio_probe_missing_track_duration_evidence_fails_closed() -> None:
+    missing = parse_audio_probe(
         {
             "streams": [
                 {
                     "codec_type": "audio",
-                    "codec_name": "dts",
+                    "codec_name": "ac3",
                     "sample_rate": "48000",
                     "channels": 6,
                     "channel_layout": "5.1(side)",
-                    "start_time": "0.040000",
+                    "start_time": "0",
                 }
             ],
-            "format": {"duration": "6621.288000"},
+            "format": {"duration": "100"},
         }
     )
-    assert probe.duration == Decimal("6621.288000")
-    assert probe.sample_count is None
+    complete = parse_audio_probe(_packet_audio_probe_document(Decimal("100")))
+    policy = effective_audio_policy(
+        "copy",
+        source_codec="ac3",
+        source_channels=6,
+        source_sample_rate=48_000,
+    )
+
+    verification = verify_audio_output(
+        complete, missing, policy, decoded_pcm_sha256_match=True
+    )
+
+    assert missing.duration is None
+    assert missing.duration_evidence is None
+    assert verification.duration_within_tolerance is False
+    assert verification.passed is False
+
+
+def test_audio_probe_rejects_incomplete_packet_tail_evidence() -> None:
+    document = _packet_audio_probe_document(Decimal("100"))
+    streams = document["streams"]
+    assert isinstance(streams, list)
+    stream = streams[0]
+    assert isinstance(stream, dict)
+    stream["nb_read_packets"] = "3"
+
+    with pytest.raises(ValueError, match="packet count mismatch"):
+        parse_audio_probe(document)
+
+
+def test_audio_probe_command_collects_track_specific_packet_tail() -> None:
     command = audio_probe_command(Path("input.mkv"))
-    assert ":format=duration" in command[command.index("-show_entries") + 1]
+    entries = command[command.index("-show_entries") + 1]
+    assert "-count_packets" in command
+    assert "-show_packets" in command
+    assert "nb_read_packets" in entries
+    assert "packet=stream_index,pts_time,dts_time,duration_time" in entries
+    assert ":format=" not in entries
 
 
 def test_spectrum_windows_cover_long_tracks_without_unbounded_buffers() -> None:
@@ -316,6 +433,50 @@ def test_pcm_integrity_uses_payload_hash_not_frame_packetization() -> None:
     assert "framemd5" not in command
 
 
+def test_ac3_decode_policy_is_applied_before_input_for_all_pcm_qc_commands() -> None:
+    commands = (
+        pcm_hash_command(Path("input.ac3"), 0, input_codec="AC-3"),
+        analysis_command(
+            Path("input.ec3"),
+            0,
+            Path("analysis.log"),
+            input_codec="E-AC-3",
+        ),
+        spectrum_command(
+            Path("input.ec3"),
+            0,
+            Path("spectrum.png"),
+            start_seconds=Decimal(0),
+            duration_seconds=Decimal(10),
+            input_codec="eac3 secondary",
+        ),
+    )
+
+    for command in commands:
+        option = command.index("-drc_scale")
+        assert command[option + 1] == "0"
+        assert option < command.index("-i")
+
+
+def test_non_ac3_pcm_qc_inputs_do_not_receive_decoder_drc_option() -> None:
+    commands = (
+        pcm_hash_command(Path("input.flac"), input_codec="flac"),
+        analysis_command(
+            Path("input.thd"), 0, Path("analysis.log"), input_codec="truehd"
+        ),
+        spectrum_command(
+            Path("input.dts"),
+            0,
+            Path("spectrum.png"),
+            start_seconds=Decimal(0),
+            duration_seconds=Decimal(10),
+            input_codec="dts",
+        ),
+    )
+
+    assert all("-drc_scale" not in command for command in commands)
+
+
 def _png(path: Path, bit_depth: int) -> None:
     signature = b"\x89PNG\r\n\x1a\n"
     data = struct.pack(">IIBBBBB", 1, 1, bit_depth, 2, 0, 0, 0)
@@ -369,13 +530,108 @@ def test_timestamp_png_extraction_seeks_before_input_without_global_frame_scan()
     assert command.index("-ss") < command.index("-i")
     assert command.index("-seek_timestamp") < command.index("-ss")
     assert command[command.index("-seek_timestamp") + 1] == "1"
-    assert command[command.index("-ss") + 1] == "3301.256"
+    assert command[command.index("-ss") + 1] == "3289.256"
     assert "-accurate_seek" in command
+    assert command[command.index("-i") + 2 : command.index("-map")] == ["-ss", "12"]
     filters = command[command.index("-vf") + 1]
     assert "select=" not in filters
     assert "format=gbrp16le" in filters
     assert command[command.index("-frames:v") + 1] == "1"
+    assert command[command.index("-fps_mode") + 1] == "passthrough"
+    assert command[command.index("-update") + 1] == "1"
+    assert "-vsync" not in command
     assert command[-1] == "frame.png"
+
+
+def test_release_grade_pair_plan_is_balanced_distributed_and_not_clustered() -> None:
+    frames = _frames("IPB" * 800)
+    pairs = select_frame_pairs(
+        frames,
+        frames,
+        total_pairs=recommended_comparison_pair_count(24),
+        timeline_frames=len(frames),
+        dual_type_match=True,
+    )
+    assert len(pairs) == 24
+    assert {
+        category: sum(pair.category == category for pair in pairs) for category in "IPB"
+    } == {"I": 8, "P": 8, "B": 8}
+    indexes = [pair.presentation_index for pair in pairs]
+    assert indexes == sorted(indexes)
+    assert all(right - left >= 25 for left, right in zip(indexes, indexes[1:]))
+    assert indexes[0] > len(frames) * 0.02
+    assert indexes[-1] < len(frames) * 0.98
+
+
+def test_release_grade_pair_count_has_explicit_bounds() -> None:
+    with pytest.raises(ValueError, match="between 20 and 50"):
+        recommended_comparison_pair_count(5)
+    with pytest.raises(ValueError, match="between 20 and 50"):
+        recommended_comparison_pair_count(51)
+
+
+def test_native_yuv_metrics_crop_active_picture_and_keep_per_plane_stats() -> None:
+    crop = CropMargins(left=220, right=220)
+    command = native_yuv_metric_command(
+        Path("reference.y4m"),
+        Path("encode.y4m"),
+        Path("sample.ssim.log"),
+        Path("sample.psnr.log"),
+        crop=crop,
+    )
+    filters = command[command.index("-filter_complex") + 1]
+    assert filters.count("crop=iw-440:ih-0:220:0") == 2
+    assert "gbr" not in filters and "rgb" not in filters
+    assert "ssim=stats_file=" in filters and "psnr=stats_file=" in filters
+
+    values = parse_ffmpeg_metric_stats("n:1 Y:0.991 U:0.998 V:0.997 All:0.993 (20.0)\n")
+    assert values["Y"] == pytest.approx(0.991)
+    assert values["U"] == pytest.approx(0.998)
+    assert values["V"] == pytest.approx(0.997)
+    assert values["All"] == pytest.approx(0.993)
+
+
+def test_cropdetect_modal_result_and_native_y4m_extraction() -> None:
+    crop = parse_cropdetect(
+        "\n".join(
+            [
+                "frame=1 crop=1480:1080:220:0",
+                "frame=2 crop=1478:1080:222:0",
+                "frame=3 crop=1480:1080:220:0",
+                "frame=4 crop=1480:1080:220:0",
+            ]
+        ),
+        source_width=1920,
+        source_height=1080,
+    )
+    assert crop == CropMargins(left=220, top=0, right=220, bottom=0)
+    command = extract_y4m_at_timestamp_command(
+        Path("encode.mkv"),
+        Decimal("120"),
+        Path("frame.y4m"),
+        crop=crop,
+    )
+    assert command[command.index("-ss") + 1] == "108"
+    assert command[command.index("-vf") + 1] == "crop=iw-440:ih-0:220:0"
+    assert command[command.index("-f") + 1] == "yuv4mpegpipe"
+    assert command[-1] == "frame.y4m"
+
+
+def test_all_single_png_commands_use_non_sequence_image2_options() -> None:
+    commands = (
+        extract_png_command(Path("input.mkv"), 1, Path("native.png"), hdr_native=True),
+        annotate_comparison_png_command(
+            Path("native.png"),
+            Path("proof.png"),
+            image_role="ENCODE",
+            presentation_index=1,
+            pict_type="P",
+        ),
+    )
+    for command in commands:
+        assert "-vsync" not in command
+        assert command[command.index("-fps_mode") + 1] == "passthrough"
+        assert command[command.index("-update") + 1] == "1"
 
 
 @pytest.mark.parametrize(
@@ -397,8 +653,7 @@ def test_comparison_png_annotation_has_lossless_external_metadata_header(
     assert "pad=iw:ih+max(40\\,ih/16)" in filters
     assert "fontsize=max(10\\,min(h/34\\,w/44))" in filters
     assert (
-        f"text='{image_role} | 0-BASED INDEX 000001234 | {pict_type}-FRAME'"
-        in filters
+        f"text='{image_role} | 0-BASED INDEX 000001234 | {pict_type}-FRAME'" in filters
     )
     assert "format=rgb48be" in filters
     assert command[command.index("-pix_fmt") + 1] == "rgb48be"

@@ -120,7 +120,13 @@ def _request(
         output_path=tmp_path / "encode" / "completed" / "movie.mkv",
         track_selections=(
             TrackSelection("audio:4352", TrackAction.FLAC, order=0, default=True),
-            TrackSelection("subtitle:4608", TrackAction.COPY, order=1, forced=True),
+            TrackSelection(
+                "subtitle:4608",
+                TrackAction.COPY,
+                order=1,
+                forced=True,
+                subtitle_kind="forced",
+            ),
         ),
     )
 
@@ -146,6 +152,12 @@ def test_bd_plan_uses_x264_flac_pgs_and_shell_free_argv(tmp_path: Path) -> None:
         video.index("-playlist") : video.index("-playlist") + 2
     ]
     assert "libx264" in video
+    assert video[video.index("-level:v") + 1] == "4.1"
+    x264_params = video[video.index("-x264-params") + 1]
+    assert "keyint=240" in x264_params
+    assert "min-keyint=24" in x264_params
+    assert "ref=4" in x264_params
+    assert "chroma-qp-offset=0" in x264_params
     assert "shell=True" not in video
     audio = plan.commands[1].argv
     assert ("-c:a", "flac") == audio[audio.index("-c:a") : audio.index("-c:a") + 2]
@@ -158,12 +170,63 @@ def test_bd_plan_uses_x264_flac_pgs_and_shell_free_argv(tmp_path: Path) -> None:
     ]
     assert subtitle[-3:-1] == ("-f", "matroska")
     assert "comparison" not in " ".join(plan.commands[-1].argv).lower()
+    mux = plan.commands[-1].argv
+    forced_flags = [
+        mux[index + 1]
+        for index, value in enumerate(mux)
+        if value == "--forced-display-flag"
+    ]
+    assert forced_flags == ["0:no", "0:yes"]
     assert plan.needs_review  # object metadata is intentionally lost by FLAC
+    assert plan.decisions["requested_encoder"]["level"] is None
+    assert plan.decisions["encoder"]["level"] == "4.1"
+    assert plan.decisions["encoder"]["chroma_qp_offset"] == -2
+    assert plan.decisions["video_policy"]["h264_level_4_1"]["applied"]
+
+
+def test_25fps_letterbox_crop_retains_five_refs_at_level_4_1(
+    tmp_path: Path,
+) -> None:
+    video = VideoProperties(
+        VideoCodec.AVC,
+        width=1920,
+        height=1080,
+        frame_rate="25",
+        field_order="progressive",
+        bit_depth=8,
+        pixel_format="yuv420p",
+        color_primaries="bt709",
+        color_transfer="bt709",
+        color_matrix="bt709",
+    )
+    scan = _scan(tmp_path, video=video)
+    request = replace(
+        _request(tmp_path, scan, recommended_profile("x264")),
+        crop=Crop(top=138, bottom=138),
+    )
+
+    plan = EncodePlanner(work_root=tmp_path / "encode").build(request)
+    command = plan.commands[0].argv
+    private = command[command.index("-x264-params") + 1]
+
+    assert "keyint=250" in private
+    assert "min-keyint=25" in private
+    assert "ref=5" in private
+    assert command[command.index("-level:v") + 1] == "4.1"
+    assert plan.decisions["video_policy"]["output_dimensions"] == {
+        "width": 1920,
+        "height": 804,
+    }
+    assert not any("reduced reference frames" in item for item in plan.warnings)
 
 
 @pytest.mark.parametrize(
     ("action", "encoder", "bitrate"),
-    ((TrackAction.AC3, "ac3", "640k"), (TrackAction.EAC3, "eac3", "1024k"), (TrackAction.DTS, "dca", "1536k")),
+    (
+        (TrackAction.AC3, "ac3", "640k"),
+        (TrackAction.EAC3, "eac3", "1024k"),
+        (TrackAction.DTS, "dca", "1536k"),
+    ),
 )
 def test_planner_builds_fixed_lossy_audio_targets_with_7_1_warning(
     tmp_path: Path, action: TrackAction, encoder: str, bitrate: str
@@ -173,7 +236,12 @@ def test_planner_builds_fixed_lossy_audio_targets_with_7_1_warning(
         _request(tmp_path, scan, recommended_profile("x264")),
         track_selections=(
             TrackSelection("audio:4352", action, language="eng"),
-            TrackSelection("subtitle:4608", TrackAction.COPY, language="hun"),
+            TrackSelection(
+                "subtitle:4608",
+                TrackAction.COPY,
+                language="hun",
+                subtitle_kind="forced",
+            ),
         ),
     )
 
@@ -211,7 +279,12 @@ def test_planner_extracts_dts_hd_core_without_reencoding(tmp_path: Path) -> None
         _request(tmp_path, scan, recommended_profile("x264")),
         track_selections=(
             TrackSelection("audio:4352", TrackAction.DTS, language="eng"),
-            TrackSelection("subtitle:4608", TrackAction.COPY, language="hun"),
+            TrackSelection(
+                "subtitle:4608",
+                TrackAction.COPY,
+                language="hun",
+                subtitle_kind="forced",
+            ),
         ),
     )
 
@@ -304,6 +377,27 @@ def test_track_choices_are_explicit_and_flac_is_audio_only(tmp_path: Path) -> No
     with pytest.raises(ValueError, match="only for audio"):
         EncodePlanner(work_root=tmp_path / "encode").build(invalid)
 
+    audio_with_subtitle_flags = replace(
+        base,
+        track_selections=(
+            TrackSelection(
+                "audio:4352",
+                "copy",
+                forced=True,
+                subtitle_kind="forced",
+            ),
+            TrackSelection(
+                "subtitle:4608",
+                "copy",
+                subtitle_kind="forced",
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="audio tracks cannot define"):
+        EncodePlanner(work_root=tmp_path / "encode").build(
+            audio_with_subtitle_flags
+        )
+
     lpcm = MediaStream(
         "audio:4352",
         1,
@@ -344,6 +438,15 @@ def test_track_choices_are_explicit_and_flac_is_audio_only(tmp_path: Path) -> No
 def test_interlace_crop_and_b_frame_review_policy(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="must be even"):
         Crop(left=1)
+    with pytest.raises(ValueError, match="must be integers"):
+        Crop(left=2.0)  # type: ignore[arg-type]
+
+    assert Crop.from_detected_borders(top=139, bottom=139) == Crop(top=138, bottom=138)
+    assert Crop.from_detected_borders(top=139, bottom=139, safety=2) == Crop(
+        top=136, bottom=136
+    )
+    with pytest.raises(ValueError, match="at least 16"):
+        Crop(left=954, right=954).output_dimensions(1920, 1080)
 
     interlaced = VideoProperties(
         VideoCodec.MPEG2,
@@ -384,6 +487,13 @@ def test_language_resolution_keeps_provenance_conflicts_and_override() -> None:
     assert declared.status is LanguageStatus.DECLARED
     assert declared.confidence >= 0.96
 
+    mislabeled = resolver.resolve(
+        mpls="eng", clpi="eng", pmt="eng", audio_lid="zho", audio_confidence=0.96
+    )
+    assert mislabeled.iso639_2t == "zho"
+    assert mislabeled.status is LanguageStatus.CONFLICT
+    assert mislabeled.needs_review
+
     conflict = resolver.resolve(
         mpls="eng", clpi="hun", audio_lid="hun", audio_confidence=0.94
     )
@@ -400,6 +510,10 @@ def test_language_resolution_keeps_provenance_conflicts_and_override() -> None:
     assert override.status is LanguageStatus.OVERRIDDEN
     assert override.iso639_2t == "hun"
     assert override.overridden_by == "operator"
+
+    cantonese = resolver.resolve(override="yue", overridden_by="operator")
+    assert cantonese.iso639_2t == "yue"
+    assert cantonese.bcp47 == "yue"
 
 
 class FakeRunner:

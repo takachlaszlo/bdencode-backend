@@ -7,6 +7,9 @@ Ez a dokumentum szándékosan részletes. Olyan felhasználónak is végigkövet
 > [!IMPORTANT]
 > A BDEncode fejlesztés alatt áll. Első használatkor érdemes egy rövidebb vagy kevésbé fontos lemezzel próbát végezni, és az elkészült MKV-t lejátszással is ellenőrizni.
 
+> [!NOTE]
+> A 2.0 új selection-sémát, szigorúbb QC gate-eket és privát/publikus artifact-szétválasztást vezet be. Frissítés előtt olvasd el a [BDEncode 2.0 kiadási jegyzetet](docs/RELEASE_2_0.md).
+
 ## Tartalomjegyzék
 
 - [1. Mire képes a rendszer?](#1-mire-képes-a-rendszer)
@@ -45,14 +48,14 @@ A főbb funkciók:
 - hibás vagy megszakított munka teljes törlése az ideiglenes fájlokkal együtt;
 - teljes dekódolási video QC, valamint codec-, profil-, szín- és HDR10-ellenőrzés;
 - veszteségmentes hangnál PCM-hash, veszteséges hangnál célkodek-, bitráta-, mintavétel-, csatorna- és időzítés-ellenőrzés;
-- 3–5 veszteségmentes PNG comparison képpár;
+- alapértelmezetten 24, a címen elosztott, veszteségmentes PNG comparison képpár;
 - I-, P- és B-frame összehasonlítás azonos képtípusok között;
 - a képeken forrásmegjelölés, képkockaszám és frame-típus;
 - hangosság-, fázis- és spektrális hangelemzés;
 - ImgBB, Catbox és Freeimage képfeltöltés, hibánál tartalék szolgáltatóval;
 - BBCode készítése;
 - MPLS/CLPI/PMT nyelvi adatok összesítése, ismeretlen hangnál választható CPU-s beszédfelismerési segítség és bizonytalanságnál kézi ellenőrzés;
-- nyers és tisztított napló; az MKV csak a tisztított encode naplót kapja meg, a comparison fájlok külön mellékletként maradnak;
+- privát nyers és tisztított napló; a publikus MKV nem kap naplót vagy más csatolmányt, a comparison külön sidecar marad;
 - napi automatikus alkalmazás- és eszközfrissítés.
 
 A rendszer nem támogatja:
@@ -468,6 +471,8 @@ Minden megtartandó sávnál ellenőrizd:
 - megjegyzés vagy cím;
 - alapértelmezett és forced jelző.
 
+Minden megtartott feliratot külön `full` vagy `forced` típusba is be kell sorolni. A 2.0 nem veszi át automatikusan a forrás forced jelzőjét, ha a tartalom besorolása nincs felülvizsgálva.
+
 Ha a lemez nem tartalmaz megbízható nyelvkódot, a rendszer javaslatot adhat, de a felületen kézzel felülbírálható. Bizonytalan esetben rövid mintát kell meghallgatni vagy a feliratot meg kell nyitni.
 
 A hangművelet lehet például:
@@ -508,7 +513,7 @@ Az **Elkészült munkák** között ellenőrizd:
 - a MediaInfo és MKV-elemzés mellékletet;
 - a videó QC eredményeit;
 - a hang spektrumképeit;
-- a 3–5 comparison képpárt;
+- az alapértelmezett 24 comparison képpárt;
 - a BBCode fájlt;
 - a fő és szakaszonkénti naplókat.
 
@@ -541,7 +546,7 @@ Ezért a helyes munkamenet:
 | `ENCODING` | Videókódolás folyik | Várj |
 | `MUXING` | Az MKV összeállítása folyik | Várj |
 | `QC` | Minőség-ellenőrzés folyik | Várj |
-| `COMPARISON` | Kép- és hangelemzés készül | Várj, ez legfeljebb néhány perc legyen |
+| `COMPARISON` | Kép- és hangelemzés készül | Várj; a hard időkeret 30 perc |
 | `UPLOADING` | Comparison képek feltöltése folyik | Várj |
 | `NEEDS_REVIEW` | Emberi döntés szükséges | Olvasd el a jelzést és folytasd |
 | `UPLOAD_FAILED` | A képfeltöltés hibázott | Használd a **Feltöltés újra** gombot |
@@ -563,33 +568,30 @@ Ezért a helyes munkamenet:
 
 ### 9.1. Mi marad meg?
 
-Sikeres véglegesítés után a nagy ideiglenes `work` tartalom automatikusan törlődik. Megmaradnak:
+Sikeres véglegesítés után a nagy ideiglenes `work` tartalom automatikusan törlődik. A publikus `completed/<release>/` csomagban megmaradnak:
 
 - az elkészült MKV;
-- a teljes munkanapló;
-- a szakaszonkénti naplók;
-- az alkalmazott x264/x265 és mux beállítások;
-- MediaInfo/MKV elemzés;
-- video QC eredmények;
-- hang spektrumképek;
-- comparison PNG-k;
-- feltöltési eredmények és BBCode.
+- a comparison PNG-k, metrikák és BBCode;
+- az audió comparison és spektrumképek;
+- a kimeneti nevet és MKV-hasht tartalmazó, jobazonosító nélküli tulajdonosi rekord.
+
+A teljes munkanapló, a szakaszonkénti naplók, az alkalmazott x264/x265 és mux beállítások, a MediaInfo/MKV elemzés, a manifest és a részletes QC eredmények a privát job-munkatérben és az alkalmazás artifact-tárában maradnak. Nem kerülnek az MKV-ba vagy a publikus release-mappába.
 
 Hibánál a szükséges munkafájlok szándékosan megmaradnak, hogy a job folytatható legyen. Ha nem akarod folytatni, használd a webes **Munka törlése** műveletet.
 
 ### 9.2. Videó comparison
 
-A gyors comparison célja nem a teljes film képkockánkénti átvizsgálása. A rendszer:
+A mintavételezett comparison célja nem a teljes film képkockánkénti átvizsgálása. A rendszer:
 
-- alapértelmezetten 5, de legalább 3 képpárt készít;
-- azonos időponthoz és azonos frame-típushoz tartozó source/encode képet párosít;
-- legalább egy I-, egy P- és egy B-frame-et keres;
+- alapértelmezetten 24, de konfigurálhatóan 20–50 képpárt készít;
+- a címen elosztva azonos időponthoz és azonos frame-típushoz tartozó source/encode képet párosít;
+- az alapértéknél 8 I-, 8 P- és 8 B-frame-et választ;
 - veszteségmentes PNG-t használ;
 - ráírja a forrást, a képkockaszámot és a frame-típust;
-- SSIM/PSNR értéket számol a felirat nélküli képtartalmon;
-- néhány perces időkeretet használ, nem végez órákig tartó teljesfilm-összehasonlítást.
+- a QC SSIM/PSNR értékeit külön, natív YUV síkokon számolja, ezért az annotáció és az RGB-konverzió nem módosítja a mérését;
+- 30 perces teljes hard időkeretet használ, nem végez órákig tartó teljesfilm-metrikát.
 
-Ha az azonos típusú pár technikailag nem állítható elő, a felület ezt egyértelműen jelzi. A strict I/P/B egyezés nem cserélhető le észrevétlenül más képtípusra.
+Ha az azonos típusú pár technikailag nem állítható elő, a felület ezt egyértelműen jelzi. A strict I/P/B egyezés nem cserélhető le észrevétlenül más képtípusra. A blokkoló küszöböket a [2.0 kiadási jegyzet](docs/RELEASE_2_0.md#videó-és-comparison) sorolja fel.
 
 ### 9.3. Hang-összehasonlítás
 

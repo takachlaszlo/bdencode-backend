@@ -28,12 +28,62 @@ class Crop:
     bottom: int = 0
 
     def __post_init__(self) -> None:
-        if any(value < 0 or value % 2 for value in asdict(self).values()):
+        values = tuple(asdict(self).values())
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in values
+        ):
+            raise ValueError("4:2:0 crop values must be integers")
+        if any(value < 0 or value % 2 for value in values):
             raise ValueError("4:2:0 crop values must be non-negative even integers")
+
+    @classmethod
+    def from_detected_borders(
+        cls,
+        *,
+        left: int = 0,
+        top: int = 0,
+        right: int = 0,
+        bottom: int = 0,
+        safety: int = 0,
+    ) -> Crop:
+        """Round measured borders inward to a safe 4:2:0 crop."""
+
+        values = (left, top, right, bottom, safety)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in values
+        ):
+            raise ValueError("detected borders and safety must be integers")
+        if any(value < 0 for value in values):
+            raise ValueError("detected borders and safety cannot be negative")
+
+        def safe(value: int) -> int:
+            return (max(0, value - safety) // 2) * 2
+
+        return cls(safe(left), safe(top), safe(right), safe(bottom))
 
     @property
     def enabled(self) -> bool:
         return any(asdict(self).values())
+
+    def output_dimensions(self, width: int, height: int) -> tuple[int, int]:
+        if (
+            isinstance(width, bool)
+            or isinstance(height, bool)
+            or not isinstance(width, int)
+            or not isinstance(height, int)
+            or width <= 0
+            or height <= 0
+        ):
+            raise ValueError("source dimensions must be positive integers")
+        if width % 2 or height % 2:
+            raise ValueError("4:2:0 source dimensions must be even")
+        output_width = width - self.left - self.right
+        output_height = height - self.top - self.bottom
+        if output_width < 16 or output_height < 16:
+            raise ValueError("crop must leave even dimensions of at least 16 pixels")
+        if output_width % 2 or output_height % 2:
+            raise ValueError("4:2:0 cropped dimensions must be even")
+        return output_width, output_height
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +151,21 @@ def render_reference_script(plan: ReferenceScriptPlan) -> str:
     elif temporal is TemporalFilter.HYBRID_SAFE_BOB_BFF:
         lines.append("src = core.bwdif.Bwdif(src, field=2)")
 
+    lines.extend(
+        [
+            "if src.width % 2 or src.height % 2:",
+            '    raise ValueError("4:2:0 source dimensions must be even")',
+        ]
+    )
     if plan.crop.enabled:
+        horizontal = plan.crop.left + plan.crop.right
+        vertical = plan.crop.top + plan.crop.bottom
+        lines.extend(
+            [
+                f"if src.width - {horizontal} < 16 or src.height - {vertical} < 16:",
+                '    raise ValueError("crop must leave at least 16 pixels per dimension")',
+            ]
+        )
         lines.append(
             "src = core.std.CropRel(src, "
             f"left={plan.crop.left}, top={plan.crop.top}, "

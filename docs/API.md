@@ -33,6 +33,7 @@ A webes felület mentés előtt ugyanazt az objektumot a `POST /jobs/{id}/select
 ```json
 {
   "selection": {
+    "schema_version": 2,
     "playlist_id": "00800",
     "angle": 1,
     "output_name": "Movie.2026.1080p.BluRay.x264.mkv",
@@ -60,6 +61,16 @@ A webes felület mentés előtt ugyanazt az objektumot a `POST /jobs/{id}/select
         "default": false,
         "forced": false,
         "order": 1
+      },
+      {
+        "stream_id": "subtitle:4608",
+        "action": "copy",
+        "language": "eng",
+        "name": "English Forced",
+        "default": false,
+        "forced": true,
+        "subtitle_kind": "forced",
+        "order": 2
       }
     ],
     "upload_images": true,
@@ -72,7 +83,9 @@ Az `image_upload_provider` értéke `auto`, `imgbb`, `catbox` vagy `freeimage`.
 Automatikus módban a sorrend ImgBB → Catbox → Freeimage, és csak az első
 sikeres kép előtt engedélyezett a váltás. Kézi választásnál nincs failover.
 
-Minden audio- és feliratsávhoz explicit művelet szükséges. Audiónál: `copy`, `flac`, `ac3`, `eac3`, `dts` vagy `omit`; feliratnál csak `copy` vagy `omit`. Az audio célok determinisztikusak: AC-3 640 kb/s, E-AC-3 1024 kb/s, DTS core 1536 kb/s, mind 48 kHz-en és legfeljebb 5.1 csatornával. DTS-HD forrás `dts` céljánál a beágyazott core újrakódolás nélkül kerül kiemelésre. Az effektív presetek a `GET /api/v1/capabilities` válasz `constraints.audio_transcode_presets` mezőjében is olvashatók. `temporal_filter`: `progressive`, `ivtc_tff`, `ivtc_bff`, `bwdif_tff`, `bwdif_bff`, `hybrid_safe_bob_tff`, `hybrid_safe_bob_bff`.
+Új kliensnek `schema_version: 2` értéket kell küldenie. A backend az 1-es sémájú, már sorban álló selectiont kompatibilitásból elfogadja és 2-es effektív tervvé migrálja; egy régi BD/x264 terv explicit `chroma_qp_offset: 0` értéke ekkor effektív `-2` lesz.
+
+Minden audio- és feliratsávhoz explicit művelet szükséges. Audiónál: `copy`, `flac`, `ac3`, `eac3`, `dts` vagy `omit`; feliratnál csak `copy` vagy `omit`. Minden megtartott felirathoz explicit `subtitle_kind` (`full` vagy `forced`) kell, és a `forced` flagnek ezzel egyeznie kell. Az audio célok determinisztikusak: AC-3 640 kb/s, E-AC-3 1024 kb/s, DTS core 1536 kb/s, mind 48 kHz-en és legfeljebb 5.1 csatornával. DTS-HD forrás `dts` céljánál a beágyazott core újrakódolás nélkül kerül kiemelésre. Az effektív presetek a `GET /api/v1/capabilities` válasz `constraints.audio_transcode_presets` mezőjében is olvashatók. `temporal_filter`: `progressive`, `ivtc_tff`, `ivtc_bff`, `bwdif_tff`, `bwdif_bff`, `hybrid_safe_bob_tff`, `hybrid_safe_bob_bff`.
 
 Az opcionális `dual_type_match` alapértéke `true`: progresszív timeline esetén az I/P/B pár csak akkor fogadható el, ha ugyanazon presentation frame az eredeti és a kész bitstreamben is ugyanabba a kategóriába tartozik. IVTC/deinterlace után a tömörítetlen referencia nem rendelkezik forrás-bitstream képtípussal, ezért ott a kategória a kész encode típusa, az index/PTS-egyezés továbbra is kötelező.
 

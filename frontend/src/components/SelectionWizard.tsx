@@ -162,10 +162,14 @@ function initialTrackSelections(playlist: Playlist): TrackSelection[] {
     return {
       stream_id: stream.id,
       action: keep ? "copy" : "omit",
-      language: detectedLanguage(stream),
+      // A scan-derived declaration is evidence, not a manual override.  Leave
+      // this null so the backend can validate it against sampled speech before
+      // treating it as authoritative.
+      language: null,
       name: stream.title,
-      default: stream.default,
+      default: stream.kind === "audio" && stream.id === firstAudio ? true : stream.default,
       forced: stream.forced,
+      subtitle_kind: stream.kind === "subtitle" ? "unknown" : null,
       order: index,
     };
   });
@@ -282,6 +286,7 @@ export function SelectionWizard({
   }, [detailLevel, encoder, recommendation.data, schema.data]);
 
   const payload = useMemo<SelectionPayload>(() => ({
+    schema_version: 2,
     playlist_id: playlistId,
     angle,
     output_name: outputName.trim().replace(/\.mkv$/i, ""),
@@ -833,7 +838,8 @@ function TrackTable({
             if (!selection) {
               return <Notice key={stream.id} tone="danger">A(z) {stream.id} sávhoz nem készült választási terv. Válaszd ki újra a playlistet.</Notice>;
             }
-            const uncertain = !selection.language || stream.language?.needs_review;
+            const declaredLanguage = detectedLanguage(stream);
+            const uncertain = !declaredLanguage || stream.language?.needs_review;
             const actionDetails = AUDIO_ACTION_DETAILS[selection.action];
             const sourceDetails = [
               stream.codec.toUpperCase(),
@@ -855,11 +861,20 @@ function TrackTable({
                   <input
                     value={selection.language || ""}
                     onChange={(event) => onUpdate(stream.id, { language: event.target.value.trim() || null })}
-                    placeholder="pl. hun"
+                    placeholder={declaredLanguage ? `forrás: ${declaredLanguage}` : "pl. hun / yue / cmn"}
                     maxLength={35}
                     aria-label={`${stream.title || stream.id} nyelve`}
                   />
                   {uncertain && <span role="img" aria-label="Bizonytalan vagy hiányzó nyelv" title="Bizonytalan vagy hiányzó nyelv"><AlertTriangle size={15} aria-hidden="true" /></span>}
+                </label>
+                <label className="track-language">
+                  <input
+                    value={selection.name || ""}
+                    onChange={(event) => onUpdate(stream.id, { name: event.target.value.trim() || null })}
+                    placeholder={stream.kind === "audio" ? "pl. Cantonese Original Mix" : "pl. English Forced / SDH"}
+                    maxLength={120}
+                    aria-label={`${stream.title || stream.id} sávneve`}
+                  />
                 </label>
                 <div className={stream.kind === "audio" ? "track-actions track-actions--audio" : "track-actions"} role="group" aria-label={`${stream.title || stream.id} kezelése`}>
                   {(stream.kind === "audio" ? AUDIO_TRACK_ACTIONS : ["copy", "omit"] as TrackAction[]).map((action) => (
@@ -872,8 +887,30 @@ function TrackTable({
                 {selection.action !== "omit" && (
                   <div className="track-flags">
                     <label><input type="checkbox" checked={selection.default} onChange={(event) => onUpdate(stream.id, { default: event.target.checked })} /> Alapértelmezett</label>
-                    <label><input type="checkbox" checked={selection.forced} onChange={(event) => onUpdate(stream.id, { forced: event.target.checked })} /> Kényszerített</label>
+                    {stream.kind === "subtitle" && (
+                      <label>
+                        Felirattípus
+                        <select
+                          value={selection.subtitle_kind || "unknown"}
+                          onChange={(event) => {
+                            const kind = event.target.value as "unknown" | "full" | "forced";
+                            onUpdate(stream.id, {
+                              subtitle_kind: kind,
+                              forced: kind === "forced",
+                            });
+                          }}
+                          aria-label={`${stream.title || stream.id} felirattípusa`}
+                        >
+                          <option value="unknown">Ellenőrizendő</option>
+                          <option value="full">Teljes felirat</option>
+                          <option value="forced">Forced / signs</option>
+                        </select>
+                      </label>
+                    )}
                   </div>
+                )}
+                {stream.kind === "subtitle" && selection.action !== "omit" && selection.subtitle_kind === "unknown" && (
+                  <div className="track-warning">A forced/full besorolást tartalmi ellenőrzés után kötelező megadni; a forrás flagje önmagában nem elég.</div>
                 )}
                 {stream.object_audio && AUDIO_TRANSCODE_ACTIONS.has(selection.action) && <div className="track-warning">Átalakításkor az Atmos/DTS:X objektum-metaadat elvész; a csatornaalapú hangsáv marad meg.</div>}
                 {stream.kind === "audio" && stream.channels && stream.channels > 6 && ["ac3", "eac3", "dts"].includes(selection.action) && <div className="track-warning">A {stream.channels} csatornás forrás ennél a célnál ellenőrzötten 5.1-re lesz keverve.</div>}

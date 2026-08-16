@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
+from fractions import Fraction
 import math
 import re
 from typing import Any, Mapping
@@ -65,10 +66,181 @@ _TRANSFERS = {
 }
 _MATRICES = {"bt709", "bt2020nc", "bt2020c", "smpte170m", "bt470bg", "rgb"}
 _MASTER_DISPLAY_RE = re.compile(
-    r"^G\(\d+,\d+\)B\(\d+,\d+\)R\(\d+,\d+\)WP\(\d+,\d+\)L\(\d+,\d+\)$"
+    r"^G\((?P<gx>\d+),(?P<gy>\d+)\)"
+    r"B\((?P<bx>\d+),(?P<by>\d+)\)"
+    r"R\((?P<rx>\d+),(?P<ry>\d+)\)"
+    r"WP\((?P<wpx>\d+),(?P<wpy>\d+)\)"
+    r"L\((?P<lmax>\d+),(?P<lmin>\d+)\)$"
 )
 _LEVEL_RE = re.compile(r"^\d(?:\.\d)?$")
 _PARTITIONS = {"none", "all", "p8x8", "p4x4", "b8x8", "i8x8", "i4x4"}
+
+# H.264 Annex A, level 4.1.  A frame's luma dimensions are rounded up to
+# 16x16 macroblocks before the frame-size, macroblock-rate and decoded-picture
+# buffer limits are evaluated.
+H264_LEVEL_4_1_MAX_FRAME_MBS = 8192
+H264_LEVEL_4_1_MAX_MBPS = 245_760
+H264_LEVEL_4_1_MAX_DPB_MBS = 32_768
+H264_LEVEL_4_1_MAX_DIMENSION_MBS = 256
+H264_HIGH_LEVEL_4_1_MAXRATE_KBPS = 62_500
+H264_HIGH_LEVEL_4_1_BUFSIZE_KBPS = 78_125
+
+
+def parse_frame_rate(value: str | int | float | Fraction) -> Fraction:
+    """Return an exact, positive frame rate.
+
+    ffprobe normally supplies a rational string (for example ``24000/1001``).
+    Decimal strings and numeric values are accepted for test fixtures and
+    operator input, but booleans and non-finite values are rejected.
+    """
+
+    if isinstance(value, bool):
+        raise ValueError("frame rate must be a positive number or rational")
+    try:
+        rate = value if isinstance(value, Fraction) else Fraction(str(value))
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ValueError("frame rate must be a positive number or rational") from exc
+    if rate <= 0:
+        raise ValueError("frame rate must be positive")
+    return rate
+
+
+def format_frame_rate(value: str | int | float | Fraction) -> str:
+    """Serialize a frame rate without losing NTSC rational precision."""
+
+    rate = parse_frame_rate(value)
+    return (
+        str(rate.numerator)
+        if rate.denominator == 1
+        else f"{rate.numerator}/{rate.denominator}"
+    )
+
+
+def _round_positive_fraction(value: Fraction) -> int:
+    return (2 * value.numerator + value.denominator) // (2 * value.denominator)
+
+
+def gop_for_frame_rate(
+    frame_rate: str | int | float | Fraction,
+    *,
+    keyint_seconds: int = 10,
+    min_keyint_seconds: int = 1,
+) -> tuple[int, int]:
+    """Derive stable GOP lengths from presentation frame rate.
+
+    The default is one maximum keyframe interval per ten seconds and one
+    minimum interval per second.  Thus 25 fps becomes 250/25 and
+    24000/1001 becomes 240/24.  Values are rounded to the nearest frame and
+    constrained to the encoder schema's supported range.
+    """
+
+    if keyint_seconds <= 0 or min_keyint_seconds < 0:
+        raise ValueError("GOP intervals must use positive durations")
+    if min_keyint_seconds > keyint_seconds:
+        raise ValueError("minimum GOP duration cannot exceed maximum duration")
+    rate = parse_frame_rate(frame_rate)
+    keyint = min(1000, max(1, _round_positive_fraction(rate * keyint_seconds)))
+    min_keyint = min(
+        keyint,
+        max(0, _round_positive_fraction(rate * min_keyint_seconds)),
+    )
+    return keyint, min_keyint
+
+
+@dataclass(frozen=True, slots=True)
+class H264Level41Compatibility:
+    """Structural H.264 level 4.1 result for one output picture geometry."""
+
+    width: int
+    height: int
+    frame_rate: str
+    macroblock_width: int
+    macroblock_height: int
+    frame_macroblocks: int
+    macroblocks_per_second: float
+    requested_reference_frames: int
+    effective_reference_frames: int
+    max_reference_frames: int
+    dimension_compatible: bool
+    frame_size_compatible: bool
+    macroblock_rate_compatible: bool
+    requested_compatible: bool
+    compatible: bool
+
+    @property
+    def reference_frames_adjusted(self) -> bool:
+        return self.requested_reference_frames != self.effective_reference_frames
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["reference_frames_adjusted"] = self.reference_frames_adjusted
+        return value
+
+
+def h264_level_4_1_compatibility(
+    width: int,
+    height: int,
+    frame_rate: str | int | float | Fraction,
+    requested_reference_frames: int,
+) -> H264Level41Compatibility:
+    """Calculate level 4.1 picture/DPB compatibility and a safe ref count."""
+
+    if (
+        isinstance(width, bool)
+        or isinstance(height, bool)
+        or not isinstance(width, int)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+    ):
+        raise ValueError("video dimensions must be positive integers")
+    if not 1 <= requested_reference_frames <= 16:
+        raise ValueError("reference frames must be between 1 and 16")
+    rate = parse_frame_rate(frame_rate)
+    macroblock_width = (width + 15) // 16
+    macroblock_height = (height + 15) // 16
+    frame_macroblocks = macroblock_width * macroblock_height
+    max_reference_frames = min(16, H264_LEVEL_4_1_MAX_DPB_MBS // frame_macroblocks)
+    dimension_compatible = (
+        macroblock_width <= H264_LEVEL_4_1_MAX_DIMENSION_MBS
+        and macroblock_height <= H264_LEVEL_4_1_MAX_DIMENSION_MBS
+    )
+    frame_size_compatible = frame_macroblocks <= H264_LEVEL_4_1_MAX_FRAME_MBS
+    macroblock_rate_compatible = frame_macroblocks * rate <= H264_LEVEL_4_1_MAX_MBPS
+    structurally_compatible = (
+        dimension_compatible
+        and frame_size_compatible
+        and macroblock_rate_compatible
+        and max_reference_frames >= 1
+    )
+    effective_reference_frames = (
+        min(requested_reference_frames, max_reference_frames)
+        if structurally_compatible
+        else requested_reference_frames
+    )
+    return H264Level41Compatibility(
+        width=width,
+        height=height,
+        frame_rate=format_frame_rate(rate),
+        macroblock_width=macroblock_width,
+        macroblock_height=macroblock_height,
+        frame_macroblocks=frame_macroblocks,
+        macroblocks_per_second=float(frame_macroblocks * rate),
+        requested_reference_frames=requested_reference_frames,
+        effective_reference_frames=effective_reference_frames,
+        max_reference_frames=max_reference_frames,
+        dimension_compatible=dimension_compatible,
+        frame_size_compatible=frame_size_compatible,
+        macroblock_rate_compatible=macroblock_rate_compatible,
+        requested_compatible=(
+            structurally_compatible
+            and requested_reference_frames <= max_reference_frames
+        ),
+        compatible=(
+            structurally_compatible
+            and effective_reference_frames <= max_reference_frames
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,8 +278,20 @@ class VbvSettings:
     initial_fullness: float = 0.9
 
     def __post_init__(self) -> None:
+        for name, value in (
+            ("maxrate_kbps", self.maxrate_kbps),
+            ("bufsize_kbps", self.bufsize_kbps),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"VBV {name} must be a non-boolean integer")
         if self.maxrate_kbps <= 0 or self.bufsize_kbps <= 0:
             raise ValueError("VBV maxrate and bufsize must be positive")
+        if isinstance(self.initial_fullness, bool) or not isinstance(
+            self.initial_fullness, (int, float)
+        ):
+            raise TypeError("VBV initial fullness must be a real number")
+        if not math.isfinite(float(self.initial_fullness)):
+            raise ValueError("VBV initial fullness must be finite")
         if not 0.0 <= self.initial_fullness <= 1.0:
             raise ValueError("VBV initial fullness must be between 0 and 1")
 
@@ -123,6 +307,18 @@ class Hdr10Metadata:
     hdr10_opt: bool = True
 
     def __post_init__(self) -> None:
+        for name, value in (
+            ("enabled", self.enabled),
+            ("hdr10_opt", self.hdr10_opt),
+        ):
+            if type(value) is not bool:
+                raise TypeError(f"HDR10 {name} must be a boolean")
+        for name, value in (
+            ("max_cll", self.max_cll),
+            ("max_fall", self.max_fall),
+        ):
+            if value is not None and type(value) is not int:
+                raise TypeError(f"HDR10 {name} must be a non-boolean integer")
         if not self.enabled:
             if any(
                 value is not None
@@ -130,10 +326,33 @@ class Hdr10Metadata:
             ):
                 raise ValueError("HDR10 metadata values require enabled=True")
             return
-        if not self.mastering_display or not _MASTER_DISPLAY_RE.fullmatch(
-            self.mastering_display
-        ):
+        if type(self.mastering_display) is not str:
             raise ValueError("HDR10 mastering_display has an invalid x265 format")
+        mastering_match = _MASTER_DISPLAY_RE.fullmatch(self.mastering_display)
+        if mastering_match is None:
+            raise ValueError("HDR10 mastering_display has an invalid x265 format")
+        for primary in ("g", "b", "r", "wp"):
+            x = int(mastering_match[f"{primary}x"])
+            y = int(mastering_match[f"{primary}y"])
+            if not (0 <= x <= 50_000 and 0 <= y <= 50_000):
+                raise ValueError(
+                    "HDR10 mastering-display chromaticity coordinates must be "
+                    "between 0 and 50000"
+                )
+            if not 0 < x + y <= 50_000:
+                raise ValueError(
+                    "HDR10 mastering-display chromaticity pairs must satisfy "
+                    "0 < x + y <= 50000"
+                )
+        maximum_luminance = int(mastering_match["lmax"])
+        minimum_luminance = int(mastering_match["lmin"])
+        if not (
+            0 <= minimum_luminance < maximum_luminance <= 100_000_000
+        ):
+            raise ValueError(
+                "HDR10 mastering-display luminance must satisfy "
+                "0 <= minimum < maximum <= 100000000"
+            )
         if self.max_cll is None or self.max_fall is None:
             raise ValueError("HDR10 requires both MaxCLL and MaxFALL")
         if not (0 <= self.max_fall <= self.max_cll <= 10000):
@@ -158,7 +377,7 @@ class EncoderSettings:
 
     # GOP and inter prediction
     keyint: int = 240
-    min_keyint: int = 23
+    min_keyint: int = 24
     scenecut: int = 40
     open_gop: bool = True
     bframes: int = 8
@@ -185,7 +404,11 @@ class EncoderSettings:
     psy_rdoq: float = 0.0
     deblock_alpha: int = -1
     deblock_beta: int = -1
-    chroma_qp_offset: int = 0
+    # Effective value reported by x264 after its encoder-open psychovisual
+    # compensation.  x264 subtracts from the caller-supplied value when Psy-RD
+    # and/or Psy-Trellis are active; private_params() compensates for that so
+    # the manifest and the encoded bitstream describe the same value.
+    chroma_qp_offset: int = -2
 
     # x265-specific tools.  They remain explicit in the pro schema so an
     # operator sees every material choice instead of receiving hidden defaults.
@@ -213,8 +436,59 @@ class EncoderSettings:
         self.validate()
 
     def validate(self) -> None:
-        if not math.isfinite(self.crf) or not 0 <= self.crf <= 51:
-            raise ValueError("CRF must be a finite value between 0 and 51")
+        integer_fields = (
+            "bit_depth",
+            "keyint",
+            "min_keyint",
+            "scenecut",
+            "bframes",
+            "b_adapt",
+            "ref",
+            "rc_lookahead",
+            "weightp",
+            "merange",
+            "subme",
+            "trellis",
+            "aq_mode",
+            "deblock_alpha",
+            "deblock_beta",
+            "chroma_qp_offset",
+            "rskip",
+        )
+        real_fields = ("crf", "aq_strength", "qcomp", "psy_rd", "psy_rdoq")
+        boolean_fields = (
+            "open_gop",
+            "b_pyramid",
+            "weightb",
+            "sao",
+            "limit_sao",
+            "strong_intra_smoothing",
+            "rect",
+            "amp",
+            "early_skip",
+            "aud",
+            "repeat_headers",
+            "annexb",
+        )
+        for name in integer_fields:
+            if type(getattr(self, name)) is not int:
+                raise TypeError(f"{name} must be a non-boolean integer")
+        for name in real_fields:
+            value = getattr(self, name)
+            label = "CRF" if name == "crf" else name
+            if type(value) not in {int, float}:
+                raise TypeError(f"{label} must be a non-boolean real number")
+            if not math.isfinite(value):
+                raise ValueError(f"{label} must be finite")
+        for name in boolean_fields:
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be a boolean")
+
+        if not 0 < self.crf <= 51:
+            raise ValueError(
+                "CRF must be a finite value above 0 and at most 51; "
+                "lossless output requires a separate policy"
+            )
         if self.preset not in _PRESETS:
             raise ValueError(f"unsupported encoder preset: {self.preset}")
         if self.level is not None and not _LEVEL_RE.fullmatch(self.level):
@@ -268,6 +542,11 @@ class EncoderSettings:
             self._validate_x265()
 
     def _validate_x264(self) -> None:
+        if self.color.transfer in {"smpte2084", "arib-std-b67"}:
+            raise ValueError(
+                "PQ and HLG output are supported only through the x265 HDR "
+                "policy"
+            )
         if self.bit_depth not in {8, 10}:
             raise ValueError("x264 bit depth must be 8 or 10")
         expected_pix_fmt = "yuv420p10le" if self.bit_depth == 10 else "yuv420p"
@@ -288,6 +567,11 @@ class EncoderSettings:
             raise ValueError("x264 aq_mode must be between 0 and 3")
 
     def _validate_x265(self) -> None:
+        if self.level is not None:
+            raise ValueError(
+                "explicit x265 level constraints are disabled until profile/tier "
+                "conformance can be proven"
+            )
         if self.bit_depth not in {8, 10, 12}:
             raise ValueError("x265 bit depth must be 8, 10 or 12")
         formats = {8: "yuv420p", 10: "yuv420p10le", 12: "yuv420p12le"}
@@ -321,6 +605,35 @@ class EncoderSettings:
                 raise ValueError(
                     "HDR10 requires BT.2020 primaries, PQ and BT.2020 non-constant matrix"
                 )
+
+    def x264_psy_chroma_qp_adjustment(self) -> int:
+        """Return x264's encoder-open adjustment to the supplied chroma QP.
+
+        x264 lowers the configured offset by one or two for each enabled Psy-RD
+        component.  This value is the adjustment made by x264 itself (normally
+        ``-2`` with this project's defaults), not the pre-compensated value we
+        pass to the library.
+        """
+
+        if self.encoder is not VideoEncoder.X264:
+            return 0
+        if self.tune in {Tune.PSNR, Tune.SSIM}:
+            return 0
+        adjustment = 0
+        if self.subme >= 6 and self.psy_rd > 0:
+            adjustment -= 1 if self.psy_rd < 0.25 else 2
+        if self.trellis and self.psy_rdoq > 0:
+            adjustment -= 1 if self.psy_rdoq < 0.25 else 2
+        return adjustment
+
+    def x264_emitted_chroma_qp_offset(self) -> int:
+        """Return the caller value that produces ``chroma_qp_offset``.
+
+        The configured field is intentionally the effective/logged value.
+        Compensating here avoids the former manifest=0, encoder-log=-2 split.
+        """
+
+        return self.chroma_qp_offset - self.x264_psy_chroma_qp_adjustment()
 
     def private_params(self) -> dict[str, str | int | float]:
         """Return deterministic libx264/libx265 private options."""
@@ -370,7 +683,7 @@ class EncoderSettings:
                     # coding tool before private overrides are applied.
                     "8x8dct": 1,
                     "psy-rd": f"{self.psy_rd},{self.psy_rdoq}",
-                    "chroma-qp-offset": self.chroma_qp_offset,
+                    "chroma-qp-offset": self.x264_emitted_chroma_qp_offset(),
                 }
             )
         else:
@@ -445,6 +758,135 @@ class EncoderSettings:
         return value
 
 
+def source_adapted_settings(
+    settings: EncoderSettings,
+    *,
+    width: int | None,
+    height: int | None,
+    frame_rate: str | int | float | Fraction | None,
+) -> tuple[EncoderSettings, dict[str, Any]]:
+    """Apply deterministic source-derived GOP and H.264 level policy.
+
+    ``width`` and ``height`` are the dimensions *after* crop.  The returned
+    record is JSON-safe and intended to be stored alongside the effective
+    settings in an encode plan/manifest.
+    """
+
+    replacements: dict[str, Any] = {}
+    policy: dict[str, Any] = {
+        "output_dimensions": {"width": width, "height": height},
+        "source_frame_rate": None,
+        "gop": {"applied": False, "reason": "frame-rate-unavailable"},
+        "h264_level_4_1": {
+            "applied": False,
+            "reason": "not-an-sdr-x264-output",
+        },
+    }
+    rate: Fraction | None = None
+    if frame_rate is not None:
+        rate = parse_frame_rate(frame_rate)
+        keyint, min_keyint = gop_for_frame_rate(rate)
+        replacements.update(keyint=keyint, min_keyint=min_keyint)
+        policy["source_frame_rate"] = format_frame_rate(rate)
+        policy["gop"] = {
+            "applied": True,
+            "keyint_seconds": 10,
+            "min_keyint_seconds": 1,
+            "requested_keyint": settings.keyint,
+            "requested_min_keyint": settings.min_keyint,
+            "keyint": keyint,
+            "min_keyint": min_keyint,
+        }
+
+    is_sdr_x264 = (
+        settings.encoder is VideoEncoder.X264
+        and not settings.hdr10.enabled
+        and settings.color.transfer not in {"smpte2084", "arib-std-b67"}
+    )
+    dimensions_available = width is not None and height is not None
+    if is_sdr_x264 and dimensions_available and rate is not None:
+        assert width is not None and height is not None
+        if settings.level not in {None, "4.1"}:
+            raise ValueError(
+                "SDR x264 Blu-ray output permits only automatic level or level 4.1"
+            )
+        if settings.vbv is not None and (
+            settings.vbv.maxrate_kbps > H264_HIGH_LEVEL_4_1_MAXRATE_KBPS
+            or settings.vbv.bufsize_kbps > H264_HIGH_LEVEL_4_1_BUFSIZE_KBPS
+        ):
+            raise ValueError(
+                "configured H.264 High@L4.1 VBV exceeds the permitted "
+                f"{H264_HIGH_LEVEL_4_1_MAXRATE_KBPS}/"
+                f"{H264_HIGH_LEVEL_4_1_BUFSIZE_KBPS} kb/s caps"
+            )
+        level_policy = h264_level_4_1_compatibility(
+            width,
+            height,
+            rate,
+            settings.ref,
+        )
+        level_record = level_policy.to_dict()
+        if not level_policy.compatible:
+            if settings.level == "4.1":
+                raise ValueError(
+                    "configured H.264 level 4.1 is incompatible with the output "
+                    "dimensions, frame rate or decoded-picture buffer"
+                )
+            level_record.update(
+                applied=False,
+                reason="structurally-incompatible",
+                configured_level=settings.level,
+            )
+        else:
+            replacements.update(
+                level="4.1",
+                ref=level_policy.effective_reference_frames,
+            )
+            if settings.vbv is None:
+                # H.264 High@L4.1 applies the high-profile 1.25 scaling to the
+                # Annex A MaxBR/MaxCPB values.  Bound CRF peaks so the explicit
+                # level is a decoder contract rather than metadata alone.
+                replacements["vbv"] = VbvSettings(
+                    maxrate_kbps=H264_HIGH_LEVEL_4_1_MAXRATE_KBPS,
+                    bufsize_kbps=H264_HIGH_LEVEL_4_1_BUFSIZE_KBPS,
+                )
+            level_record.update(
+                applied=True,
+                reason="compatible",
+                configured_level="4.1",
+                vbv={
+                    "maxrate_kbps": (
+                        settings.vbv.maxrate_kbps
+                        if settings.vbv is not None
+                        else H264_HIGH_LEVEL_4_1_MAXRATE_KBPS
+                    ),
+                    "bufsize_kbps": (
+                        settings.vbv.bufsize_kbps
+                        if settings.vbv is not None
+                        else H264_HIGH_LEVEL_4_1_BUFSIZE_KBPS
+                    ),
+                    "auto_applied": settings.vbv is None,
+                },
+            )
+        policy["h264_level_4_1"] = level_record
+    elif is_sdr_x264:
+        policy["h264_level_4_1"] = {
+            "applied": False,
+            "reason": "dimensions-or-frame-rate-unavailable",
+        }
+
+    effective = replace(settings, **replacements) if replacements else settings
+    if effective.encoder is VideoEncoder.X264:
+        policy["x264_chroma_qp_offset"] = {
+            "effective": effective.chroma_qp_offset,
+            "emitted_before_psy_adjustment": (
+                effective.x264_emitted_chroma_qp_offset()
+            ),
+            "encoder_open_psy_adjustment": (effective.x264_psy_chroma_qp_adjustment()),
+        }
+    return effective, policy
+
+
 def _number(value: float | int) -> str:
     numeric = float(value)
     return str(int(numeric)) if numeric.is_integer() else str(numeric)
@@ -497,7 +939,7 @@ _FIELD_SPECS: tuple[FieldSpec, ...] = (
         True,
         18.0,
         "number",
-        0,
+        0.1,
         51,
         description="Constant-quality target; lower is higher quality and larger.",
     ),
@@ -559,10 +1001,10 @@ _FIELD_SPECS: tuple[FieldSpec, ...] = (
         False,
         None,
         "string",
-        description="Optional numeric H.264/H.265 decoder level constraint.",
+        description="Optional numeric H.264 decoder level constraint.",
     ),
     FieldSpec("keyint", "gop", DetailLevel.ADVANCED, True, 240, "integer", 1, 1000),
-    FieldSpec("min_keyint", "gop", DetailLevel.ADVANCED, True, 23, "integer", 0, 1000),
+    FieldSpec("min_keyint", "gop", DetailLevel.ADVANCED, True, 24, "integer", 0, 1000),
     FieldSpec("scenecut", "gop", DetailLevel.ADVANCED, True, 40, "integer", -1, 100),
     FieldSpec("open_gop", "gop", DetailLevel.ADVANCED, True, True, "boolean"),
     FieldSpec(
@@ -633,7 +1075,17 @@ _FIELD_SPECS: tuple[FieldSpec, ...] = (
     FieldSpec("qcomp", "rate_control", DetailLevel.PRO, True, 0.65, "number", 0, 1),
     FieldSpec("deblock_alpha", "filter", DetailLevel.PRO, True, -1, "integer", -6, 6),
     FieldSpec("deblock_beta", "filter", DetailLevel.PRO, True, -1, "integer", -6, 6),
-    FieldSpec("chroma_qp_offset", "x264", DetailLevel.PRO, True, 0, "integer", -12, 12),
+    FieldSpec(
+        "chroma_qp_offset",
+        "x264",
+        DetailLevel.PRO,
+        True,
+        -2,
+        "integer",
+        -12,
+        12,
+        description="Effective value reported by x264 after Psy-RD compensation.",
+    ),
     FieldSpec("weightp", "motion", DetailLevel.PRO, True, 2, "integer", 0, 2),
     FieldSpec("weightb", "motion", DetailLevel.PRO, True, True, "boolean"),
     FieldSpec("sao", "x265", DetailLevel.PRO, True, True, "boolean"),
@@ -667,6 +1119,8 @@ def profile_schema(
         if spec.group == "x265" and encoder is not VideoEncoder.X265:
             continue
         if spec.group == "x264" and encoder is not VideoEncoder.X264:
+            continue
+        if spec.name == "level" and encoder is VideoEncoder.X265:
             continue
         if spec.name == "hdr10" and encoder is not VideoEncoder.X265:
             continue
@@ -743,9 +1197,24 @@ def recommended_profile(
             hdr10=hdr,
             subme=5,
             psy_rdoq=1.0,
+            chroma_qp_offset=0,
         )
     if not overrides:
         return settings
+    requested_tune = Tune(overrides.get("tune", settings.tune))
+    if encoder is VideoEncoder.X264 and requested_tune is Tune.GRAIN:
+        # Keep the tune coherent instead of combining x264's grain deadzones
+        # with film-oriented qcomp/AQ/deblock overrides.  Explicit operator
+        # values below still win field by field.
+        settings = replace(
+            settings,
+            tune=Tune.GRAIN,
+            qcomp=0.75,
+            aq_strength=0.65,
+            deblock_alpha=-2,
+            deblock_beta=-2,
+            psy_rdoq=0.15,
+        )
     unknown = set(overrides) - {
         item.name for item in settings.__dataclass_fields__.values()
     }

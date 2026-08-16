@@ -121,7 +121,7 @@ def test_cpu_int8_runtime_extracts_six_samples_and_returns_provenance(media):
         )
     ]
     for command in runner.commands:
-        assert command[command.index("-map") + 1] == "0:3"
+        assert command[command.index("-map") + 1] == "0:a:3"
         assert command[command.index("-t") + 1] == "30.000"
         assert command[command.index("-ac") + 1] == "1"
         assert command[command.index("-ar") + 1] == "16000"
@@ -137,7 +137,7 @@ def test_result_and_wavs_are_idempotent_without_loading_second_model(media):
     expected = first.infer(reference, 1, 7200, work, runner)
     sample_mtimes = {
         path.name: path.stat().st_mtime_ns
-        for path in work.joinpath("language", "stream-00001").glob("*.wav")
+        for path in work.joinpath("language", "audio-00001").glob("*.wav")
     }
 
     second_factory = CapturingFactory(FakeModel())
@@ -150,7 +150,7 @@ def test_result_and_wavs_are_idempotent_without_loading_second_model(media):
     assert restarted.model_loaded is False
     assert sample_mtimes == {
         path.name: path.stat().st_mtime_ns
-        for path in work.joinpath("language", "stream-00001").glob("*.wav")
+        for path in work.joinpath("language", "audio-00001").glob("*.wav")
     }
 
 
@@ -216,7 +216,7 @@ def test_invalid_extracted_wav_has_controlled_failure(media):
 def test_input_validation_happens_before_optional_model_import(media):
     reference, work, data = media
     runtime = AudioLanguageRuntime(data, model_factory=CapturingFactory(FakeModel()))
-    with pytest.raises(ValueError, match="stream_index"):
+    with pytest.raises(ValueError, match="audio_ordinal"):
         runtime.infer(reference, -1, 7200, work, FakeRunner())
     with pytest.raises(ValueError, match="duration_seconds"):
         runtime.infer(reference, 0, float("nan"), work, FakeRunner())

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { makeJob } from "./test/fixtures";
-import { formatEventMessage, formatStatusMessage, formatWorkerError, isFastComparisonTimeoutReview, stageProgress } from "./utils";
+import { formatEventMessage, formatStatusMessage, formatWorkerError, isFastComparisonTimeoutReview, stageProgress, suggestedOutputName } from "./utils";
 
 describe("formatEventMessage", () => {
   it("localizes historical worker messages", () => {
@@ -52,5 +52,21 @@ describe("formatEventMessage", () => {
   it("uses backend pipeline baselines for legacy jobs without progress", () => {
     expect(stageProgress(makeJob({ state: "MUXING", progress: null }))).toBe(0.78);
     expect(stageProgress(makeJob({ state: "FAILED", resume_state: "MUXING", progress: null }))).toBe(0.78);
+  });
+});
+
+describe("suggestedOutputName", () => {
+  it("removes inherited COMPLETE/source-group and codec tails", () => {
+    expect(suggestedOutputName("After.We.Fell.2021.COMPLETE.BLURAY-iNTEGRUM", "x264"))
+      .toBe("After.We.Fell.2021.1080p.BluRay.x264");
+    expect(suggestedOutputName("Assassination.Nation.2018.1080p.USA.Blu-ray.AVC.DTS-HD.MA.5.1-BeyondHD", "x264"))
+      .toBe("Assassination.Nation.2018.1080p.BluRay.x264");
+  });
+
+  it("does not inherit MULTi and normalizes UHD output", () => {
+    expect(suggestedOutputName("Amsterdamned.II.2025.MULTi.COMPLETE.BLURAY-MONUMENT", "x264"))
+      .toBe("Amsterdamned.II.2025.1080p.BluRay.x264");
+    expect(suggestedOutputName("Example Movie 2026 UHD REMUX", "x265"))
+      .toBe("Example.Movie.2026.2160p.UHD.BluRay.x265");
   });
 });

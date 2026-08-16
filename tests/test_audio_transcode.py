@@ -6,11 +6,48 @@ from decimal import Decimal
 import pytest
 
 from bdencode.audio import (
+    audio_decode_input_args,
     audio_encode_args,
     audio_output_channels,
     effective_audio_policy,
+    flac_sample_format,
+    normalize_audio_codec_name,
 )
 from bdencode.qc.audio import AudioProbe, verify_audio_output
+
+
+@pytest.mark.parametrize(
+    ("codec", "canonical"),
+    (
+        ("ac3", "ac3"),
+        (" AC-3 ", "ac3"),
+        ("ac3_fixed", "ac3"),
+        ("E-AC-3", "eac3"),
+        ("eac3 secondary", "eac3"),
+        ("Dolby Digital Plus", "eac3"),
+        ("TrueHD", "truehd"),
+    ),
+)
+def test_audio_codec_normalization_is_exact_and_canonical(
+    codec: str, canonical: str
+) -> None:
+    assert normalize_audio_codec_name(codec) == canonical
+
+
+@pytest.mark.parametrize("codec", ("", "   ", "---"))
+def test_audio_codec_normalization_rejects_empty_tokens(codec: str) -> None:
+    with pytest.raises(ValueError, match="audio codec name"):
+        normalize_audio_codec_name(codec)
+
+
+@pytest.mark.parametrize("codec", ("ac3", "AC-3", "eac3", "E-AC-3 secondary"))
+def test_ac3_family_disables_decoder_drc(codec: str) -> None:
+    assert audio_decode_input_args(codec) == ["-drc_scale", "0"]
+
+
+@pytest.mark.parametrize("codec", ("flac", "truehd", "not-ac3-codec"))
+def test_non_ac3_codec_does_not_enable_decoder_drc(codec: str) -> None:
+    assert audio_decode_input_args(codec) == []
 
 
 @pytest.mark.parametrize(
@@ -193,6 +230,111 @@ def test_lossless_qc_accepts_missing_source_layout_when_pcm_is_identical() -> No
         policy,
         decoded_pcm_sha256_match=True,
     ).passed
+
+
+def test_lossless_qc_accepts_matroska_duration_rounding() -> None:
+    source = AudioProbe(
+        "pcm_s24le",
+        48_000,
+        2,
+        "stereo",
+        None,
+        Decimal("0"),
+        Decimal("10"),
+        24,
+    )
+    encode = AudioProbe(
+        "flac",
+        48_000,
+        2,
+        "stereo",
+        None,
+        Decimal("0"),
+        Decimal("10.001"),
+        24,
+    )
+    policy = effective_audio_policy(
+        "flac",
+        source_codec="pcm_s24le",
+        source_channels=2,
+        source_sample_rate=48_000,
+    )
+
+    verification = verify_audio_output(
+        source, encode, policy, decoded_pcm_sha256_match=True
+    )
+
+    assert verification.passed
+    assert verification.duration_within_tolerance
+    assert verification.duration_tolerance_seconds == Decimal("0.001")
+
+
+def test_lossless_qc_rejects_duration_mismatch_despite_identical_pcm_hash() -> None:
+    source = AudioProbe(
+        "pcm_s24le",
+        48_000,
+        2,
+        "stereo",
+        None,
+        Decimal("0"),
+        Decimal("10"),
+        24,
+    )
+    encode = AudioProbe(
+        "flac",
+        48_000,
+        2,
+        "stereo",
+        None,
+        Decimal("0"),
+        Decimal("11"),
+        24,
+    )
+    policy = effective_audio_policy(
+        "flac",
+        source_codec="pcm_s24le",
+        source_channels=2,
+        source_sample_rate=48_000,
+    )
+
+    verification = verify_audio_output(
+        source, encode, policy, decoded_pcm_sha256_match=True
+    )
+
+    assert not verification.passed
+    assert not verification.duration_within_tolerance
+    assert verification.decoded_pcm_sha256_match is True
+
+
+@pytest.mark.parametrize(
+    ("bit_depth", "sample_format"),
+    ((16, "s16"), (24, "s32")),
+)
+def test_flac_preserves_reviewed_source_bit_depth(
+    bit_depth: int, sample_format: str
+) -> None:
+    command = audio_encode_args(
+        "flac",
+        source_codec=f"pcm_s{bit_depth}le",
+        source_channels=2,
+        source_sample_rate=48_000,
+        source_bit_depth=bit_depth,
+    )
+    policy = effective_audio_policy(
+        "flac",
+        source_codec=f"pcm_s{bit_depth}le",
+        source_channels=2,
+        source_sample_rate=48_000,
+        source_bit_depth=bit_depth,
+    )
+
+    assert command[command.index("-sample_fmt") + 1] == sample_format
+    assert policy.bit_depth == bit_depth
+
+
+def test_flac_does_not_guess_an_unsupported_pcm_depth() -> None:
+    with pytest.raises(ValueError, match="confirmed as 16 or 24"):
+        flac_sample_format(20)
 
 
 def test_lossy_qc_rejects_wrong_bitrate_and_lossless_qc_still_requires_pcm() -> None:

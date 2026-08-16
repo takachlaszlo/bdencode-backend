@@ -135,3 +135,28 @@ def test_reporter_observation_failure_never_escapes(tmp_path: Path) -> None:
     reporter.handle_line("out_time_us=1000000")
     reporter.handle_line("progress=continue")
     reporter.complete()
+
+
+def test_reporter_never_follows_progress_jsonl_symlink(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    external = tmp_path / "external-progress.txt"
+    external.write_text("SENTINEL\n", encoding="utf-8")
+    linked_progress = tmp_path / "encode-progress.jsonl"
+    try:
+        linked_progress.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+    reporter = EncodeProgressReporter(
+        10.0,
+        linked_progress,
+        lambda *_args: None,
+    )
+
+    reporter.handle_line("out_time_us=1000000")
+    reporter.handle_line("progress=continue")
+    reporter.complete()
+
+    assert external.read_text(encoding="utf-8") == "SENTINEL\n"
+    assert "progress JSONL path cannot be a symbolic link" in caplog.text

@@ -193,11 +193,23 @@ export function suggestedOutputName(name: string, encoder: "x264" | "x265"): str
   const safe = name
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^A-Za-z0-9._ -]+/g, "")
+    .replace(/_/g, ".")
+    .replace(/[^A-Za-z0-9. -]+/g, "")
     .trim()
     .replace(/[ .]+/g, ".")
     .replace(/^\.+|\.+$/g, "");
-  return `${safe || "Encode"}.BluRay.${encoder}`;
+  const tokens = safe.split(".").filter(Boolean);
+  const technical = /^(?:complete|blu-?ray|uhd|bd|bdmv|remux|1080[pi]|2160p|720p|avc|hevc|h\.?26[45]|x26[45])$/i;
+  const cutAt = tokens.findIndex((token, index) => index >= 2 && technical.test(token));
+  const titleTokens = (cutAt >= 0 ? tokens.slice(0, cutAt) : tokens).filter(Boolean);
+  // MULTi/GERMAN are output properties, not title data.  If they immediately
+  // precede the source-format tail, never inherit them into a new release.
+  while (titleTokens.length > 1 && /^(?:multi|german|french|italian|spanish|dual)$/i.test(titleTokens.at(-1) || "")) {
+    titleTokens.pop();
+  }
+  const title = titleTokens.join(".") || "Encode";
+  const suffix = encoder === "x265" ? "2160p.UHD.BluRay.x265" : "1080p.BluRay.x264";
+  return `${title}.${suffix}`;
 }
 
 export function copyText(text: string): Promise<void> {
