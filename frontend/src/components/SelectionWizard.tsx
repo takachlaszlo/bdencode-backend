@@ -211,6 +211,12 @@ function fieldLabel(name: string): string {
   return FIELD_LABELS[name] || humanize(name);
 }
 
+function isSubtitleClassificationError(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false;
+  return /retained subtitles?/i.test(error.detail)
+    && /full\s*\/\s*forced|full.*forced/i.test(error.detail);
+}
+
 export function SelectionWizard({
   job,
   scan,
@@ -385,6 +391,7 @@ export function SelectionWizard({
   const colorApiIssue = validate.error instanceof ApiError
     ? sourceColorIssueFromPayload(validate.error.payload)
     : null;
+  const subtitleClassificationApiIssue = isSubtitleClassificationError(validate.error);
   const needsColorConfirmation = blockingSourceColorFields(videoStream?.video).length > 0
     || Boolean(colorApiIssue);
   const safeColorRecommendation = hasSafeSourceColorRecommendation(videoStream?.video, scan.disc_kind);
@@ -395,7 +402,19 @@ export function SelectionWizard({
   const expectedTrackIds = playlist?.streams.filter((stream) => stream.kind !== "video").map((stream) => stream.id) ?? [];
   const selectedTrackIds = new Set(tracks.map((track) => track.stream_id));
   const hasCompleteTrackPlan = expectedTrackIds.every((streamId) => selectedTrackIds.has(streamId));
-  const canNext = step === 1 ? Boolean(playlist) : step === 2 ? hasCompleteTrackPlan : step === 3 ? Boolean(outputName.trim()) : true;
+  const subtitleTrackIds = new Set(playlist?.streams.filter((stream) => stream.kind === "subtitle").map((stream) => stream.id) ?? []);
+  const unclassifiedRetainedSubtitles = retainedTracks.filter((track) =>
+    subtitleTrackIds.has(track.stream_id)
+    && track.subtitle_kind !== "full"
+    && track.subtitle_kind !== "forced",
+  );
+  const canNext = step === 1
+    ? Boolean(playlist)
+    : step === 2
+      ? hasCompleteTrackPlan && unclassifiedRetainedSubtitles.length === 0
+      : step === 3
+        ? Boolean(outputName.trim())
+        : true;
 
   return (
     <div className="selection-wizard">
@@ -492,6 +511,12 @@ export function SelectionWizard({
             selections={tracks}
             onUpdate={updateTrack}
           />
+          {unclassifiedRetainedSubtitles.length > 0 && (
+            <Notice tone="warning" title="Felirattípus megadása szükséges">
+              <p>{unclassifiedRetainedSubtitles.length} megtartott felirat még „Ellenőrizendő” állapotban van.</p>
+              <p>Minden megtartott feliratnál válaszd a „Teljes felirat” vagy a „Forced / signs” típust. Ha a sáv nem kell, válaszd a „Kihagyás” lehetőséget. Ezután válik elérhetővé a Tovább gomb.</p>
+            </Notice>
+          )}
           {unresolvedTracks.length > 0 && (
             <Notice tone="warning" title="Hiányzó nyelv">
               {unresolvedTracks.length} megtartott sáv nyelve bizonytalan. Megadhatod most, vagy a hangot a worker beszédmintákból próbálja azonosítani; PGS feliratnál kézi megadás szükséges.
@@ -638,11 +663,17 @@ export function SelectionWizard({
                   : <Button variant="secondary" icon={<Palette size={17} />} onClick={() => setStep(3)}>Színadatok kézi megadása</Button>}
               </Notice>
             )}
-            {validate.isError && !colorApiIssue && <Notice tone="danger" title="A terv nem indítható">{validate.error instanceof ApiError ? validate.error.detail : validate.error.message}</Notice>}
+            {validate.isError && !colorApiIssue && !subtitleClassificationApiIssue && <Notice tone="danger" title="A terv nem indítható">{validate.error instanceof ApiError ? validate.error.detail : validate.error.message}</Notice>}
             {validate.isError && colorApiIssue && (
               <Notice tone="danger" title="Hiányos forrás-színinformáció">
                 <p>A kódolás biztonsága érdekében erősítsd meg ezeket: {reportedMissingColorFields.map((field) => SOURCE_COLOR_FIELD_LABELS[field]).join(", ")}.</p>
                 <Button variant="secondary" onClick={() => setStep(3)}>Színadatok megnyitása</Button>
+              </Notice>
+            )}
+            {validate.isError && subtitleClassificationApiIssue && (
+              <Notice tone="danger" title="Hiányzik egy megtartott felirat típusa">
+                <p>A megtartott feliratok egyikénél sincs megengedve az „Ellenőrizendő” állapot. Mindegyiket sorold be „Teljes felirat” vagy „Forced / signs” típusba, illetve hagyd ki, ha nincs rá szükség.</p>
+                <Button variant="secondary" onClick={() => setStep(2)}>Feliratok megnyitása</Button>
               </Notice>
             )}
             {save.isError && <Notice tone="danger" title="A jóváhagyás nem menthető">{save.error instanceof ApiError ? save.error.detail : save.error.message}</Notice>}

@@ -1,11 +1,40 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { SelectionValidation } from "../api/types";
+import type { DiscScanResult, SelectionValidation } from "../api/types";
 import { api, ApiError } from "../api/client";
 import { makeJob, makeScan } from "../test/fixtures";
 import { renderApp } from "../test/render";
 import { SelectionWizard } from "./SelectionWizard";
+
+function makeScanWithRetainedSubtitle(): DiscScanResult {
+  const scan = makeScan();
+  scan.playlists[0].streams.push({
+    id: "subtitle:4608",
+    index: 2,
+    pid: 4608,
+    kind: "subtitle",
+    codec: "hdmv_pgs_subtitle",
+    codec_profile: null,
+    language: {
+      iso639_2t: "hun",
+      bcp47: "hu",
+      confidence: 1,
+      needs_review: false,
+    },
+    title: "Magyar",
+    channels: null,
+    channel_layout: null,
+    sample_rate: null,
+    bit_depth: null,
+    default: true,
+    forced: false,
+    roles: [],
+    object_audio: false,
+    video: null,
+  });
+  return scan;
+}
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -133,6 +162,26 @@ describe("SelectionWizard", () => {
     expect(screen.getByPlaceholderText("forrás: eng")).toBeInTheDocument();
   });
 
+  it("does not leave the track step while a retained subtitle is unclassified", async () => {
+    const user = userEvent.setup();
+    const view = renderApp(
+      <SelectionWizard
+        job={makeJob({ state: "AWAITING_SELECTION" })}
+        scan={makeScanWithRetainedSubtitle()}
+        onComplete={vi.fn()}
+      />,
+    );
+
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+
+    expect(view.getByText("Felirattípus megadása szükséges")).toBeInTheDocument();
+    expect(view.getByRole("button", { name: "Tovább" })).toBeDisabled();
+
+    await user.selectOptions(view.getByLabelText("Magyar felirattípusa"), "full");
+
+    expect(view.getByRole("button", { name: "Tovább" })).toBeEnabled();
+  });
+
   it("lists missing source color fields and sends the explicitly confirmed BD defaults", async () => {
     const user = userEvent.setup();
     const scan = makeScan();
@@ -216,5 +265,33 @@ describe("SelectionWizard", () => {
     await user.click(view.getByRole("button", { name: "Színadatok megnyitása" }));
     expect(view.getByRole("heading", { name: "Forrás színinformációjának megerősítése" })).toBeInTheDocument();
     expect(view.queryByText(/source color metadata is incomplete/i)).not.toBeInTheDocument();
+  });
+
+  it("turns a backend subtitle classification error into a Hungarian repair action", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.validateSelection).mockRejectedValueOnce(new ApiError(
+      422,
+      "tracks[3] retained subtitle needs an explicit full/forced classification",
+      { detail: "tracks[3] retained subtitle needs an explicit full/forced classification" },
+    ));
+    const view = renderApp(
+      <SelectionWizard
+        job={makeJob({ state: "AWAITING_SELECTION" })}
+        scan={makeScanWithRetainedSubtitle()}
+        onComplete={vi.fn()}
+      />,
+    );
+
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.selectOptions(view.getByLabelText("Magyar felirattípusa"), "forced");
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Tovább" }));
+    await user.click(view.getByRole("button", { name: "Terv ellenőrzése" }));
+
+    expect(await view.findByText("Hiányzik egy megtartott felirat típusa")).toBeInTheDocument();
+    expect(view.queryByText(/retained subtitle needs/i)).not.toBeInTheDocument();
+
+    await user.click(view.getByRole("button", { name: "Feliratok megnyitása" }));
+    expect(view.getByRole("heading", { name: "Feliratok" })).toBeInTheDocument();
   });
 });
