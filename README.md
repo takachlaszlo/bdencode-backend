@@ -358,14 +358,18 @@ install_bdencode_secret() {
     printf '\n'
     printf '%s' "$credential_value" > "$temporary_file"
     unset credential_value
-    systemd-creds encrypt \
+    sudo systemd-creds encrypt \
         --name="$credential_name" \
         "$temporary_file" \
         "$credential_dir/$credential_name.cred"
     rm -f "$temporary_file"
+    sudo chown "$USER:$(id -gn)" \
+        "$credential_dir/$credential_name.cred"
     chmod 600 "$credential_dir/$credential_name.cred"
 }
 ```
+
+A `sudo` itt szándékos: Debian 12 alatt a gép helyi systemd credential-titkához csak root fér hozzá. A `chown` ezután visszaadja a titkosított fájlt a BDEncode felhasználójának; a telepítő kizárólag az ő tulajdonában levő, `0600` jogosultságú credentialt fogadja el.
 
 Ezután csak azt futtasd, amelyik szolgáltatáshoz van azonosítód:
 
@@ -479,6 +483,33 @@ Részletes rendszerdiagnosztika:
 ```
 
 Ha egyedi `BDENCODE_DATA_ROOT` értéket használtál, a parancsban a `$HOME/encode` részt cseréld ki arra.
+
+A health endpoint két külön címen érhető el:
+
+```bash
+# Közvetlenül a csak helyben figyelő backend API-n:
+curl --fail --silent http://127.0.0.1:8796/api/v1/health
+
+# Swizzin/nginx mögött, HTTPS-en; a jelszót a curl külön bekéri:
+curl --fail --silent --user FELHASZNALO \
+    https://sajat-domain.example/encoder/api/v1/health
+```
+
+A Swizzin/nginx cím `/encoder/` előtagot és HTTP Basic hitelesítést használ. A `8796`-os belső portot ne nyisd meg az internet felé.
+
+Windows WSL telepítésnél PowerShellből a helyi nginx ellenőrizhető:
+
+```powershell
+curl.exe --noproxy "*" http://127.0.0.1:8787/encoder/api/v1/health
+```
+
+A `runtime-capabilities` jelentésben a képfeltöltő credentialök tényleges fogyasztója a `bdencode-worker.service`. A fontos mezők:
+
+- `configured`: az érvényes, titkosított credential fájl rendelkezésre áll;
+- `service_bound`: a systemd a credentialt a worker szolgáltatáshoz köti;
+- `service_active`: a worker pillanatnyilag fut-e;
+- `ready_for_consumer`: a credential a megfelelő szolgáltatáshoz használatra készen be van kötve;
+- `runtime_loaded`: csak a jelentést készítő folyamat saját runtime credentialjét tudja közvetlenül igazolni. A képfeltöltőknél az API válaszában ezért szabályosan `null`, nem pedig `false`; ez nem workerhiba.
 
 ### 6.3. A weboldal nem tölt be azonnal
 
@@ -722,7 +753,7 @@ Kilépés az élő nézetből: `Ctrl+C`.
 | `sudo: python3: command not found` | A minimális Debianban még nincs Python | Régi telepítőhiba; a jelenlegi telepítő előbb telepíti a Python 3-at. Frissíts és futtasd újra. |
 | `Command 'man apt(8)' failed with code 1` | A systemd unit ellenőrzése a hiányzó `man` programon bukott el | Régi telepítőhiba; frissíts és futtasd újra. A jelenlegi bootstrap telepíti a szükséges csomagot. |
 | A telepítés sikeres, de a `localhost:8787` nem jön be | A WSL vagy nginx még nem fut, az ütemezett feladat hiányzik, vagy proxy zavar be | Várj 20 másodpercet, futtasd a 10.3. fejezet parancsait, majd ellenőrizd a szolgáltatásokat. |
-| Átmeneti `curl: (7) Failed to connect` látszik telepítés közben | A health check gyorsabban indult, mint a szolgáltatás | Ha később `HEALTHY`, `COMMITTED` és sikeres webcím jelenik meg, nincs teendő. Ha a végső állapot piros, nézd meg a naplót. |
+| Régebbi telepítőn átmeneti `curl: (7) Failed to connect` látszik | A health check gyorsabban indult, mint a szolgáltatás | Frissítsd a repót. A jelenlegi telepítő legfeljebb 10 másodpercig csendben újrapróbálkozik, és csak a végleges health-check hibát jelzi. |
 | `VapourSynth hiba` | A `vspipe` vagy egy szükséges plugin nem tölthető be | Futtasd a `doctor --json` parancsot, frissítsd a telepítést, majd nézd meg a worker naplóját. |
 | ImgBB/Catbox/Freeimage credential nincs beállítva | Az adott képfeltöltő nem használható hitelesítve | Állítsd be az 5. fejezet szerint. A kódolás ettől még elkészülhet, de a feltöltés korlátozott vagy hibás lehet. |
 | A forrás nem jelenik meg | Rossz gyökérmappa, jogosultsági hiba vagy közvetlen UNC útvonal | Ellenőrizd, hogy a gyökér alatt ténylegesen van `BDMV`, Windows alatt használj meghajtóbetűjelet. |

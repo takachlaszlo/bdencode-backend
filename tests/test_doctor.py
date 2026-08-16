@@ -300,6 +300,100 @@ def test_runtime_credential_status_rejects_symlink(
     assert status["metadata_ok"] is False
 
 
+def test_persistent_image_credential_reports_worker_readiness_without_api_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    credential_dir = home / ".config" / "bdencode"
+    credential_dir.mkdir(parents=True)
+    credential = credential_dir / "imgbb-api-key.cred"
+    credential.write_text("encrypted-at-rest", encoding="utf-8")
+    credential.chmod(0o600)
+    dropin = tmp_path / "worker-credential.conf"
+    dropin.write_text(
+        f"[Service]\nLoadCredentialEncrypted=imgbb-api-key:{credential}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    monkeypatch.setattr(doctor.Path, "home", lambda: home)
+    monkeypatch.setitem(
+        doctor.CREDENTIAL_SERVICE_DROPINS,
+        doctor.WORKER_SERVICE,
+        dropin,
+    )
+    # Windows exposes ACL-backed files as 0666 regardless of chmod.
+    monkeypatch.setattr(doctor.stat, "S_IMODE", lambda _mode: 0o600)
+
+    status = doctor._credential_status(
+        "imgbb-api-key",
+        consumer_service=doctor.WORKER_SERVICE,
+        consumer_active=True,
+    )
+
+    assert status["configured"] is True
+    assert status["encrypted_at_rest"] is True
+    assert status["runtime_loaded"] is None
+    assert status["consumer_service"] == doctor.WORKER_SERVICE
+    assert status["service_bound"] is True
+    assert status["service_active"] is True
+    assert status["ready_for_consumer"] is True
+    assert str(credential) not in repr(status)
+
+
+def test_persistent_image_credential_is_not_ready_without_worker_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    credential_dir = home / ".config" / "bdencode"
+    credential_dir.mkdir(parents=True)
+    credential = credential_dir / "freeimage-api-key.cred"
+    credential.write_text("encrypted-at-rest", encoding="utf-8")
+    credential.chmod(0o600)
+    missing_dropin = tmp_path / "missing-worker-credential.conf"
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    monkeypatch.setattr(doctor.Path, "home", lambda: home)
+    monkeypatch.setitem(
+        doctor.CREDENTIAL_SERVICE_DROPINS,
+        doctor.WORKER_SERVICE,
+        missing_dropin,
+    )
+    monkeypatch.setattr(doctor.stat, "S_IMODE", lambda _mode: 0o600)
+
+    status = doctor._credential_status(
+        "freeimage-api-key",
+        consumer_service=doctor.WORKER_SERVICE,
+        consumer_active=False,
+    )
+
+    assert status["configured"] is True
+    assert status["runtime_loaded"] is None
+    assert status["service_binding_present"] is False
+    assert status["service_bound"] is False
+    assert status["ready_for_consumer"] is False
+
+
+def test_installer_health_retry_hides_expected_connection_refusals() -> None:
+    installer = (ROOT / "install" / "install.sh").read_text(encoding="utf-8")
+    start = installer.index("wait_for_api() {")
+    end = installer.index("\n}\n", start)
+    wait_function = installer[start:end]
+
+    assert "for _attempt in {1..20}" in wait_function
+    assert "api/v1/health >/dev/null 2>&1" in wait_function
+    assert "--show-error" not in wait_function
+
+
+def test_readme_credential_helper_uses_root_then_restores_safe_owner() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "sudo systemd-creds encrypt" in readme
+    assert 'sudo chown "$USER:$(id -gn)"' in readme
+    assert 'chmod 600 "$credential_dir/$credential_name.cred"' in readme
+    assert "http://127.0.0.1:8796/api/v1/health" in readme
+    assert "https://sajat-domain.example/encoder/api/v1/health" in readme
+    assert "http://127.0.0.1:8787/encoder/api/v1/health" in readme
+
+
 def test_installer_isolates_tests_from_live_runtime_configuration() -> None:
     installer = (ROOT / "install" / "install.sh").read_text(encoding="utf-8")
     start = installer.index("# The installer itself accepts BDENCODE_DATA_ROOT")

@@ -26,6 +26,12 @@ function booleanLabel(value: boolean | undefined): string {
   return "Ismeretlen";
 }
 
+const imageCredentialLabels: Record<string, string> = {
+  imgbb: "ImgBB",
+  catbox: "Catbox",
+  freeimage: "Freeimage",
+};
+
 export function SystemPage() {
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 5000 });
   const runtime = useQuery({ queryKey: ["runtime-capabilities"], queryFn: api.runtimeCapabilities, refetchInterval: 60_000 });
@@ -48,6 +54,7 @@ export function SystemPage() {
   const cpuPercentFromRuntime = finiteNumber(runtime.data?.worker_cpu_policy?.requested_percent);
   const cpuFraction = finiteNumber(capabilities.data?.constraints.cpu_budget_fraction);
   const cpuPercent = cpuPercentFromRuntime ?? (cpuFraction === null ? null : cpuFraction * 100);
+  const imageCredentials = runtime.data?.image_upload_credentials ?? {};
 
   function refresh() {
     void Promise.all([health.refetch(), runtime.refetch(), capabilities.refetch()]);
@@ -103,6 +110,42 @@ export function SystemPage() {
                   <li><CheckCircle2 size={16} /> Dolby Vision helyett kizárólag HDR10</li>
                   <li><CheckCircle2 size={16} /> Comparison képek veszteségmentes PNG-ben</li>
                 </ul>
+              </Card>
+              <Card>
+                <span className="eyebrow">Képfeltöltés</span><h2>Worker credentialök</h2>
+                <div className="tool-table">
+                  {Object.entries(imageCredentialLabels).map(([name, label]) => {
+                    const credential = imageCredentials[name];
+                    const active = credential?.service_active;
+                    let state = "Ismeretlen";
+                    let tone: "neutral" | "info" | "success" | "warning" | "danger" = "neutral";
+                    if (credential?.configured === false) {
+                      state = "Nincs beállítva";
+                      tone = "danger";
+                    } else if (credential?.configured === true && credential.ready_for_consumer === false) {
+                      state = "Nincs a workerhez kötve";
+                      tone = "danger";
+                    } else if (credential?.configured === true && credential.ready_for_consumer === true) {
+                      state = active === false ? "Bekötve, a worker áll" : active === true ? "Használatra kész" : "A workerhez kötve";
+                      tone = active === false ? "warning" : "success";
+                    } else if (credential?.configured === true) {
+                      state = "Beállítva, workerállapot nélkül";
+                      tone = "info";
+                    }
+                    const statusClass = tone === "neutral"
+                      ? "tool-row__status"
+                      : tone === "danger"
+                        ? "tool-row__status tool-row__status--error"
+                        : "tool-row__status tool-row__status--ok";
+                    return (
+                      <div key={name} className="tool-row">
+                        <span className={statusClass}>{tone === "neutral" || tone === "info" ? <CircleHelp size={16} /> : tone === "danger" ? <XCircle size={16} /> : <CheckCircle2 size={16} />}</span>
+                        <span><strong>{label}</strong><small>{credential?.consumer_service ?? "bdencode-worker.service"}</small></span>
+                        <Badge tone={tone}>{state}</Badge>
+                      </div>
+                    );
+                  })}
+                </div>
               </Card>
             </div>
           </div>

@@ -48,6 +48,14 @@ MANDATORY_FFMPEG_FILTERS = {
 }
 MANDATORY_FFMPEG_PROTOCOLS = {"bluray"}
 MANDATORY_FFMPEG_BITSTREAM_FILTERS = {"dca_core"}
+WORKER_SERVICE = "bdencode-worker.service"
+API_SERVICE = "bdencode-api.service"
+CREDENTIAL_SERVICE_DROPINS = {
+    WORKER_SERVICE: Path(
+        "/etc/systemd/system/bdencode-worker.service.d/credential.conf"
+    ),
+    API_SERVICE: Path("/etc/systemd/system/bdencode-api.service.d/credential.conf"),
+}
 
 
 def _path_check(path: Path, *, writable: bool) -> dict[str, Any]:
@@ -131,14 +139,77 @@ def _release_profiles_status(settings: Settings) -> dict[str, Any]:
     }
 
 
-def _credential_status(name: str) -> dict[str, Any]:
+def _service_active(service: str) -> bool | None:
+    """Return the observable systemd state without turning it into a hard error."""
+
+    try:
+        completed = subprocess.run(
+            ["systemctl", "is-active", "--quiet", service],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode == 0:
+        return True
+    if completed.returncode in {3, 4}:
+        return False
+    return None
+
+
+def _credential_consumer_status(
+    name: str,
+    encrypted_path: Path,
+    service: str,
+    *,
+    service_active: bool | None,
+) -> dict[str, Any]:
+    """Describe whether a credential is wired to its real consumer service.
+
+    The API must never receive image-host secrets merely so it can inspect the
+    worker.  Instead, it verifies the root-owned systemd binding and reports the
+    consumer service state.  This distinguishes "ready for the worker" from
+    "loaded in the API process" without reading or exposing secret material.
+    """
+
+    dropin = CREDENTIAL_SERVICE_DROPINS[service]
+    service_bound = False
+    binding_present = os.path.lexists(dropin)
+    if binding_present:
+        try:
+            details = dropin.lstat()
+            if stat.S_ISREG(details.st_mode) and not stat.S_ISLNK(details.st_mode):
+                expected = f"LoadCredentialEncrypted={name}:{encrypted_path}"
+                service_bound = expected in {
+                    line.strip()
+                    for line in dropin.read_text(encoding="utf-8").splitlines()
+                }
+        except (OSError, UnicodeError):
+            service_bound = False
+    return {
+        "consumer_service": service,
+        "service_binding_present": binding_present,
+        "service_bound": service_bound,
+        "service_active": service_active,
+    }
+
+
+def _credential_status(
+    name: str,
+    *,
+    consumer_service: str | None = None,
+    consumer_active: bool | None = None,
+) -> dict[str, Any]:
     credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    encrypted_path = Path.home() / ".config" / "bdencode" / f"{name}.cred"
     candidates: list[tuple[Path, bool]] = []
     if credential_dir:
         candidates.append((Path(credential_dir) / name, True))
-    candidates.append(
-        (Path.home() / ".config" / "bdencode" / f"{name}.cred", False)
-    )
+    candidates.append((encrypted_path, False))
     for candidate, is_runtime in candidates:
         try:
             details = candidate.lstat()
@@ -153,12 +224,14 @@ def _credential_status(name: str) -> dict[str, Any]:
             permissions & 0o077 == 0 if is_runtime else permissions == 0o600
         )
         metadata_ok = regular and not symlink and owner_ok and permissions_ok
-        return {
-            "configured": metadata_ok and details.st_size > 0,
+        configured = metadata_ok and details.st_size > 0
+        result: dict[str, Any] = {
+            "configured": configured,
             "present": True,
-            "runtime_loaded": (
-                is_runtime and regular and not symlink and details.st_size > 0
-            ),
+            # For another systemd service this process cannot safely inspect
+            # the private runtime credential directory.  Null means
+            # "not observable here", not "missing from the worker".
+            "runtime_loaded": configured if is_runtime else None,
             # A systemd runtime credential is the decrypted, private tmpfs
             # material.  Only the persistent .cred candidate is itself
             # encrypted at rest.
@@ -171,7 +244,19 @@ def _credential_status(name: str) -> dict[str, Any]:
             "metadata_ok": metadata_ok,
             # Deliberately omit path/content: neither is needed in attachable logs.
         }
-    return {
+        if consumer_service is not None:
+            consumer = _credential_consumer_status(
+                name,
+                encrypted_path,
+                consumer_service,
+                service_active=consumer_active,
+            )
+            result.update(consumer)
+            result["ready_for_consumer"] = bool(
+                configured and (is_runtime or consumer["service_bound"])
+            )
+        return result
+    result = {
         "configured": False,
         "present": False,
         "runtime_loaded": False,
@@ -181,6 +266,16 @@ def _credential_status(name: str) -> dict[str, Any]:
         "owner_ok": False,
         "metadata_ok": False,
     }
+    if consumer_service is not None:
+        consumer = _credential_consumer_status(
+            name,
+            encrypted_path,
+            consumer_service,
+            service_active=consumer_active,
+        )
+        result.update(consumer)
+        result["ready_for_consumer"] = False
+    return result
 
 
 def _comparison_font_status() -> dict[str, Any]:
@@ -274,15 +369,41 @@ def build_report(
     vs = _vapoursynth_plugins()
     ffmpeg = snapshot["ffmpeg"]
     comparison_font = _comparison_font_status()
+    worker_active = _service_active(WORKER_SERVICE)
+    api_active = _service_active(API_SERVICE)
     image_upload_credentials = {
-        "imgbb": _credential_status("imgbb-api-key"),
-        "catbox": _credential_status("catbox-userhash"),
-        "freeimage": _credential_status("freeimage-api-key"),
+        "imgbb": _credential_status(
+            "imgbb-api-key",
+            consumer_service=WORKER_SERVICE,
+            consumer_active=worker_active,
+        ),
+        "catbox": _credential_status(
+            "catbox-userhash",
+            consumer_service=WORKER_SERVICE,
+            consumer_active=worker_active,
+        ),
+        "freeimage": _credential_status(
+            "freeimage-api-key",
+            consumer_service=WORKER_SERVICE,
+            consumer_active=worker_active,
+        ),
     }
     release_credentials = {
-        "qbittorrent_username": _credential_status("qbittorrent-username"),
-        "qbittorrent_password": _credential_status("qbittorrent-password"),
-        "aither_api_token": _credential_status("tracker-aither-api-token"),
+        "qbittorrent_username": _credential_status(
+            "qbittorrent-username",
+            consumer_service=API_SERVICE,
+            consumer_active=api_active,
+        ),
+        "qbittorrent_password": _credential_status(
+            "qbittorrent-password",
+            consumer_service=API_SERVICE,
+            consumer_active=api_active,
+        ),
+        "aither_api_token": _credential_status(
+            "tracker-aither-api-token",
+            consumer_service=API_SERVICE,
+            consumer_active=api_active,
+        ),
     }
     release_profiles = _release_profiles_status(settings)
     warnings: list[str] = []
@@ -304,6 +425,11 @@ def build_report(
         )
     if not image_upload_credentials["freeimage"]["configured"]:
         warnings.append("Freeimage upload credential is not configured")
+    for label, credential in image_upload_credentials.items():
+        if credential["configured"] and not credential["ready_for_consumer"]:
+            warnings.append(
+                f"{label} upload credential is not bound to {WORKER_SERVICE}"
+            )
     if release_profiles["present"] and not release_profiles["valid"]:
         warnings.append("release profile configuration is invalid")
     missing_ffmpeg = {

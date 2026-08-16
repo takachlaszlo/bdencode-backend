@@ -285,8 +285,12 @@ render_unit_atomic() {
 
 wait_for_api() {
     for _attempt in {1..20}; do
-        if curl --fail --silent --show-error --max-time 2 \
-            http://127.0.0.1:8796/api/v1/health >/dev/null; then
+        # A systemd már "active" állapotot jelezhet, miközben az ASGI szerver
+        # még nem kezdett figyelni. A köztes connection-refused válaszok ezért
+        # várhatóak, és nem szabad őket telepítési hibaként kiírni. A hívó csak
+        # a teljes, tíz másodperces várakozás sikertelenségét jelenti hibának.
+        if curl --fail --silent --max-time 2 \
+            http://127.0.0.1:8796/api/v1/health >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.5

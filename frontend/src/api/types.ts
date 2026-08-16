@@ -143,6 +143,11 @@ export interface RuntimeCapabilitiesResponse {
   vapoursynth?: RuntimeVapourSynthCapability;
   imgbb_credential?: {
     configured?: boolean;
+    ready_for_consumer?: boolean;
+    consumer_service?: string;
+    service_bound?: boolean;
+    service_active?: boolean | null;
+    runtime_loaded?: boolean | null;
     encrypted_at_rest?: boolean;
     permissions?: string;
     permissions_ok?: boolean;
@@ -151,9 +156,14 @@ export interface RuntimeCapabilitiesResponse {
   image_upload_credentials?: Record<string, {
     configured?: boolean;
     present?: boolean;
-    runtime_loaded?: boolean;
+    runtime_loaded?: boolean | null;
     encrypted_at_rest?: boolean;
     source?: "systemd-runtime" | "encrypted-file";
+    consumer_service?: string;
+    service_binding_present?: boolean;
+    service_bound?: boolean;
+    service_active?: boolean | null;
+    ready_for_consumer?: boolean;
     permissions?: string;
     permissions_ok?: boolean;
     owner_ok?: boolean;

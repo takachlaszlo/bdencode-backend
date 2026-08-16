@@ -143,4 +143,42 @@ describe("SystemPage runtime capabilities", () => {
     expect(screen.getByText("Olvasható").nextElementSibling).toHaveTextContent("Nem");
     expect(screen.getByText("Írható").nextElementSibling).toHaveTextContent("Nem");
   });
+
+  it("shows worker credential readiness instead of the API process runtime view", async () => {
+    mockRuntime({
+      image_upload_credentials: {
+        imgbb: {
+          configured: true,
+          runtime_loaded: null,
+          consumer_service: "bdencode-worker.service",
+          service_bound: true,
+          service_active: true,
+          ready_for_consumer: true,
+        },
+        catbox: {
+          configured: true,
+          runtime_loaded: null,
+          consumer_service: "bdencode-worker.service",
+          service_bound: true,
+          service_active: false,
+          ready_for_consumer: true,
+        },
+        freeimage: {
+          configured: true,
+          runtime_loaded: null,
+          consumer_service: "bdencode-worker.service",
+          service_bound: false,
+          service_active: true,
+          ready_for_consumer: false,
+        },
+      },
+    });
+
+    renderApp(<SystemPage />, "/settings");
+
+    expect(await screen.findByText("Használatra kész")).toBeInTheDocument();
+    expect(screen.getByText("Bekötve, a worker áll")).toBeInTheDocument();
+    expect(screen.getByText("Nincs a workerhez kötve")).toBeInTheDocument();
+    expect(screen.getAllByText("bdencode-worker.service")).toHaveLength(3);
+  });
 });

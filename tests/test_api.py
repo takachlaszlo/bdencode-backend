@@ -70,12 +70,14 @@ def test_runtime_capabilities_is_fresh_and_does_not_prepare_paths(
     monkeypatch.setattr(
         doctor,
         "_credential_status",
-        lambda _name: {
+        lambda _name, **_consumer: {
             "configured": True,
             "encrypted_at_rest": True,
             "permissions_ok": True,
+            "ready_for_consumer": True,
         },
     )
+    monkeypatch.setattr(doctor, "_service_active", lambda _service: True)
 
     with TestClient(create_app(database, settings=settings)) as client:
         first = client.get("/api/v1/runtime-capabilities")
