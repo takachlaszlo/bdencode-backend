@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 import tomllib
 
+import pytest
+
 
 MODULE_PATH = Path(__file__).parents[1] / "install" / "config_upgrade.py"
 SPEC = importlib.util.spec_from_file_location("bdencode_config_upgrade", MODULE_PATH)
@@ -22,6 +24,7 @@ def test_upgrade_inserts_release_profiles_inside_bdencode_table(
         """[bdencode]
 data_root = "/srv/bdencode"
 source_roots = ["/srv/media"]
+comparison_pair_count = 5
 
 [operator_notes]
 owner = "example"
@@ -37,6 +40,7 @@ owner = "example"
         document["bdencode"]["release_profiles_path"]
         == "/etc/bdencode/release-profiles.json"
     )
+    assert document["bdencode"]["comparison_pair_count"] == 24
     assert "release_profiles_path" not in document["operator_notes"]
 
 
@@ -51,3 +55,67 @@ release_profiles_path = \"/etc/custom/profiles.json\"\r
 
     assert not config_upgrade.upgrade(config, "/etc/bdencode/release-profiles.json")
     assert config.read_bytes() == original
+
+
+@pytest.mark.parametrize("legacy_value", [-1, 3, 5, 19, 51, 500])
+def test_upgrade_migrates_each_out_of_range_legacy_pair_count_and_is_idempotent(
+    tmp_path: Path, legacy_value: int
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_bytes(
+        (
+            "[bdencode]\r\n"
+            f"comparison_pair_count   =   {legacy_value}   # keep this comment\r\n"
+            'release_profiles_path = "/etc/custom/profiles.json"\r\n'
+        ).encode("utf-8")
+    )
+
+    assert config_upgrade.upgrade(config, "/etc/bdencode/release-profiles.json")
+    expected = (
+        "[bdencode]\r\n"
+        "comparison_pair_count   =   24   # keep this comment\r\n"
+        'release_profiles_path = "/etc/custom/profiles.json"\r\n'
+    ).encode("utf-8")
+    assert config.read_bytes() == expected
+
+    assert not config_upgrade.upgrade(config, "/etc/bdencode/release-profiles.json")
+    assert config.read_bytes() == expected
+
+
+@pytest.mark.parametrize("supported_value", [20, 24, 50])
+def test_upgrade_preserves_supported_pair_count_exactly(
+    tmp_path: Path, supported_value: int
+) -> None:
+    config = tmp_path / "config.toml"
+    original = (
+        "[bdencode]\n"
+        f"comparison_pair_count = {supported_value}\n"
+        'release_profiles_path = "/etc/custom/profiles.json"\n'
+    ).encode("utf-8")
+    config.write_bytes(original)
+
+    assert not config_upgrade.upgrade(config, "/etc/bdencode/release-profiles.json")
+    assert config.read_bytes() == original
+
+
+def test_upgrade_does_not_change_same_named_key_in_another_table(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        """[bdencode]
+comparison_pair_count = 3
+release_profiles_path = "/etc/custom/profiles.json"
+
+[operator_notes]
+comparison_pair_count = 4
+""",
+        encoding="utf-8",
+    )
+
+    assert config_upgrade.upgrade(config, "/etc/bdencode/release-profiles.json")
+
+    with config.open("rb") as stream:
+        document = tomllib.load(stream)
+    assert document["bdencode"]["comparison_pair_count"] == 24
+    assert document["operator_notes"]["comparison_pair_count"] == 4

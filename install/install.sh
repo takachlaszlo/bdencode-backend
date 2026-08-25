@@ -465,6 +465,17 @@ esac
 pause_apt_timers
 sudo /usr/local/libexec/bdencode-install-transaction prepare
 
+# The installed CLI above must inspect the queue with the configuration format
+# it was shipped with.  Once the worker is stopped and PREPARED has made the
+# old configuration rollbackable, upgrade that configuration before the new
+# release is built or tested.  The later call remains the idempotent first-
+# install/finalization path.
+if sudo test -f /etc/bdencode/config.toml; then
+    sudo python3 "$repo_root/install/config_upgrade.py" \
+        /etc/bdencode/config.toml \
+        --release-profiles-path /etc/bdencode/release-profiles.json
+fi
+
 # Publish the media pin and APT recovery gates before invoking apt-get. They
 # are mutable installer targets, so a later failure restores their snapshot.
 sudo install -d -m 0755 /etc/bdencode /etc/apt/preferences.d \

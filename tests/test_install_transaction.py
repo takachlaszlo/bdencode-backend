@@ -49,6 +49,31 @@ def test_installer_prepares_database_rollback_before_live_migration() -> None:
     assert begin < worker_stopped < prepare < migration
 
 
+def test_installer_upgrades_config_only_after_old_queue_gate_is_rollbackable() -> None:
+    installer = INSTALLER_PATH.read_text(encoding="utf-8")
+    begin = installer.index("bdencode-install-transaction begin")
+    queue_gate = installer.index("queue_is_install_safe", begin)
+    worker_stopped = installer.index('worker_state="$(sudo systemctl show', queue_gate)
+    prepare = installer.index("bdencode-install-transaction prepare", worker_stopped)
+    config_upgrade = installer.index(
+        'sudo python3 "$repo_root/install/config_upgrade.py"', prepare
+    )
+    pytest = installer.index(
+        '"$release_root/venv/bin/python" -m pytest', config_upgrade
+    )
+    final_config_upgrade = installer.index(
+        'sudo python3 "$repo_root/install/config_upgrade.py"', pytest
+    )
+
+    targets = {path.as_posix() for path in install_transaction.SYSTEM_TARGETS}
+    assert "/etc/bdencode/config.toml" in targets
+    assert begin < queue_gate < worker_stopped < prepare < config_upgrade < pytest
+    assert pytest < final_config_upgrade
+    assert "sudo test -f /etc/bdencode/config.toml" in installer[
+        prepare:config_upgrade
+    ]
+
+
 def test_stable_recovery_bootstrap_is_outside_rollback_allowlist() -> None:
     targets = {path.as_posix() for path in install_transaction.SYSTEM_TARGETS}
     assert "/usr/local/libexec/bdencode-update-runtime" not in targets
