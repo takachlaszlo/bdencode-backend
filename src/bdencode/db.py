@@ -214,11 +214,12 @@ class Database:
                 return
             if self.path != ":memory:":
                 Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+            # Schema creation and migration are rare, process-wide operations.
+            # Do not let a deliberately short runtime write timeout shrink this
+            # lock budget: concurrent service starts must have enough time to
+            # serialize through the one migration transaction.
             connection = self._connect(
-                busy_timeout_ms=min(
-                    max(0, int(self.busy_timeout_ms)),
-                    _INITIALIZE_BUSY_TIMEOUT_MS,
-                )
+                busy_timeout_ms=_INITIALIZE_BUSY_TIMEOUT_MS
             )
             try:
                 connection.execute("PRAGMA journal_mode = WAL")

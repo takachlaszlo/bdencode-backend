@@ -239,6 +239,24 @@ def test_parallel_initializers_migrate_schema_one_atomically(tmp_path):
     } <= objects
 
 
+def test_initializer_lock_budget_is_independent_of_runtime_timeout(
+    tmp_path, monkeypatch
+):
+    observed_timeouts = []
+    original_connect = Database._connect
+
+    def tracked_connect(database, *, busy_timeout_ms=None):
+        observed_timeouts.append(busy_timeout_ms)
+        return original_connect(database, busy_timeout_ms=busy_timeout_ms)
+
+    monkeypatch.setattr(Database, "_connect", tracked_connect)
+    database = Database(tmp_path / "dedicated-init-timeout.sqlite3", busy_timeout_ms=25)
+
+    database.initialize()
+
+    assert observed_timeouts == [500]
+
+
 def test_single_command_interrupt_terminates_before_return(tmp_path):
     started = threading.Event()
     interrupt = threading.Event()
