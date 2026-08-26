@@ -2775,6 +2775,8 @@ def test_fast_comparison_timeout_requests_review_without_losing_resume_stage(con
     assert result.state is JobState.NEEDS_REVIEW
     assert result.resume_state is JobState.COMPARISON
     assert "bounded" in (result.status_message or "")
+    event = database.list_events(job_id=job.id, limit=1000)[-1]
+    assert event.payload["timeout_seconds"] == 300
 
 
 def test_upload_fails_closed_for_legacy_unannotated_comparison(context):

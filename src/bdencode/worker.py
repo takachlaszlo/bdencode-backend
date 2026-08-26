@@ -229,6 +229,12 @@ from .vapoursynth import (
 
 LOG = logging.getLogger(__name__)
 
+# Twenty-five distributed probes decode roughly six minutes once the open-GOP
+# preroll is included.  Real H.264/HEVC titles can need more than 90 seconds on
+# otherwise healthy hardware, while the enclosing comparison still enforces a
+# strict thirty-minute wall-clock deadline.
+COMPARISON_FRAME_PROBE_TIMEOUT_SECONDS = 300
+
 _FFPROBE_PROFILE_NAMES = {
     "high": "High",
     "high10": "High 10",
@@ -5363,7 +5369,7 @@ class PipelineWorker:
                 cwd=paths.work,
                 stdout_path=encoded_probe,
                 stderr_path=paths.logs / "comparison-sampled-encoded-probe.stderr",
-                timeout=remaining_timeout(90),
+                timeout=remaining_timeout(COMPARISON_FRAME_PROBE_TIMEOUT_SECONDS),
             )
             _write_stage(encoded_probe_marker, encoded_probe_inputs, [encoded_probe])
         try:
@@ -5432,7 +5438,7 @@ class PipelineWorker:
                     cwd=paths.work,
                     stdout_path=source_probe,
                     stderr_path=paths.logs / "comparison-sampled-source-probe.stderr",
-                    timeout=remaining_timeout(90),
+                    timeout=remaining_timeout(COMPARISON_FRAME_PROBE_TIMEOUT_SECONDS),
                 )
                 _write_stage(source_probe_marker, source_probe_inputs, [source_probe])
             try:
