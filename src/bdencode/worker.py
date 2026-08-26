@@ -1647,7 +1647,12 @@ def _derive_color(
         raise ReviewRequired(f"source color metadata is unsupported: {exc}") from exc
 
 
-def parse_selection(job: Job, scan: DiscScan) -> ParsedSelection:
+def parse_selection(
+    job: Job,
+    scan: DiscScan,
+    *,
+    crop_override: VapourSynthCrop | None = None,
+) -> ParsedSelection:
     raw = job.selection
     if not isinstance(raw, Mapping):
         raise ReviewRequired("selection JSON is missing")
@@ -1787,9 +1792,10 @@ def parse_selection(job: Job, scan: DiscScan) -> ParsedSelection:
     if any(type(value) is not int for value in crop_raw.values()):
         raise ReviewRequired("video.crop values must be non-boolean integers")
     try:
-        crop = VapourSynthCrop(**dict(crop_raw))
+        requested_crop = VapourSynthCrop(**dict(crop_raw))
     except (TypeError, ValueError) as exc:
         raise ReviewRequired(f"invalid crop: {exc}") from exc
+    crop = requested_crop if crop_override is None else crop_override
     if (
         "temporal_filter" in raw
         and "temporal_filter" in video_raw
@@ -2486,6 +2492,27 @@ class PipelineWorker:
             ),
         )
 
+    @staticmethod
+    def _crop_policy_inputs(
+        scan: DiscScan,
+        selection: ParsedSelection,
+        *,
+        reference_sha256: str,
+    ) -> dict[str, Any]:
+        playlist = scan.playlist(selection.playlist_id)
+        source_video = playlist.video_streams[0].video
+        assert source_video is not None
+        return {
+            "policy_schema_version": 3,
+            "strategy": "full-title-sequential-1fps",
+            "selection_mode": "automatic-when-zero",
+            "reference_sha256": reference_sha256,
+            "duration_seconds": playlist.duration_seconds,
+            "source_width": source_video.width,
+            "source_height": source_video.height,
+            "requested": asdict(selection.crop),
+        }
+
     def _load_scan_and_selection(
         self, job: Job, paths: JobPaths
     ) -> tuple[DiscScan, ParsedSelection]:
@@ -2514,6 +2541,63 @@ class PipelineWorker:
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
         return scan, selection
+
+    def _load_prepared_scan_and_selection(
+        self, job: Job, paths: JobPaths
+    ) -> tuple[DiscScan, ParsedSelection]:
+        """Load the durable post-prepare selection contract.
+
+        An all-zero operator crop is an automatic-selection sentinel, not the
+        crop that was necessarily encoded.  Preparation records the validated
+        effective crop in a hash-pinned policy report.  Every later stage must
+        replay that decision and re-run source adaptation with its dimensions
+        instead of silently falling back to the original zero margins.
+        """
+
+        scan, selection = self._load_scan_and_selection(job, paths)
+        if selection.crop.enabled:
+            return scan, selection
+
+        reference_sha256 = _recorded_output_sha256(
+            paths.stages / "reference-remux.json", paths.reference
+        )
+        if reference_sha256 is None:
+            raise ReviewRequired(
+                "automatic crop source checkpoint is missing or stale"
+            )
+        crop_inputs = self._crop_policy_inputs(
+            scan,
+            selection,
+            reference_sha256=reference_sha256,
+        )
+        crop_report = paths.analysis / "crop-policy.json"
+        if not _valid_stage(
+            paths.stages / "crop-policy.json", crop_inputs, [crop_report]
+        ):
+            raise ReviewRequired("automatic crop checkpoint is missing or stale")
+        try:
+            crop_document = json.loads(crop_report.read_text(encoding="utf-8"))
+            if (
+                crop_document.get("schema_version") != 1
+                or crop_document.get("status") != "passed"
+                or crop_document.get("selection_mode") != "automatic"
+            ):
+                raise ValueError("automatic crop decision was not passed")
+            effective_crop_raw = crop_document["decision"]["requested"]
+            effective_crop = VapourSynthCrop(**effective_crop_raw)
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewRequired(
+                f"automatic crop report is invalid: {exc}"
+            ) from exc
+
+        effective_selection = parse_selection(
+            job,
+            scan,
+            crop_override=effective_crop,
+        )
+        # Preserve any language inference already restored by the regular
+        # loader; crop adaptation cannot change track decisions.
+        return scan, replace(effective_selection, tracks=selection.tracks)
 
     @staticmethod
     def _declared_language_evidence(
@@ -2904,16 +2988,11 @@ class PipelineWorker:
                 "source dimensions are required for distributed crop validation"
             )
         crop_report = paths.analysis / "crop-policy.json"
-        crop_inputs = {
-            "policy_schema_version": 3,
-            "strategy": "full-title-sequential-1fps",
-            "selection_mode": "automatic-when-zero",
-            "reference_sha256": sha256_file(paths.reference),
-            "duration_seconds": playlist.duration_seconds,
-            "source_width": source_video.width,
-            "source_height": source_video.height,
-            "requested": asdict(selection.crop),
-        }
+        crop_inputs = self._crop_policy_inputs(
+            scan,
+            selection,
+            reference_sha256=sha256_file(paths.reference),
+        )
         crop_marker = paths.stages / "crop-policy.json"
         if not _valid_stage(crop_marker, crop_inputs, [crop_report]):
             crop_log_path = paths.logs / "crop-detect-full-title.log"
@@ -2973,7 +3052,12 @@ class PipelineWorker:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ReviewRequired(f"automatic crop report is invalid: {exc}") from exc
         if effective_crop != selection.crop:
-            selection = replace(selection, crop=effective_crop)
+            effective_selection = parse_selection(
+                job,
+                scan,
+                crop_override=effective_crop,
+            )
+            selection = replace(effective_selection, tracks=selection.tracks)
             self.database.add_event(
                 EventCreate(
                     job_id=job.id,
@@ -3060,7 +3144,7 @@ class PipelineWorker:
             )
 
     def _encode(self, job: Job, paths: JobPaths) -> None:
-        scan, selection = self._load_scan_and_selection(job, paths)
+        scan, selection = self._load_prepared_scan_and_selection(job, paths)
         if not paths.script.is_file() or not paths.reference.is_file():
             raise RuntimeError("prepared reference or VapourSynth script is missing")
         reference_sha256 = _recorded_output_sha256(
@@ -3068,14 +3152,21 @@ class PipelineWorker:
         )
         if reference_sha256 is None:
             raise RuntimeError("reference remux checkpoint digest is missing")
+        temporary_video = paths.work / "video-encoded.partial.mkv"
+        commands = encode_pipeline_commands(
+            paths.script,
+            temporary_video,
+            selection.settings,
+        )
         inputs = {
-            "policy_schema_version": 2,
+            "policy_schema_version": 3,
             "scan_fingerprint": scan.fingerprint,
             "playlist_id": selection.playlist_id,
             "angle": selection.angle,
             "reference_sha256": reference_sha256,
             "script_sha256": sha256_file(paths.script),
             "settings": selection.settings.to_dict(),
+            "argv": commands,
         }
 
         def interrupted() -> bool:
@@ -3083,13 +3174,7 @@ class PipelineWorker:
 
         marker = paths.stages / "video-encode.json"
         if not _valid_stage(marker, inputs, [paths.encoded_video]):
-            temporary_video = paths.work / "video-encoded.partial.mkv"
             temporary_video.unlink(missing_ok=True)
-            commands = encode_pipeline_commands(
-                paths.script,
-                temporary_video,
-                selection.settings,
-            )
             playlist = scan.playlist(selection.playlist_id)
 
             def persist_progress(
@@ -3219,7 +3304,7 @@ class PipelineWorker:
             ) from exc
 
     def _mux(self, job: Job, paths: JobPaths) -> None:
-        scan, selection = self._load_scan_and_selection(job, paths)
+        scan, selection = self._load_prepared_scan_and_selection(job, paths)
         if not paths.encoded_video.is_file() or not paths.reference.is_file():
             raise RuntimeError("encoded video or reference remux is missing")
         playlist = scan.playlist(selection.playlist_id)
@@ -3490,7 +3575,7 @@ class PipelineWorker:
         self.queue.advance(job.id, JobState.QC, message="final Matroska mux complete")
 
     def _qc(self, job: Job, paths: JobPaths) -> None:
-        scan, selection = self._load_scan_and_selection(job, paths)
+        scan, selection = self._load_prepared_scan_and_selection(job, paths)
         output = paths.muxed_output
         if not output.is_file():
             raise RuntimeError("mux output is missing")
@@ -5027,7 +5112,7 @@ class PipelineWorker:
             return None
 
     def _comparison(self, job: Job, paths: JobPaths) -> None:
-        scan, selection = self._load_scan_and_selection(job, paths)
+        scan, selection = self._load_prepared_scan_and_selection(job, paths)
         encoded_input = paths.muxed_output
         if not encoded_input.is_file():
             raise RuntimeError("final Matroska output is missing before comparison")
@@ -5939,7 +6024,7 @@ class PipelineWorker:
         )
 
     def _upload_and_finalize(self, job: Job, paths: JobPaths) -> None:
-        _scan, selection = self._load_scan_and_selection(job, paths)
+        _scan, selection = self._load_prepared_scan_and_selection(job, paths)
         recorded_mux_digest = _recorded_output_sha256(
             paths.stages / "mux.json", paths.muxed_output
         )

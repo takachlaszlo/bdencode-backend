@@ -1474,6 +1474,46 @@ def test_service_stop_after_video_checkpoint_pauses_before_mux(context, monkeypa
     assert sum(command[0] == "vspipe" for command in runner.commands) == encode_calls
 
 
+def test_video_checkpoint_is_invalidated_when_encoder_argv_changes(
+    context, monkeypatch
+):
+    database, settings, _scan, _scanner, runner, worker = context
+    job, encoding = _prepare_encoding(context)
+    stopping = [False]
+    stop_after_first_checkpoint = [True]
+    original_write_stage = worker_module._write_stage
+
+    def stop_after_video_marker(marker, inputs, outputs):
+        original_write_stage(marker, inputs, outputs)
+        if marker.name == "video-encode.json" and stop_after_first_checkpoint[0]:
+            stop_after_first_checkpoint[0] = False
+            stopping[0] = True
+
+    monkeypatch.setattr(worker_module, "_write_stage", stop_after_video_marker)
+    worker.stop_requested = lambda: stopping[0]
+    paused = worker.process_job(encoding)
+    assert paused.state is JobState.ENCODING
+    paths = JobPaths.create(settings, job.id)
+    assert (paths.stages / "video-encode.json").is_file()
+    encode_calls = sum(command[0] == "vspipe" for command in runner.commands)
+
+    original_commands = worker_module.encode_pipeline_commands
+
+    def changed_commands(*args: Any, **kwargs: Any) -> list[list[str]]:
+        commands = original_commands(*args, **kwargs)
+        commands[-1][-2:-2] = ["-metadata", "checkpoint_contract=changed"]
+        return commands
+
+    monkeypatch.setattr(worker_module, "encode_pipeline_commands", changed_commands)
+    stopping[0] = False
+    resumed = worker.process_one_stage(paused)
+
+    assert resumed.state is JobState.MUXING
+    assert sum(command[0] == "vspipe" for command in runner.commands) == (
+        encode_calls + 1
+    )
+
+
 def test_api_cancel_after_video_checkpoint_never_enters_mux(context, monkeypatch):
     database, settings, _scan, _scanner, runner, worker = context
     job, encoding = _prepare_encoding(context)
@@ -2012,7 +2052,10 @@ def test_prepare_automatically_applies_stable_letterbox_crop(context) -> None:
     claimed = JobQueue(database).claim_next()
     assert claimed is not None
     worker.process_one_stage(claimed)
-    ready = database.set_selection(job.id, _selection())
+    selection = _selection()
+    selection["video"]["detail_level"] = "advanced"
+    selection["video"]["settings"] = {"ref": 5}
+    ready = database.set_selection(job.id, selection)
 
     real_run = runner.run
 
@@ -2048,6 +2091,11 @@ def test_prepare_automatically_applies_stable_letterbox_crop(context) -> None:
     assert "left=0, top=138, right=0, bottom=138" in paths.script.read_text(
         encoding="utf-8"
     )
+    plan = json.loads(paths.plan_json.read_text(encoding="utf-8"))
+    assert plan["decisions"]["encoder"]["ref"] == 5
+    _scan, prepared = worker._load_prepared_scan_and_selection(ready, paths)
+    assert prepared.crop.top == prepared.crop.bottom == 138
+    assert prepared.settings.ref == 5
     auto_crop_events = [
         event
         for event in database.list_events(job_id=job.id)
@@ -2055,6 +2103,81 @@ def test_prepare_automatically_applies_stable_letterbox_crop(context) -> None:
     ]
     assert len(auto_crop_events) == 1
     assert auto_crop_events[0].payload["crop"] == report["decision"]["requested"]
+
+    cropdetect_count = sum(
+        any("cropdetect=" in item for item in command)
+        for command in runner.commands
+    )
+    worker._prepare(ready, paths, advance=False)
+    restarted_report = json.loads(
+        (paths.analysis / "crop-policy.json").read_text(encoding="utf-8")
+    )
+    assert restarted_report["selection_mode"] == "automatic"
+    assert (
+        sum(
+            any("cropdetect=" in item for item in command)
+            for command in runner.commands
+        )
+        == cropdetect_count
+    )
+
+
+def test_automatic_crop_contract_survives_encode_and_qc_reload(context) -> None:
+    database, settings, scan, _scanner, runner, worker = context
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    selection = _selection()
+    selection["video"]["detail_level"] = "advanced"
+    selection["video"]["settings"] = {"ref": 5}
+    ready = database.set_selection(job.id, selection)
+
+    real_run = runner.run
+
+    def run_with_letterbox_media(*args: Any, **kwargs: Any) -> None:
+        real_run(*args, **kwargs)
+        command = tuple(os.fspath(item) for item in args[0])
+        stderr_path = kwargs.get("stderr_path")
+        stdout_path = kwargs.get("stdout_path")
+        if stderr_path is not None and any("cropdetect=" in item for item in command):
+            runner._write(
+                stderr_path,
+                "\n".join(
+                    "[Parsed_cropdetect_0] crop=1920:804:0:138"
+                    for _ in range(30)
+                )
+                + "\n",
+            )
+        if stdout_path is not None and stdout_path.name == "ffprobe-streams.json":
+            document = json.loads(stdout_path.read_text(encoding="utf-8"))
+            document["streams"][0]["height"] = 804
+            runner._write(stdout_path, json.dumps(document))
+
+    runner.run = run_with_letterbox_media  # type: ignore[method-assign]
+
+    current = worker.process_one_stage(ready)
+    assert current.state is JobState.ENCODING
+    current = worker.process_one_stage(current)
+    assert current.state is JobState.MUXING
+    encode_command = next(
+        command for command in runner.commands if "libx264" in command
+    )
+    x264_params = encode_command[encode_command.index("-x264-params") + 1]
+    assert "ref=5" in x264_params.split(":")
+
+    current = worker.process_one_stage(current)
+    assert current.state is JobState.QC
+    current = worker.process_one_stage(current)
+    assert current.state is JobState.COMPARISON
+
+    paths = JobPaths.create(settings, job.id)
+    ffprobe = json.loads(
+        (paths.analysis / "container" / "ffprobe-streams.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert ffprobe["streams"][0]["height"] == 804
 
 
 def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):

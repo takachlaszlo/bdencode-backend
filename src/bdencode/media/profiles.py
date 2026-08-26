@@ -65,6 +65,14 @@ _TRANSFERS = {
     "linear",
 }
 _MATRICES = {"bt709", "bt2020nc", "bt2020c", "smpte170m", "bt470bg", "rgb"}
+_CHROMA_LOCATION_IDS = {
+    "left": 0,
+    "center": 1,
+    "topleft": 2,
+    "top": 3,
+    "bottomleft": 4,
+    "bottom": 5,
+}
 _MASTER_DISPLAY_RE = re.compile(
     r"^G\((?P<gx>\d+),(?P<gy>\d+)\)"
     r"B\((?P<bx>\d+),(?P<by>\d+)\)"
@@ -260,14 +268,7 @@ class ColorMetadata:
             raise ValueError(f"unsupported matrix coefficients: {self.matrix}")
         if self.range not in {"limited", "full"}:
             raise ValueError("color range must be limited or full")
-        if self.chroma_location not in {
-            "left",
-            "center",
-            "topleft",
-            "top",
-            "bottomleft",
-            "bottom",
-        }:
+        if self.chroma_location not in _CHROMA_LOCATION_IDS:
             raise ValueError("unsupported chroma sample location")
 
 
@@ -661,6 +662,10 @@ class EncoderSettings:
             "colorprim": self.color.primaries,
             "transfer": self.color.transfer,
             "colormatrix": self.color.matrix,
+            # vspipe's generic Y4M C420 header is interpreted as centered
+            # chroma.  Pin the reviewed siting in the encoder itself so the
+            # pipe cannot override it; x264 and x265 use the same 0..5 map.
+            "chromaloc": _CHROMA_LOCATION_IDS[self.color.chroma_location],
         }
         if self.vbv:
             common.update(

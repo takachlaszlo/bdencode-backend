@@ -64,7 +64,34 @@ def test_recommended_anime_bd_profile_is_valid_x264() -> None:
     assert "-x264-params" in args
     assert "bframes=8" in args[args.index("-x264-params") + 1]
     assert "colorprim=bt709" in args[args.index("-x264-params") + 1]
+    assert "chromaloc=0" in args[args.index("-x264-params") + 1]
     assert "8x8dct=1" in args[args.index("-x264-params") + 1]
+
+
+@pytest.mark.parametrize("encoder", (VideoEncoder.X264, VideoEncoder.X265))
+@pytest.mark.parametrize(
+    ("location", "location_id"),
+    (
+        ("left", 0),
+        ("center", 1),
+        ("topleft", 2),
+        ("top", 3),
+        ("bottomleft", 4),
+        ("bottom", 5),
+    ),
+)
+def test_private_encoder_params_pin_reviewed_chroma_location(
+    encoder: VideoEncoder, location: str, location_id: int
+) -> None:
+    settings = recommended_profile(
+        encoder,
+        color=ColorMetadata(chroma_location=location),
+    )
+
+    assert settings.private_params()["chromaloc"] == location_id
+    args = settings.ffmpeg_video_args()
+    private_name = "-x264-params" if encoder is VideoEncoder.X264 else "-x265-params"
+    assert f"chromaloc={location_id}" in args[args.index(private_name) + 1]
 
 
 @pytest.mark.parametrize(
