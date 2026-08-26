@@ -417,6 +417,7 @@ def verify_audio_signal(
     encode: AudioSignalAnalysis,
     policy: EffectiveAudioPolicy,
     *,
+    decoded_pcm_sha256_match: bool | None = None,
     maximum_lossy_true_peak_dbfs: Decimal = Decimal("0"),
     near_ceiling_dbfs: Decimal = Decimal("-1.0"),
     maximum_near_ceiling_increase_db: Decimal = Decimal("0.3"),
@@ -424,9 +425,11 @@ def verify_audio_signal(
     """Validate whole-track audio signal safety for an effective output policy.
 
     Only ``policy.strategy == \"lossy_transcode\"`` receives the lossy
-    intersample-peak gates.  Copy, FLAC and DTS core extraction still fail for
-    non-finite samples or decoded PCM clipping, while positive intersample
-    peaks remain explicit warnings.
+    intersample-peak gates.  Non-finite samples always fail.  Copy and FLAC may
+    report source clipping as an inherited warning only when their complete
+    decoded PCM SHA-256 values match; new, changed or unproven clipping remains
+    a failure.  Positive intersample peaks remain explicit warnings for the
+    other lossless policies.
     """
 
     if maximum_near_ceiling_increase_db < 0:
@@ -436,6 +439,13 @@ def verify_audio_signal(
 
     failures: list[str] = []
     warnings: list[str] = []
+    inherited_clipping = (
+        policy.pcm_match_required
+        and decoded_pcm_sha256_match is True
+        and source.has_clipping
+        and encode.has_clipping
+        and source.clipped_samples == encode.clipped_samples
+    )
     for label, analysis in (("source", source), ("encode", encode)):
         if analysis.missing_fields:
             failures.append(
@@ -452,7 +462,7 @@ def verify_audio_signal(
                 f"{label} audio contains non-finite samples "
                 f"(NaN={analysis.nan_samples or 0}, Inf={analysis.inf_samples or 0})"
             )
-        if analysis.has_clipping:
+        if analysis.has_clipping and not inherited_clipping:
             failures.append(
                 f"{label} audio contains {analysis.clipped_samples} clipped/full-scale samples"
             )
@@ -460,6 +470,12 @@ def verify_audio_signal(
             warnings.append(
                 f"{label} audio contains {analysis.denormal_samples} denormal samples"
             )
+    if inherited_clipping:
+        warnings.append(
+            "source and encode share "
+            f"{source.clipped_samples} pre-existing clipped/full-scale samples; "
+            "decoded PCM SHA-256 matches"
+        )
 
     source_peak = _finite_decimal(source.true_peak_dbfs)
     encode_peak = _finite_decimal(encode.true_peak_dbfs)

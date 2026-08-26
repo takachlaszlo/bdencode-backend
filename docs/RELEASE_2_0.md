@@ -52,7 +52,7 @@ A selection pontos alakját az [API contract](API.md#selection), az üzemelteté
 
 ### Hang és felirat
 
-- Minden hangnál teljes sávos EBU R128/true-peak és `astats` elemzés készül. Clipping, NaN vagy Inf minta blokkol; denormal minta külön figyelmeztetés.
+- Minden hangnál teljes sávos EBU R128/true-peak és `astats` elemzés készül. Az új, romló vagy nem igazolt clipping, valamint minden NaN vagy Inf minta blokkol; a dekódolt PCM SHA-256-tal igazolt, lossless módon örökölt clipping és a denormal minta külön auditfigyelmeztetés.
 - Veszteséges átkódolásnál a kimeneti true peak nem lehet `0 dBTP` felett. Ha a forrás legalább `-1 dBTP`, a növekedés legfeljebb `0.3 dB` lehet.
 - Copy és FLAC esetén megmarad a dekódolt PCM-hash és topológia gate; veszteséges céloknál a kodek, bitráta, 48 kHz, csatornaszám és időzítés az effektív presethez mérődik. A hossz bizonyítéka mindig a kiválasztott audiósáv teljes packet-tailje; a konténer teljes időtartama nem használható helyette.
 - Minden nem-COPY audió teljes, countolt decoded-frame menetet kap. A `PTS + nb_samples/sample_rate` mintakurzor frame-enként kizárja a belső rést és átfedést; a source → sidecar és source → final összminta- és normalizált végpont-egyezés külön hard gate. A nagy nyers frame-riportok csak a privát work könyvtárban élnek a checkpoint folytatásáig, sikeres lezáráskor törlődnek.

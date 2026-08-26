@@ -143,6 +143,48 @@ def test_non_finite_and_clipped_samples_are_rejected_and_denormals_reported() ->
     assert any("3 denormal samples" in item for item in result.warnings)
 
 
+def test_lossless_pcm_match_reports_inherited_clipping_as_warning() -> None:
+    source = parse_audio_analysis(
+        _analysis_log(sample_peak="0.0", peak_count="2")
+    )
+    encode = parse_audio_analysis(
+        _analysis_log(sample_peak="0.0", peak_count="2")
+    )
+
+    result = verify_audio_signal(
+        source,
+        encode,
+        _policy("copy"),
+        decoded_pcm_sha256_match=True,
+    )
+
+    assert result.passed
+    assert not any("clipped/full-scale" in item for item in result.failures)
+    assert any("pre-existing clipped/full-scale" in item for item in result.warnings)
+
+
+@pytest.mark.parametrize("pcm_match", (False, None))
+def test_lossless_clipping_without_pcm_proof_still_fails(
+    pcm_match: bool | None,
+) -> None:
+    source = parse_audio_analysis(
+        _analysis_log(sample_peak="0.0", peak_count="2")
+    )
+    encode = parse_audio_analysis(
+        _analysis_log(sample_peak="0.0", peak_count="2")
+    )
+
+    result = verify_audio_signal(
+        source,
+        encode,
+        _policy("copy"),
+        decoded_pcm_sha256_match=pcm_match,
+    )
+
+    assert not result.passed
+    assert any("clipped/full-scale" in item for item in result.failures)
+
+
 def test_lossy_transcode_rejects_true_peak_overshoot_without_pcm_clipping() -> None:
     source = parse_audio_analysis(_analysis_log(true_peak="-0.5"))
     encode = parse_audio_analysis(_analysis_log(true_peak="0.2", sample_peak="-0.1"))

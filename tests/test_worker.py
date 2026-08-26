@@ -3362,7 +3362,7 @@ def test_lossy_audio_transcode_uses_target_qc_without_pcm_hash_gate(
             / "audio-comparison.json"
         ).read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     track = manifest["tracks"][0]
     assert track["verification_mode"] == "lossy_transcode"
     assert track["decoded_pcm_sha256_required"] is False

@@ -4463,7 +4463,7 @@ class PipelineWorker:
             item.id: index for index, item in enumerate(playlist.audio_streams)
         }
         audio_inputs: dict[str, Any] = {
-            "manifest_schema_version": 3,
+            "manifest_schema_version": 4,
             "audio_decode_policy_schema_version": AUDIO_DECODE_POLICY_SCHEMA_VERSION,
             "audio_frame_continuity_schema_version": (
                 AUDIO_FRAME_CONTINUITY_SCHEMA_VERSION
@@ -4789,7 +4789,10 @@ class PipelineWorker:
                     f"audio signal evidence is incomplete for {stream.id}"
                 ) from exc
             signal_verification = verify_audio_signal(
-                source_signal, encode_signal, audio_policy
+                source_signal,
+                encode_signal,
+                audio_policy,
+                decoded_pcm_sha256_match=pcm_match,
             )
             one_sample_tolerance = Decimal(1) / Decimal(source_value.sample_rate)
             delay_within_one_sample = (
@@ -4813,6 +4816,10 @@ class PipelineWorker:
                         "source_signal": source_signal.to_dict(),
                         "encode_signal": encode_signal.to_dict(),
                         "signal_verification": signal_verification.to_dict(),
+                        "decoded_pcm_sha256_match": pcm_match,
+                        "decoded_pcm_sha256_required": (
+                            audio_policy.pcm_match_required
+                        ),
                     },
                 )
             source_probe_value = asdict(source_value)
@@ -4918,7 +4925,7 @@ class PipelineWorker:
         audio_marker = paths.stages / "qc-audio.json"
         if not _valid_stage(audio_marker, audio_inputs, audio_outputs):
             atomic_write_json(
-                audio_manifest_path, {"schema_version": 3, "tracks": audio_results}
+                audio_manifest_path, {"schema_version": 4, "tracks": audio_results}
             )
             _write_stage(audio_marker, audio_inputs, audio_outputs)
 
