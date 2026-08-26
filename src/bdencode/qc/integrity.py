@@ -93,6 +93,7 @@ class PacketTimelineVerdict:
     first_mismatch_indexes: tuple[int, ...]
     tolerance_ms: int
     passed: bool
+    timestamp_tolerance_ms: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -461,8 +462,14 @@ def compare_packet_timelines(
     final: PacketTimelineFingerprint,
     *,
     tolerance_ms: int = 1,
+    timestamp_tolerance_ms: int | None = None,
 ) -> PacketTimelineVerdict:
-    """Compare normalized packet timing while allowing Matroska ms rounding."""
+    """Compare normalized packet timing while allowing Matroska ms rounding.
+
+    ``timestamp_tolerance_ms`` can widen only normalized PTS/DTS comparison for
+    a remux.  Packet durations retain ``tolerance_ms`` so a container timebase
+    conversion cannot mask a changed packet cadence.
+    """
 
     if (
         isinstance(tolerance_ms, bool)
@@ -470,6 +477,14 @@ def compare_packet_timelines(
         or tolerance_ms < 0
     ):
         raise ValueError("packet timeline tolerance must be non-negative")
+    if timestamp_tolerance_ms is None:
+        timestamp_tolerance_ms = tolerance_ms
+    if (
+        isinstance(timestamp_tolerance_ms, bool)
+        or not isinstance(timestamp_tolerance_ms, int)
+        or timestamp_tolerance_ms < 0
+    ):
+        raise ValueError("packet timestamp tolerance must be non-negative")
     mismatches: list[int] = []
     for index, (left, right) in enumerate(
         zip(source.entries, final.entries, strict=False)
@@ -478,10 +493,15 @@ def compare_packet_timelines(
         for field in ("pts_ms", "dts_ms", "duration_ms"):
             left_value = getattr(left, field)
             right_value = getattr(right, field)
+            field_tolerance = (
+                tolerance_ms
+                if field == "duration_ms"
+                else timestamp_tolerance_ms
+            )
             if (left_value is None) != (right_value is None) or (
                 left_value is not None
                 and right_value is not None
-                and abs(left_value - right_value) > tolerance_ms
+                and abs(left_value - right_value) > field_tolerance
             ):
                 timing_matches = False
         if left.size_bytes != right.size_bytes or not timing_matches:
@@ -499,6 +519,7 @@ def compare_packet_timelines(
         mismatch_count=len(mismatches),
         first_mismatch_indexes=tuple(mismatches[:10]),
         tolerance_ms=tolerance_ms,
+        timestamp_tolerance_ms=timestamp_tolerance_ms,
         passed=packet_count_matches and not mismatches,
     )
 

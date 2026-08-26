@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from bdencode.qc.integrity import (
+    PacketTimelineVerdict,
     VideoEfficiencyError,
     compare_packet_timelines,
     evaluate_video_cadence,
@@ -127,6 +128,126 @@ def test_packet_timeline_normalizes_uniform_mux_sync_offset() -> None:
     verdict = compare_packet_timelines(source, final)
     assert verdict.passed
     assert source.presentation_span_ms == final.presentation_span_ms == 96
+
+
+def test_packet_timeline_verdict_keeps_legacy_constructor_compatible() -> None:
+    verdict = PacketTimelineVerdict(True, 0, (), 1, True)
+
+    assert verdict.timestamp_tolerance_ms == 1
+    assert verdict.to_dict()["timestamp_tolerance_ms"] == 1
+
+
+def test_packet_timeline_accepts_two_tick_timestamp_quantization_only_when_scoped() -> None:
+    source = parse_packet_timeline(
+        {
+            "packets": [
+                {
+                    "pts_time": "0.042",
+                    "dts_time": "0.042",
+                    "duration_time": "0.011",
+                    "size": "100",
+                },
+                {
+                    "pts_time": "0.063",
+                    "dts_time": "0.063",
+                    "duration_time": "0.011",
+                    "size": "90",
+                },
+            ]
+        }
+    )
+    final = parse_packet_timeline(
+        {
+            "packets": [
+                {
+                    "pts_time": "0.000",
+                    "dts_time": "0.000",
+                    "duration_time": "0.011",
+                    "size": "100",
+                },
+                {
+                    "pts_time": "0.019",
+                    "dts_time": "0.019",
+                    "duration_time": "0.011",
+                    "size": "90",
+                },
+            ]
+        }
+    )
+
+    strict = compare_packet_timelines(source, final)
+    remux = compare_packet_timelines(
+        source, final, timestamp_tolerance_ms=2
+    )
+
+    assert not strict.passed
+    assert strict.first_mismatch_indexes == (1,)
+    assert remux.passed
+    assert remux.tolerance_ms == 1
+    assert remux.timestamp_tolerance_ms == 2
+
+
+def test_packet_timeline_scoped_timestamp_tolerance_rejects_real_drift() -> None:
+    def timeline(second_packet: str) -> dict[str, object]:
+        return {
+            "packets": [
+                {
+                    "pts_time": "0.000",
+                    "dts_time": "0.000",
+                    "duration_time": "0.010",
+                    "size": "100",
+                },
+                {
+                    "pts_time": second_packet,
+                    "dts_time": second_packet,
+                    "duration_time": "0.010",
+                    "size": "100",
+                },
+            ]
+        }
+
+    verdict = compare_packet_timelines(
+        parse_packet_timeline(timeline("0.020")),
+        parse_packet_timeline(timeline("0.017")),
+        timestamp_tolerance_ms=2,
+    )
+
+    assert not verdict.passed
+    assert verdict.first_mismatch_indexes == (1,)
+
+
+def test_packet_timeline_scoped_timestamp_tolerance_keeps_duration_strict() -> None:
+    source = parse_packet_timeline(
+        {
+            "packets": [
+                {
+                    "pts_time": "0.000",
+                    "dts_time": "0.000",
+                    "duration_time": "0.010",
+                    "size": "100",
+                }
+            ]
+        }
+    )
+    final = parse_packet_timeline(
+        {
+            "packets": [
+                {
+                    "pts_time": "0.000",
+                    "dts_time": "0.000",
+                    "duration_time": "0.012",
+                    "size": "100",
+                }
+            ]
+        }
+    )
+
+    verdict = compare_packet_timelines(
+        source, final, timestamp_tolerance_ms=2
+    )
+
+    assert not verdict.passed
+    assert verdict.first_mismatch_indexes == (0,)
 
 
 def test_packet_timeline_rejects_internal_timestamp_shift_with_same_endpoints() -> None:

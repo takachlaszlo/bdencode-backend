@@ -3973,7 +3973,12 @@ class PipelineWorker:
                         record["final_timeline_path"].read_text(encoding="utf-8")
                     )
                     timeline_verdict = compare_packet_timelines(
-                        sidecar_timeline, final_timeline
+                        sidecar_timeline,
+                        final_timeline,
+                        # A sync-shifted remux compares two independently
+                        # quantized Matroska timelines.  Normalizing both
+                        # origins can therefore differ by up to two 1 ms ticks.
+                        timestamp_tolerance_ms=2,
                     )
                     reference_payload_sha256 = None
                     reference_timeline = None
