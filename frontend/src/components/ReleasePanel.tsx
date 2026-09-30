@@ -145,6 +145,9 @@ function defaultDraft(job: Job, releaseName: string): ReleaseDraft {
     : typeof job.settings.encoder === "string"
       ? job.settings.encoder
       : "x264";
+  // ``job.disc_type`` is the operator's request and defaults to AUTO; the real
+  // disc kind decides the encoder (UHD is always x265), so use that as well.
+  const uhd = job.disc_type === "UHD" || (job.disc_type !== "BD" && encoder === "x265");
   return {
     profileId: "",
     releaseName,
@@ -154,8 +157,8 @@ function defaultDraft(job: Job, releaseName: string): ReleaseDraft {
     imdbId: "",
     tmdbId: "",
     category: job.content_type === "SERIES" ? "TV" : "Movie",
-    sourceMedia: job.disc_type === "UHD" ? "UHD Blu-ray" : "Blu-ray",
-    resolution: job.disc_type === "UHD" ? "2160p" : "1080p",
+    sourceMedia: uhd ? "UHD Blu-ray" : "Blu-ray",
+    resolution: uhd ? "2160p" : "1080p",
     videoCodec: encoder === "x265" ? "H.265" : "H.264",
     audioCodecs: audioCodecs.join(", ") || "Unknown",
     languages: languages.join(", ") || "und",
