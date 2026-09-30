@@ -650,6 +650,11 @@ class ReleaseStore:
             if row is None:
                 raise NotFoundError(f"release preparation not found: {preparation_id}")
             current = ReleasePreparationState(row["state"])
+            self._assert_no_destructive_maintenance(
+                connection,
+                job_id=str(row["job_id"]),
+                preparation_id=preparation_id,
+            )
             if int(row["version"]) != expected_version:
                 raise StateConflictError(
                     f"release preparation version is {row['version']}, "
