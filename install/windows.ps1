@@ -16,6 +16,13 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 $script:InstallLog = Join-Path $env:LOCALAPPDATA "BDEncode\install.log"
+# A függvények saját $PSBoundParameters értéket kapnak, ezért itt rögzítjük az
+# indításkor ténylegesen megadott paramétereket az emelt és a folytatott futáshoz.
+$script:InstallArguments = $PSBoundParameters
+
+if ($Port -eq 8796) {
+    throw "A 8796-os port a BDEncode belső API-jának van fenntartva; válassz másik portot."
+}
 
 function Wait-BeforeExit {
     param([string]$Prompt = "Nyomj Entert a bezáráshoz")
@@ -127,9 +134,34 @@ function Test-LocalHealth {
     }
 }
 
+function ConvertTo-CommandLineArgument {
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string]$Value)
+
+    # CommandLineToArgvW szabályok: az idézőjelet megelőző, illetve a záró
+    # idézőjel előtti visszaperjeleket meg kell duplázni.
+    $escaped = $Value -replace '(\\*)"', '$1$1\"'
+    $escaped = $escaped -replace '(\\+)$', '$1$1'
+    return '"' + $escaped + '"'
+}
+
+function Get-ForwardedArgumentLine {
+    $tokens = foreach ($entry in $script:InstallArguments.GetEnumerator()) {
+        if ($entry.Value -is [System.Management.Automation.SwitchParameter]) {
+            if ($entry.Value.IsPresent) { "-$($entry.Key)" }
+        } else {
+            "-$($entry.Key)"
+            ConvertTo-CommandLineArgument -Value ([string]$entry.Value)
+        }
+    }
+    if ($null -eq $tokens) { return "" }
+    return (@($tokens) -join " ")
+}
+
 function Register-ContinuationAfterRestart {
     $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $command = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $powerShell, $PSCommandPath
+    $forwarded = Get-ForwardedArgumentLine
+    if ($forwarded) { $command = "$command $forwarded" }
     $runOnce = "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
     New-Item -Path $runOnce -Force | Out-Null
     New-ItemProperty -Path $runOnce -Name "BDEncodeInstall" -Value $command -PropertyType String -Force | Out-Null
@@ -137,6 +169,8 @@ function Register-ContinuationAfterRestart {
 
 if (-not (Test-Administrator)) {
     $argumentLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
+    $forwarded = Get-ForwardedArgumentLine
+    if ($forwarded) { $argumentLine = "$argumentLine $forwarded" }
     try {
         $elevated = Start-Process powershell.exe -Verb RunAs -ArgumentList $argumentLine -PassThru -Wait
         exit $elevated.ExitCode
@@ -253,6 +287,9 @@ printf '%s ALL=(ALL) NOPASSWD:ALL\n' '$LinuxUser' >/etc/sudoers.d/bdencode-wsl
 chmod 0440 /etc/sudoers.d/bdencode-wsl
 install -d -m 0755 /etc/bdencode
 touch /etc/bdencode/windows-managed
+if [ -f /etc/wsl.conf ] && [ ! -e /etc/wsl.conf.bdencode-backup ]; then
+    cp -p /etc/wsl.conf /etc/wsl.conf.bdencode-backup
+fi
 printf '[boot]\nsystemd=true\n\n[user]\ndefault=$LinuxUser\n' >/etc/wsl.conf
 "@
 Invoke-WslScript -User "root" -Script $rootBootstrap
