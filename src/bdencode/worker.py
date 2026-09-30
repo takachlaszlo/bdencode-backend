@@ -36,6 +36,8 @@ from .chapters import render_matroska_chapters
 from .config import Settings
 from .capabilities import capability_snapshot, dynamic_hdr_support
 from .crf_search import (
+    STATUS_BEST_EFFORT,
+    STATUS_MAX_CRF,
     AutoCrfConfig,
     CrfProbe,
     CrfSearch,
@@ -267,6 +269,16 @@ LOG = logging.getLogger(__name__)
 # otherwise healthy hardware, while the enclosing comparison still enforces a
 # strict thirty-minute wall-clock deadline.
 COMPARISON_FRAME_PROBE_TIMEOUT_SECONDS = 300
+
+# libvmaf frame-level threads for the CRF probes.  Measured on 720p: one thread
+# 114 s, four 25 s, eight 14.5 s, sixteen 10.5 s for the same bit-identical
+# score; eight keeps the per-frame float buffers of a UHD title modest.
+VMAF_PROBE_MAX_THREADS = 8
+
+
+def _vmaf_thread_count() -> int:
+    return max(1, min(VMAF_PROBE_MAX_THREADS, os.cpu_count() or 1))
+
 
 _FFPROBE_PROFILE_NAMES = {
     "high": "High",
@@ -3724,6 +3736,14 @@ class PipelineWorker:
                             vmaf_json,
                             hdr10=hdr10,
                             model_4k=model_4k,
+                            # Only the VMAF score steers the search: skip the
+                            # slow PSNR/SSIM features, use a thread pool (the
+                            # score is identical), and keep the named pipes
+                            # out of the job tree, where they would make the
+                            # storage accounting refuse the whole job.
+                            threads=_vmaf_thread_count(),
+                            vmaf_only=True,
+                            fifo_root=self.settings.cache_root / "vmaf",
                         ),
                         cwd=paths.work,
                         stderr_path=paths.logs / f"crf-probe-{token}-vmaf.log",
@@ -3787,11 +3807,24 @@ class PipelineWorker:
             "crf-search.json",
             mime_type="application/json",
         )
+        message = f"automatic CRF search selected CRF {outcome.chosen_crf:g}"
+        if outcome.status == STATUS_MAX_CRF:
+            message += (
+                f"; the VMAF target {config.target_vmaf:g} is met even at the "
+                f"highest allowed CRF (VMAF {outcome.chosen_score:.2f}), so a "
+                "higher max_crf would give a smaller file"
+            )
+        elif outcome.status == STATUS_BEST_EFFORT:
+            message += (
+                f"; VMAF {outcome.chosen_score:.2f} is more than "
+                f"{config.tolerance:g} above the target {config.target_vmaf:g} "
+                "because the search ended before a closer CRF was found"
+            )
         self.database.add_event(
             EventCreate(
                 job_id=job.id,
                 kind="worker.auto-crf",
-                message=f"automatic CRF search selected CRF {outcome.chosen_crf:g}",
+                message=message,
                 payload={
                     "status": outcome.status,
                     "chosen_crf": outcome.chosen_crf,

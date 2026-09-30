@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Sequence
 
-from .qc.video import standalone_vmaf_command
+from .qc.video import VMAF_EXTRA_FEATURES, standalone_vmaf_command
 from .utils import atomic_write_json
 
 
@@ -35,7 +35,17 @@ def streamed_vmaf_command(
     hdr10: bool,
     model_4k: bool = False,
     executable: str = "bdencode-vmaf",
+    threads: int | None = None,
+    vmaf_only: bool = False,
+    fifo_root: Path | None = None,
 ) -> list[str]:
+    """Build the ``bdencode-vmaf`` command.
+
+    The optional arguments are appended only when given, so the default command
+    is exactly the historical one.
+    """
+    if threads is not None and threads < 0:
+        raise ValueError("VMAF thread count cannot be negative")
     command = [
         executable,
         "--script",
@@ -49,6 +59,12 @@ def streamed_vmaf_command(
         command.append("--hdr10")
     if model_4k:
         command.extend(("--model", "vmaf_4k_v0.6.1"))
+    if threads is not None:
+        command.extend(("--threads", str(threads)))
+    if vmaf_only:
+        command.append("--vmaf-only")
+    if fifo_root is not None:
+        command.extend(("--fifo-root", str(fifo_root)))
     return command
 
 
@@ -119,15 +135,32 @@ def run_streamed_vmaf(
     vspipe: str = "vspipe",
     ffmpeg: str = "ffmpeg",
     vmaf: str = "vmaf",
+    threads: int = 0,
+    vmaf_only: bool = False,
+    fifo_root: Path | None = None,
 ) -> Path:
-    """Run VMAF/PSNR/SSIM without materializing lossless intermediate video."""
+    """Run VMAF (and by default PSNR/SSIM) without lossless intermediate video.
+
+    ``threads`` sets libvmaf's frame-level thread pool (0 = one thread; the
+    score is identical either way).  ``vmaf_only`` skips the PSNR, SSIM and
+    MS-SSIM features, which dominate the run time.  ``fifo_root`` moves the
+    private named pipes out of the output's directory: a FIFO inside a job tree
+    makes the storage accounting refuse that tree while the pipe exists.
+    """
 
     if os.name != "posix" or not hasattr(os, "mkfifo"):
         raise StreamedVmafError("streamed VMAF requires POSIX named pipes")
+    if threads < 0:
+        raise StreamedVmafError("VMAF thread count cannot be negative")
     script = script.resolve(strict=True)
     encoded = encoded.resolve(strict=True)
     output = output.resolve(strict=False)
     output.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    pipe_parent = output.parent
+    if fifo_root is not None:
+        pipe_parent = fifo_root.resolve(strict=False)
+        pipe_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    features = () if vmaf_only else VMAF_EXTRA_FEATURES
     for executable in (vspipe, ffmpeg, vmaf):
         if shutil.which(executable) is None:
             raise StreamedVmafError(
@@ -137,7 +170,7 @@ def run_streamed_vmaf(
     processes: list[subprocess.Popen[bytes]] = []
     prior_handlers: dict[int, object] = {}
     with tempfile.TemporaryDirectory(
-        prefix=".vmaf-stream-", dir=output.parent
+        prefix=".vmaf-stream-", dir=pipe_parent
     ) as temporary:
         temporary_root = Path(temporary)
         reference_fifo = temporary_root / "reference.y4m"
@@ -150,9 +183,10 @@ def run_streamed_vmaf(
             reference_fifo,
             encoded_fifo,
             partial_output,
-            threads=0,
+            threads=threads,
             vmaf=vmaf,
             model=model,
+            features=features,
         )
         reference_server = [
             vspipe,
@@ -249,7 +283,7 @@ def run_streamed_vmaf(
         document["bdencode"] = {
             "backend": "official-libvmaf-cli",
             "model": model,
-            "additional_features": ["psnr", "float_ssim", "float_ms_ssim"],
+            "additional_features": list(features),
             "preprocessing": (
                 "hdr10-pq-to-bt709-mobius-proof-transform"
                 if hdr10
@@ -270,7 +304,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--hdr10", action="store_true")
     parser.add_argument("--model", default="vmaf_v0.6.1")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="libvmaf frame-level threads; 0 keeps one thread (the score is the same)",
+    )
+    parser.add_argument(
+        "--vmaf-only",
+        action="store_true",
+        help="skip the PSNR, SSIM and MS-SSIM features and compute only VMAF",
+    )
+    parser.add_argument(
+        "--fifo-root",
+        type=Path,
+        default=None,
+        help="directory for the private named pipes (default: next to --output)",
+    )
     args = parser.parse_args(argv)
+    if args.threads < 0:
+        parser.error("--threads cannot be negative")
     try:
         run_streamed_vmaf(
             args.script,
@@ -278,6 +331,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output,
             hdr10=args.hdr10,
             model=args.model,
+            threads=args.threads,
+            vmaf_only=args.vmaf_only,
+            fifo_root=args.fifo_root,
         )
     except (OSError, StreamedVmafError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"bdencode-vmaf: {exc}\n")

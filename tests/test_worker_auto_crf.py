@@ -141,6 +141,29 @@ def test_prepare_searches_crf_and_encodes_with_the_chosen_value(context) -> None
     assert events.count("worker.auto-crf-probe") == len(report["probes"])
 
 
+def test_probe_scoring_is_fast_and_keeps_named_pipes_out_of_the_job_tree(
+    context,
+) -> None:
+    database, settings, worker, runner, ready = ready_job(
+        context, auto_selection(target_vmaf=95.0), lambda crf: 120.0 - 1.4 * crf
+    )
+
+    worker.process_one_stage(ready)
+
+    scoring = [command for command in runner.commands if command[0] == "bdencode-vmaf"]
+    assert scoring, "no probe was scored"
+    job_root = settings.job_root(ready.id)
+    for command in scoring:
+        # Only the VMAF score steers the search; libvmaf gets a thread pool.
+        assert "--vmaf-only" in command
+        assert int(command[command.index("--threads") + 1]) >= 1
+        # A FIFO inside the job tree makes the storage accounting refuse the
+        # whole job while a probe is being scored.
+        fifo_root = Path(command[command.index("--fifo-root") + 1])
+        assert fifo_root == settings.cache_root / "vmaf"
+        assert job_root not in fifo_root.parents
+
+
 def test_probe_checkpoints_survive_a_crash_and_are_not_repeated(context) -> None:
     database, settings, worker, runner, ready = ready_job(
         context, auto_selection(target_vmaf=95.0), lambda crf: 120.0 - 1.4 * crf
@@ -177,6 +200,27 @@ def test_unreachable_target_sends_the_job_to_review(context) -> None:
         command[0] == "ffmpeg" and command[-1].endswith("video-encoded.partial.mkv")
         for command in runner.commands
     )
+
+
+def test_ceiling_outcome_explains_itself_in_the_event(context) -> None:
+    # A very easy title: the target is met even at the highest allowed CRF.
+    database, settings, worker, runner, ready = ready_job(
+        context, auto_selection(target_vmaf=95.0), lambda crf: 99.5
+    )
+
+    prepared = worker.process_one_stage(ready)
+
+    assert prepared.state is JobState.ENCODING
+    paths = JobPaths.create(settings, ready.id)
+    report = json.loads((paths.analysis / "crf-search.json").read_text("utf-8"))
+    assert report["status"] == "max_crf_reached" and report["chosen_crf"] == 26.0
+    message = next(
+        event.message
+        for event in database.list_events(job_id=ready.id)
+        if event.kind == "worker.auto-crf"
+    )
+    assert "CRF 26" in message
+    assert "highest allowed CRF" in message and "max_crf" in message
 
 
 def test_changing_the_selection_invalidates_a_stale_crf_report(context) -> None:

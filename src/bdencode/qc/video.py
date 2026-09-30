@@ -1213,6 +1213,11 @@ def parse_cropdetect(
     return result
 
 
+#: Metrics libvmaf computes next to VMAF itself.  They are the expensive part
+#: (about 85% of the time on one thread) and only the QC report uses them.
+VMAF_EXTRA_FEATURES: tuple[str, ...] = ("psnr", "float_ssim", "float_ms_ssim")
+
+
 def standalone_vmaf_command(
     reference_y4m: Path,
     encoded_y4m: Path,
@@ -1221,11 +1226,16 @@ def standalone_vmaf_command(
     threads: int = 0,
     vmaf: str = "vmaf",
     model: str = "vmaf_v0.6.1",
+    features: Sequence[str] = VMAF_EXTRA_FEATURES,
 ) -> list[str]:
-    """Build the official libvmaf CLI command for files or named pipes."""
+    """Build the official libvmaf CLI command for files or named pipes.
+
+    ``threads`` is libvmaf's frame-level thread pool: 0 keeps everything on one
+    thread.  The score does not depend on it (bit-identical in measurement).
+    """
     if threads < 0:
         raise ValueError("VMAF thread count cannot be negative")
-    return [
+    command = [
         vmaf,
         "--reference",
         str(reference_y4m),
@@ -1233,18 +1243,13 @@ def standalone_vmaf_command(
         str(encoded_y4m),
         "--model",
         f"version={model}",
-        "--feature",
-        "psnr",
-        "--feature",
-        "float_ssim",
-        "--feature",
-        "float_ms_ssim",
-        "--threads",
-        str(threads),
-        "--output",
-        str(output_json),
-        "--json",
     ]
+    for feature in features:
+        command.extend(("--feature", feature))
+    command.extend(
+        ("--threads", str(threads), "--output", str(output_json), "--json")
+    )
+    return command
 
 
 def _escape_filter_path(path: Path) -> str:

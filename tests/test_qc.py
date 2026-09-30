@@ -708,6 +708,23 @@ def test_official_vmaf_cli_plan_uses_y4m_sidecars() -> None:
     assert "float_ms_ssim" in command
 
 
+def test_vmaf_only_plan_drops_the_slow_extra_features() -> None:
+    command = standalone_vmaf_command(
+        Path("reference.y4m"),
+        Path("encode.y4m"),
+        Path("vmaf.json"),
+        threads=8,
+        features=(),
+    )
+    assert "--feature" not in command
+    assert command[command.index("--threads") + 1] == "8"
+    assert command[command.index("--model") + 1] == "version=vmaf_v0.6.1"
+    with pytest.raises(ValueError, match="cannot be negative"):
+        standalone_vmaf_command(
+            Path("a.y4m"), Path("b.y4m"), Path("c.json"), threads=-1
+        )
+
+
 def test_streamed_vmaf_wrapper_records_hdr_mode() -> None:
     command = streamed_vmaf_command(
         Path("reference.vpy"),
@@ -719,6 +736,43 @@ def test_streamed_vmaf_wrapper_records_hdr_mode() -> None:
     assert command[0] == "bdencode-vmaf"
     assert "--hdr10" in command
     assert command[command.index("--model") + 1] == "vmaf_4k_v0.6.1"
+
+
+def test_streamed_vmaf_wrapper_adds_the_speed_options_only_when_asked() -> None:
+    plain = streamed_vmaf_command(
+        Path("reference.vpy"), Path("encode.mkv"), Path("vmaf.json"), hdr10=False
+    )
+    assert plain == [
+        "bdencode-vmaf",
+        "--script",
+        "reference.vpy",
+        "--encoded",
+        "encode.mkv",
+        "--output",
+        "vmaf.json",
+    ]
+
+    fast = streamed_vmaf_command(
+        Path("reference.vpy"),
+        Path("encode.mkv"),
+        Path("vmaf.json"),
+        hdr10=False,
+        threads=8,
+        vmaf_only=True,
+        fifo_root=Path("cache/vmaf"),
+    )
+    assert fast[: len(plain)] == plain
+    assert fast[len(plain) :] == [
+        "--threads",
+        "8",
+        "--vmaf-only",
+        "--fifo-root",
+        str(Path("cache/vmaf")),
+    ]
+    with pytest.raises(ValueError, match="cannot be negative"):
+        streamed_vmaf_command(
+            Path("a.vpy"), Path("b.mkv"), Path("c.json"), hdr10=False, threads=-2
+        )
 
 
 @pytest.mark.parametrize(
