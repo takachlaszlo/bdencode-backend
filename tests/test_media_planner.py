@@ -516,6 +516,40 @@ def test_language_resolution_keeps_provenance_conflicts_and_override() -> None:
     assert cantonese.bcp47 == "yue"
 
 
+def test_strong_content_contradicts_mpls_clpi_even_when_pmt_dissents() -> None:
+    resolver = LanguageResolver()
+    # A dissenting PMT tag must not weaken the safeguard that unanimous
+    # declarations already receive against a confident content result.
+    for content_language in ("deu", "fra"):
+        decision = resolver.resolve(
+            mpls="eng",
+            clpi="eng",
+            pmt="fra",
+            audio_lid=content_language,
+            audio_confidence=0.95,
+        )
+        assert decision.iso639_2t == content_language
+        assert decision.status is LanguageStatus.CONFLICT
+        assert decision.needs_review
+
+
+def test_mpls_clpi_agreement_still_wins_without_strong_contrary_content() -> None:
+    resolver = LanguageResolver()
+    weak = resolver.resolve(
+        mpls="eng", clpi="eng", pmt="fra", audio_lid="deu", audio_confidence=0.6
+    )
+    assert weak.iso639_2t == "eng"
+    assert weak.status is LanguageStatus.DECLARED
+    assert not weak.needs_review
+
+    agreeing = resolver.resolve(
+        mpls="eng", clpi="eng", pmt="fra", audio_lid="eng", audio_confidence=0.95
+    )
+    assert agreeing.iso639_2t == "eng"
+    assert agreeing.status is LanguageStatus.DECLARED
+    assert not agreeing.needs_review
+
+
 class FakeRunner:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
@@ -618,3 +652,137 @@ def test_scanner_is_source_guarded_capability_based_and_mockable(
     (outside / "BDMV" / "STREAM").mkdir()
     with pytest.raises(ValueError, match="within"):
         scanner.scan(outside)
+
+
+class _CountingRunner:
+    """Answers every playlist probe and records which playlists were probed."""
+
+    def __init__(self) -> None:
+        self.probed: list[str] = []
+
+    def capture(self, argv, *, timeout: float = 30, check: bool = True):
+        arguments = [str(item) for item in argv]
+        if "-show_streams" in arguments:
+            self.probed.append(arguments[arguments.index("-playlist") + 1])
+            payload = {"format": {"duration": "10"}, "streams": []}
+            return type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""},
+            )()
+        return type("Result", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+
+
+def _decoy_disc(tmp_path: Path, count: int) -> tuple[Path, Path]:
+    storage = tmp_path / "storage"
+    disc = storage / "Obfuscated"
+    (disc / "BDMV" / "PLAYLIST").mkdir(parents=True)
+    (disc / "BDMV" / "STREAM").mkdir(parents=True)
+    for index in range(count):
+        (disc / "BDMV" / "PLAYLIST" / f"{index:05d}.mpls").write_bytes(b"MPL0200")
+    return storage, disc
+
+
+def test_scanner_limit_also_bounds_playlists_reported_by_native_metadata(
+    tmp_path: Path,
+) -> None:
+    storage, disc = _decoy_disc(tmp_path, 400)
+    native = {
+        "playlists": [
+            {
+                "id": f"{index:05d}",
+                "duration": 5400 if index == 377 else 10 + (index % 7),
+                "recommended": index == 199,
+            }
+            for index in range(400)
+        ]
+    }
+    runner = _CountingRunner()
+    scanner = BluRayScanner(
+        runner=runner,
+        capabilities=ToolCapabilities(ffprobe="/usr/bin/ffprobe", ffprobe_bluray=True),
+        libbluray_provider=lambda _: native,
+        source_root=storage,
+        max_playlists=32,
+    )
+
+    result = scanner.scan(disc)
+
+    assert len(runner.probed) == 32
+    assert len(result.playlists) == 32
+    kept = {item.playlist_id for item in result.playlists}
+    # The backend-recommended playlist and the longest one always survive.
+    assert {"00199", "00377"} <= kept
+    assert any("scanned 32 of 400 playlists" in item for item in result.warnings)
+
+
+def test_scanner_below_the_limit_probes_every_playlist_without_a_warning(
+    tmp_path: Path,
+) -> None:
+    storage, disc = _decoy_disc(tmp_path, 5)
+    native = {"playlists": [{"id": f"{index:05d}", "duration": 10} for index in range(5)]}
+    runner = _CountingRunner()
+    scanner = BluRayScanner(
+        runner=runner,
+        capabilities=ToolCapabilities(ffprobe="/usr/bin/ffprobe", ffprobe_bluray=True),
+        libbluray_provider=lambda _: native,
+        source_root=storage,
+        max_playlists=32,
+    )
+
+    result = scanner.scan(disc)
+
+    assert len(runner.probed) == 5
+    assert not any("safety limit" in item for item in result.warnings)
+
+
+def test_native_only_scan_respects_the_playlist_limit(tmp_path: Path) -> None:
+    storage, disc = _decoy_disc(tmp_path, 50)
+    native = {
+        "playlists": [
+            {"id": f"{index:05d}", "duration": 100 + index, "streams": []}
+            for index in range(50)
+        ]
+    }
+    scanner = BluRayScanner(
+        runner=_CountingRunner(),
+        capabilities=ToolCapabilities(libbluray_json="/usr/bin/scan"),
+        libbluray_provider=lambda _: native,
+        source_root=storage,
+        max_playlists=10,
+    )
+
+    result = scanner.scan(disc)
+
+    assert [item.playlist_id for item in result.playlists] == [
+        f"{index:05d}" for index in range(40, 50)
+    ]
+
+
+def test_series_episode_numbers_follow_playlist_order_not_runtime(
+    tmp_path: Path,
+) -> None:
+    storage, disc = _decoy_disc(tmp_path, 4)
+    durations = {0: 2700, 1: 2520, 2: 2800, 3: 120}  # the last one is a trailer
+    native = {
+        "playlists": [
+            {"id": f"{index:05d}", "duration": duration}
+            for index, duration in durations.items()
+        ]
+    }
+    scanner = BluRayScanner(
+        runner=_CountingRunner(),
+        capabilities=ToolCapabilities(libbluray_json="/usr/bin/scan"),
+        libbluray_provider=lambda _: native,
+        source_root=storage,
+    )
+
+    result = scanner.scan(disc, content_kind="series")
+
+    numbering = {item.playlist_id: item.episode_number for item in result.playlists}
+    assert numbering == {"00000": 1, "00001": 2, "00002": 3, "00003": None}
+    assert {item.playlist_id for item in result.playlists if item.recommended} == {
+        "00000",
+        "00001",
+        "00002",
+    }

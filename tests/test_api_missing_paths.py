@@ -117,3 +117,34 @@ def test_unreadable_source_directory_is_a_client_error(
     monkeypatch.setattr(Path, "iterdir", deny)
     response = client.get("/api/v1/sources", params={"path": str(locked)})
     assert response.status_code == 422
+
+
+def test_analyzing_a_non_mkv_file_is_a_client_error(tmp_path: Path) -> None:
+    client, settings, _ = _client(tmp_path)
+    target = settings.completed_root / "notes.txt"
+    target.write_text("not media", encoding="utf-8")
+    response = client.get("/api/v1/analyze-mkv", params={"path": str(target)})
+    assert response.status_code == 422
+    assert "existing MKV" in response.json()["detail"]
+
+
+def test_a_failing_media_tool_is_reported_without_leaking_its_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    from bdencode import api as api_module
+
+    class Failing:
+        def analyze(self, _path: Path) -> object:
+            raise subprocess.CalledProcessError(
+                2, ["mkvmerge"], output="", stderr="secret /home/user/path"
+            )
+
+    monkeypatch.setattr(api_module, "MkvAnalyzer", Failing)
+    client, settings, _ = _client(tmp_path)
+    target = settings.completed_root / "movie.mkv"
+    target.write_bytes(b"\x1a\x45\xdf\xa3")
+    response = client.get("/api/v1/analyze-mkv", params={"path": str(target)})
+    assert response.status_code == 422
+    assert "secret" not in response.text and "/home/user" not in response.text

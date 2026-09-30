@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import threading
 from dataclasses import asdict
 from pathlib import Path
@@ -672,7 +673,15 @@ def create_app(
             or target.is_relative_to(settings.jobs_root)
         ):
             raise ConfigurationError("MKV analysis is limited to job/completed roots")
-        return MkvAnalyzer().analyze(target).to_dict()
+        try:
+            return MkvAnalyzer().analyze(target).to_dict()
+        except ValueError as exc:
+            # Not an MKV, or a media tool produced an unusable document.
+            raise ConfigurationError(f"MKV analysis rejected the file: {exc}") from exc
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise ConfigurationError(
+                "MKV analysis failed; the file could not be inspected"
+            ) from exc
 
     @application.post(
         f"{API_PREFIX}/jobs", response_model=Job, status_code=status.HTTP_201_CREATED
