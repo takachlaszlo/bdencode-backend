@@ -3,15 +3,26 @@ import type {
   AIRecommendationResponse,
   AIRecommendationStatus,
   ArtifactList,
+  BackupInfo,
+  BackupList,
   CapabilitiesResponse,
+  DatabaseStatus,
   DetailLevel,
   EventList,
   HealthResponse,
   Job,
   JobCreate,
   JobList,
+  JobStatistics,
   JobStorageReport,
   JobState,
+  LibraryImportResult,
+  LibraryProfile,
+  LibraryProfileDocument,
+  LibraryProfileList,
+  NoiseProfilesResponse,
+  PlayerInfo,
+  PreviewRecord,
   ProfileRecommendationResponse,
   ProfileSchemaResponse,
   ReleaseMetadataPayload,
@@ -24,6 +35,7 @@ import type {
   SelectionPayload,
   SelectionValidation,
   SourceBrowserResponse,
+  StatisticsResponse,
   TrackerReleaseProfile,
 } from "./types";
 
@@ -265,6 +277,50 @@ export const api = {
     apiFetch<ProfileRecommendationResponse>(
       `/profiles/${encoder}/recommendation?detail_level=${detail}&content_type=${encodeURIComponent(contentType.toLowerCase())}`,
     ),
+  noiseProfiles: (encoder: "x264" | "x265", contentType: string) =>
+    apiFetch<NoiseProfilesResponse>(
+      `/profiles/${encoder}/noise-profiles?content_type=${encodeURIComponent(contentType.toLowerCase())}`,
+    ),
+  profileLibrary: () => apiFetch<LibraryProfileList>("/profile-library"),
+  saveLibraryProfile: (document: LibraryProfileDocument, overwrite = false) =>
+    apiFetch<LibraryProfile>(`/profile-library${overwrite ? "?overwrite=true" : ""}`, {
+      method: "POST",
+      body: JSON.stringify(document),
+    }),
+  deleteLibraryProfile: (id: string) =>
+    apiFetch<void>(`/profile-library/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  exportLibraryProfile: (id: string) =>
+    apiFetch<Record<string, unknown>>(`/profile-library/${encodeURIComponent(id)}/export`),
+  exportLibrary: () => apiFetch<Record<string, unknown>>("/profile-library/export"),
+  importLibraryProfiles: (
+    document: Record<string, unknown>,
+    onConflict: "rename" | "skip" | "overwrite" = "rename",
+  ) =>
+    apiFetch<LibraryImportResult>(`/profile-library/import?on_conflict=${onConflict}`, {
+      method: "POST",
+      body: JSON.stringify(document),
+    }),
+  statistics: (limit = 200) => apiFetch<StatisticsResponse>(`/statistics?limit=${limit}`),
+  jobStatistics: (id: string) =>
+    apiFetch<JobStatistics>(`/jobs/${encodeURIComponent(id)}/statistics`),
+  playerInfo: (jobId: string) =>
+    apiFetch<PlayerInfo>(`/jobs/${encodeURIComponent(jobId)}/player`),
+  createPreview: (
+    jobId: string,
+    request: { start_seconds: number; duration_seconds: number; height: number },
+  ) =>
+    apiFetch<PreviewRecord>(`/jobs/${encodeURIComponent(jobId)}/previews`, {
+      method: "POST",
+      body: JSON.stringify(request),
+    }),
+  deletePreview: (jobId: string, name: string) =>
+    apiFetch<void>(
+      `/jobs/${encodeURIComponent(jobId)}/previews/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+  databaseStatus: () => apiFetch<DatabaseStatus>("/system/database"),
+  backups: () => apiFetch<BackupList>("/system/backups"),
+  createBackup: () => apiFetch<BackupInfo>("/system/backups", { method: "POST" }),
   aiRecommendationStatus: () =>
     apiFetch<AIRecommendationStatus>("/ai-recommendation/status"),
   aiRecommendation: (id: string, request: AIRecommendationRequest) =>
@@ -290,6 +346,10 @@ export const api = {
       }),
     }),
 };
+
+export function previewUrl(jobId: string, name: string): string {
+  return `${API_ROOT}/jobs/${encodeURIComponent(jobId)}/previews/${encodeURIComponent(name)}`;
+}
 
 export function artifactContentUrl(id: string): string {
   return `${API_ROOT}/artifacts/${encodeURIComponent(id)}/content`;

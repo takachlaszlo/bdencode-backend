@@ -13,6 +13,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { api } from "../api/client";
+import { BackupsPanel } from "../components/BackupsPanel";
 import { Badge, Button, Card, LoadingPanel, Notice, PageHeader, ProgressBar } from "../components/ui";
 import { formatBytes, humanize } from "../utils";
 
@@ -68,7 +69,7 @@ export function SystemPage() {
       <PageHeader
         eyebrow="Rendszer"
         title="Szerver és képességek"
-        description="Csak olvasható állapotlap a telepített eszközökről és a backend biztonsági korlátairól."
+        description="A telepített eszközök, a backend biztonsági korlátai és az adatbázis mentései."
         actions={<Button variant="secondary" icon={<RefreshCw size={17} />} onClick={refresh} loading={health.isFetching || runtime.isFetching}>Frissítés</Button>}
       />
       {(health.isLoading || runtime.isLoading) ? <LoadingPanel label="Rendszeradatok betöltése…" /> : health.isError || runtime.isError ? <Notice tone="danger" title="A rendszerállapot nem olvasható">Az API vagy a runtime-capabilities endpoint nem elérhető.</Notice> : (
@@ -110,7 +111,7 @@ export function SystemPage() {
                   <li><CheckCircle2 size={16} /> Scan és beállítás a futó encode mellett is</li>
                   <li><CheckCircle2 size={16} /> CPU-kapacitás legfeljebb 80%-a</li>
                   <li><CheckCircle2 size={16} /> 3D kimenet tiltva</li>
-                  <li><CheckCircle2 size={16} /> Dolby Vision helyett kizárólag HDR10</li>
+                  <li><CheckCircle2 size={16} /> Alapból csak statikus HDR10; a dinamikus HDR megtartása opcionális és ellenőrzött</li>
                   <li><CheckCircle2 size={16} /> Comparison képek veszteségmentes PNG-ben</li>
                 </ul>
               </Card>
@@ -162,6 +163,8 @@ export function SystemPage() {
               </Card>
             </div>
           </div>
+
+          <BackupsPanel />
 
           {runtime.data?.warnings && runtime.data.warnings.length > 0 && <Notice tone="warning" title="Runtime figyelmeztetések"><ul>{runtime.data.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></Notice>}
           <details className="runtime-raw"><summary>{humanize("runtime_capabilities")} JSON</summary><pre>{JSON.stringify(runtime.data, null, 2)}</pre></details>

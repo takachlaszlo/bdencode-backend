@@ -178,4 +178,46 @@ describe("ComparisonPanel", () => {
     expect(await screen.findByText("Source képtípus nem értelmezhető · azonos frame")).toBeInTheDocument();
     expect(screen.queryByText(/eltérő típus/)).not.toBeInTheDocument();
   });
+
+  it("opens a pixel-level inspector for a frame pair and steps between pairs", async () => {
+    const user = userEvent.setup();
+    const twoPairs: VideoComparisonManifest = {
+      ...videoManifest,
+      counts: { I: 1, P: 1, B: 0 },
+      pairs: [
+        videoManifest.pairs[0],
+        { ...videoManifest.pairs[0], category: "P", presentation_index: 48, encoded_pict_type: "P", source_pict_type: "P", reference_png: "p-source.png", encode_png: "p-encode.png" },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse(twoPairs))),
+    );
+    const artifacts = [
+      makeArtifact({ id: "video-manifest", kind: "VIDEO_COMPARISON", name: "video-comparison.json", mime_type: "application/json" }),
+      ...["i-source", "i-encode", "p-source", "p-encode"].map((id) =>
+        makeArtifact({ id, kind: "VIDEO_COMPARISON", name: `${id}.png`, mime_type: "image/png" }),
+      ),
+    ];
+
+    renderApp(<ComparisonPanel artifacts={artifacts} />);
+
+    const openers = await screen.findAllByRole("button", { name: /Nagyítás és pixelnézet/ });
+    expect(openers).toHaveLength(2);
+    await user.click(openers[0]);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("I-frame #12 — pixelnézet");
+    expect(screen.getByAltText("Forrás")).toHaveAttribute("src", expect.stringContaining("/artifacts/i-source/content"));
+    expect(screen.getByAltText("Encode")).toHaveAttribute("src", expect.stringContaining("/artifacts/i-encode/content"));
+    expect(screen.getByRole("button", { name: "Előző" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Következő" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("P-frame #48 — pixelnézet");
+    expect(screen.getByAltText("Forrás")).toHaveAttribute("src", expect.stringContaining("/artifacts/p-source/content"));
+    expect(screen.getByRole("button", { name: "Következő" })).toBeDisabled();
+
+    await user.click(screen.getAllByRole("button", { name: "Bezárás" }).at(-1)!);
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
 });

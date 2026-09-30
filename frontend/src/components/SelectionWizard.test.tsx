@@ -48,6 +48,8 @@ vi.mock("../api/client", async (importOriginal) => {
       aiRecommendation: vi.fn(),
       validateSelection: vi.fn(),
       saveSelection: vi.fn(),
+      noiseProfiles: vi.fn(),
+      profileLibrary: vi.fn(),
     },
   };
 });
@@ -107,6 +109,31 @@ describe("SelectionWizard", () => {
       rationale: ["A scan progresszív 1080p filmet mutat."],
       warnings: ["A célméret CRF mellett tájékoztató."],
       confidence: 0.91,
+    });
+    vi.mocked(api.noiseProfiles).mockResolvedValue({
+      encoder: "x264",
+      requires_operator_confirmation: true,
+      profiles: [
+        { id: "off", label: "Nincs", description: "Nincs külön kezelés.", settings: { noise_reduction: 0, tune: "film" } },
+        { id: "medium_denoise", label: "Közepes zajszűrés", description: "nr 120", settings: { noise_reduction: 120, tune: "film" } },
+      ],
+    });
+    vi.mocked(api.profileLibrary).mockResolvedValue({
+      count: 1,
+      items: [
+        {
+          id: "kedvenc",
+          name: "Kedvenc",
+          description: "",
+          encoder: "x264",
+          detail_level: "beginner",
+          settings: { crf: 16.5 },
+          auto_crf: { enabled: true, target_vmaf: 93 },
+          created_at: "2026-05-01T10:00:00+00:00",
+          updated_at: "2026-05-01T10:00:00+00:00",
+          selection: { detail_level: "beginner", settings: { crf: 16.5 }, auto_crf: { enabled: true, target_vmaf: 93 } },
+        },
+      ],
     });
     vi.mocked(api.validateSelection).mockResolvedValue(validation);
     vi.mocked(api.saveSelection).mockResolvedValue(
@@ -393,5 +420,89 @@ describe("SelectionWizard", () => {
     await user.click(view.getByRole("button", { name: "Terv újraellenőrzése" }));
     expect(await view.findByText("A terv érvényes")).toBeInTheDocument();
     expect(api.validateSelection).toHaveBeenCalledTimes(2);
+  });
+
+  it("sends the automatic CRF search, a noise preset and a library profile with the selection", async () => {
+    const user = userEvent.setup();
+    renderApp(
+      <SelectionWizard job={makeJob({ state: "AWAITING_SELECTION" })} scan={makeScan()} onComplete={vi.fn()} />,
+    );
+
+    await waitFor(() => expect(api.profileRecommendation).toHaveBeenCalled());
+    await user.click(screen.getByRole("button", { name: "Tovább" }));
+    await user.click(screen.getByRole("button", { name: "E-AC-3" }));
+    await user.click(screen.getByRole("button", { name: "Tovább" }));
+    expect(screen.getByRole("heading", { name: "Minőségi opciók" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("Dinamikus HDR")).not.toBeInTheDocument();
+
+    // A noise preset merges its concrete settings into the editable fields.
+    const noise = await screen.findByLabelText("Zaj- és szemcseprofil");
+    await waitFor(() => expect(noise).toBeEnabled());
+    await user.selectOptions(noise, "medium_denoise");
+
+    // Turning the automatic CRF search on and tuning its target.
+    await user.click(screen.getByRole("checkbox", { name: /A worker rövid mintakódolásokból/ }));
+    const target = screen.getByLabelText("Cél VMAF");
+    await user.clear(target);
+    await user.type(target, "94.5");
+
+    await user.click(screen.getByRole("button", { name: "Tovább" }));
+    await user.click(screen.getByRole("button", { name: "Terv ellenőrzése" }));
+
+    await waitFor(() => expect(api.validateSelection).toHaveBeenCalledTimes(1));
+    const video = vi.mocked(api.validateSelection).mock.calls[0][1].video;
+    expect(video.auto_crf).toEqual({ enabled: true, target_vmaf: 94.5 });
+    expect(video.settings).toEqual(expect.objectContaining({ noise_reduction: 120, tune: "film" }));
+    expect(video).not.toHaveProperty("dynamic_hdr");
+  });
+
+  it("applies a library profile: its settings, automatic CRF and HDR policy replace the editable state", async () => {
+    const user = userEvent.setup();
+    renderApp(
+      <SelectionWizard job={makeJob({ state: "AWAITING_SELECTION" })} scan={makeScan()} onComplete={vi.fn()} />,
+    );
+
+    await waitFor(() => expect(api.profileRecommendation).toHaveBeenCalled());
+    await user.click(screen.getByRole("button", { name: "Tovább" }));
+    await user.click(screen.getByRole("button", { name: "E-AC-3" }));
+    await user.click(screen.getByRole("button", { name: "Tovább" }));
+
+    await user.click(await screen.findByRole("button", { name: "Kedvenc alkalmazása" }));
+    expect(screen.getByLabelText("Cél VMAF")).toHaveValue(93);
+
+    await user.click(screen.getByRole("button", { name: "Tovább" }));
+    await user.click(screen.getByRole("button", { name: "Terv ellenőrzése" }));
+
+    await waitFor(() => expect(api.validateSelection).toHaveBeenCalledTimes(1));
+    const video = vi.mocked(api.validateSelection).mock.calls[0][1].video;
+    expect(video.auto_crf).toEqual({ enabled: true, target_vmaf: 93 });
+    expect(video.settings).toEqual(expect.objectContaining({ crf: 16.5 }));
+  });
+
+  it("restores the saved quality options when a selection is reopened", async () => {
+    const user = userEvent.setup();
+    const job = makeJob({
+      state: "NEEDS_REVIEW",
+      selection: {
+        schema_version: 2,
+        playlist_id: "00001",
+        angle: 1,
+        video: {
+          detail_level: "beginner",
+          temporal_filter: "progressive",
+          crop: { left: 0, top: 0, right: 0, bottom: 0 },
+          settings: { crf: 17 },
+          auto_crf: { enabled: true, target_vmaf: 92 },
+        },
+        tracks: [],
+        output_name: "Mintafilm.1080p.BluRay.x264",
+        upload_images: false,
+      },
+    });
+    renderApp(<SelectionWizard job={job} scan={makeScan()} onComplete={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "Tovább" }));
+    await user.click(screen.getByRole("button", { name: "Tovább" }));
+    expect(await screen.findByLabelText("Cél VMAF")).toHaveValue(92);
   });
 });
