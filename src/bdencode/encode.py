@@ -99,6 +99,7 @@ def encode_pipeline_commands(
     settings: EncoderSettings,
     *,
     metadata: Mapping[str, Any] | None = None,
+    extra_video_params: Mapping[str, str | int | float] | None = None,
     vspipe: str = "vspipe",
     ffmpeg: str = "ffmpeg",
 ) -> list[list[str]]:
@@ -123,7 +124,7 @@ def encode_pipeline_commands(
         "-map",
         "0:v:0",
         "-an",
-        *settings.ffmpeg_video_args(),
+        *settings.ffmpeg_video_args(extra_video_params),
         "-map_metadata",
         "-1",
     ]

@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import __version__
 from .audio import AUDIO_ACTIONS, audio_presets_payload
+from .capabilities import dynamic_hdr_support
+from .crf_search import AutoCrfConfig
 from .ai_recommendation import (
     AIRecommendationError,
     AIRecommendationRequest,
@@ -81,8 +83,10 @@ from .media.profiles import (
     profile_schema,
     recommended_profile,
 )
+from .media.noise_profiles import noise_profiles, preset_settings
 from .media.planner import EncodePlanner, EncodeRequest
 from .analyzer import MkvAnalyzer
+from .api_extras import register_extra_routes
 from .release import ReleaseMetadata, ReleasePreparationState
 from .release_profiles import RELEASE_PROFILE_VALIDATION_ERROR
 from .release_service import (
@@ -97,6 +101,7 @@ from .worker import (
     _planner_crop,
     _scan_from_dict,
     parse_selection,
+    resolve_selection_dynamic_hdr,
 )
 
 
@@ -442,7 +447,11 @@ def create_app(
                 "tracker_publish_requires_dupe_receipt": True,
                 "cpu_budget_fraction": 0.8,
                 "supports_3d": False,
-                "dolby_vision_retention": False,
+                "dolby_vision_retention": True,
+                "dolby_vision_retention_status": "experimental",
+                "dynamic_hdr_modes": ["discard", "auto", "hdr10plus", "dolby_vision"],
+                "auto_crf": True,
+                "auto_crf_defaults": AutoCrfConfig().to_dict(),
                 "hdr_modes": ["SDR", "HDR10"],
                 "comparison_images": "lossless PNG",
                 "ai_recommendation": True,
@@ -482,6 +491,26 @@ def create_app(
             "source": "deterministic_expert_rules",
             "requires_operator_confirmation": True,
             "settings": profile.to_dict(),
+        }
+
+    @application.get(f"{API_PREFIX}/profiles/{{encoder}}/noise-profiles")
+    def encoder_noise_profiles(
+        encoder: VideoEncoder, content_type: str = "film"
+    ) -> dict[str, object]:
+        """Grain/noise presets as concrete, editable encoder settings."""
+
+        return {
+            "encoder": encoder.value,
+            "requires_operator_confirmation": True,
+            "profiles": [
+                {
+                    **item.to_dict(),
+                    "settings": preset_settings(
+                        encoder, item.id, content_type=content_type
+                    ),
+                }
+                for item in noise_profiles(encoder)
+            ],
         }
 
     @application.get(f"{API_PREFIX}/ai-recommendation/status")
@@ -794,6 +823,7 @@ def create_app(
         except (KeyError, TypeError, ValueError) as exc:
             raise ConfigurationError(f"stored scan result is invalid: {exc}") from exc
 
+        dynamic_plan = resolve_selection_dynamic_hdr(scan, selection)
         work_root = (
             settings.data_root if settings is not None else Path.cwd()
         ).resolve(strict=False)
@@ -811,12 +841,28 @@ def create_app(
                     crop=_planner_crop(selection.crop),
                     angle=selection.angle,
                     overwrite=True,
+                    dynamic_hdr=dynamic_plan.mode.value,
                 )
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ConfigurationError(
                 f"selection cannot be planned safely: {exc}"
             ) from exc
+        hdr_warnings: list[str] = []
+        if dynamic_plan.retained:
+            support = dynamic_hdr_support()[
+                "hdr10plus" if dynamic_plan.mode.value == "hdr10plus" else "dolby_vision"
+            ]
+            if not support["available"]:
+                hdr_warnings.append(
+                    f"Dynamic HDR retention ({dynamic_plan.mode.value}) is selected but "
+                    f"this host cannot perform it yet: {support['tool']} installed="
+                    f"{support['tool_available']}, x265 support={support['x265_supported']}."
+                )
+        elif selection.dynamic_hdr.value == "auto":
+            hdr_warnings.append(
+                f"Dynamic HDR: automatic mode will discard ({dynamic_plan.reason})."
+            )
 
         return SelectionValidationResponse(
             valid=True,
@@ -826,7 +872,19 @@ def create_app(
             ffmpeg_video_args=list(selection.settings.ffmpeg_video_args()),
             crop=asdict(selection.crop),
             temporal_filter=selection.temporal_filter.value,
-            advisory_warnings=list(plan.warnings),
+            advisory_warnings=[
+                *plan.warnings,
+                *hdr_warnings,
+                *(
+                    [
+                        "Automatic CRF search is enabled: the configured CRF is only "
+                        "the starting point; the release CRF is chosen from sample "
+                        f"encodes scored against VMAF {selection.auto_crf.target_vmaf:g}."
+                    ]
+                    if selection.auto_crf.enabled
+                    else []
+                ),
+            ],
         )
 
     @application.post(f"{API_PREFIX}/jobs/{{job_id}}/progress", response_model=Job)
@@ -1551,6 +1609,9 @@ def create_app(
         cursor = items[-1].id if items else after_id
         return EventList(items=items, after_id=cursor)
 
+    register_extra_routes(
+        application, db=db, settings=settings, prefix=API_PREFIX
+    )
     return application
 
 

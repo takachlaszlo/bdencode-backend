@@ -12,6 +12,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .hdr_dynamic import (
+    DOVI_TOOL,
+    HDR10PLUS_TOOL,
+    x265_support_from_help,
+)
 from .process import CommandRunner
 
 
@@ -43,6 +48,8 @@ VERSION_ARGS: dict[str, tuple[str, ...]] = {
     "whisper-cli": ("--help",),
     "vmaf": ("--version",),
     "bdencode-vmaf": ("--help",),
+    "hdr10plus_tool": ("--version",),
+    "dovi_tool": ("--version",),
 }
 
 
@@ -142,3 +149,45 @@ def capability_snapshot(names: Iterable[str] | None = None) -> dict[str, object]
         },
         "ffmpeg": ffmpeg_features(runner),
     }
+
+
+def x265_build_support(runner: CommandRunner | None = None) -> dict[str, bool]:
+    """Whether the installed x265 accepts the dynamic-HDR parameters.
+
+    FFmpeg's libx265 wrapper merely warns about an unknown parameter and then
+    encodes without it, so support has to be established up front.  A missing
+    CLI or a failing probe reports every feature as unsupported (fail closed).
+    """
+
+    if not shutil.which("x265"):
+        return x265_support_from_help("")
+    command_runner = runner or CommandRunner()
+    try:
+        completed = command_runner.capture(["x265", "--help"], check=False)
+        text = f"{completed.stdout}\n{completed.stderr}"
+    except (OSError, TimeoutError, subprocess.SubprocessError):
+        text = ""
+    return x265_support_from_help(text)
+
+
+def dynamic_hdr_support(
+    runner: CommandRunner | None = None,
+) -> dict[str, dict[str, object]]:
+    """Availability of HDR10+ and Dolby Vision retention on this host."""
+
+    command_runner = runner or CommandRunner()
+    build = x265_build_support(command_runner)
+    result: dict[str, dict[str, object]] = {}
+    for mode, tool_name in (
+        ("hdr10plus", HDR10PLUS_TOOL),
+        ("dolby_vision", DOVI_TOOL),
+    ):
+        tool = discover_tool(tool_name, command_runner)
+        result[mode] = {
+            "tool": tool_name,
+            "tool_available": tool.available,
+            "tool_version": tool.version,
+            "x265_supported": build[mode],
+            "available": tool.available and build[mode],
+        }
+    return result

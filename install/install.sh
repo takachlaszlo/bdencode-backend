@@ -536,6 +536,8 @@ env \
     -u BDENCODE_COMPARISON_FRAMES_PER_TYPE \
     -u BDENCODE_AI_MODEL \
     -u BDENCODE_AI_TIMEOUT_SECONDS \
+    -u BDENCODE_BACKUP_INTERVAL_HOURS \
+    -u BDENCODE_BACKUP_KEEP_SCHEDULED \
     -u BDENCODE_LOG_LEVEL \
     "$release_root/venv/bin/python" -m pytest -q "$repo_root/tests"
 

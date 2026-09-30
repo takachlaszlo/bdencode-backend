@@ -276,6 +276,9 @@ class EncodeRequest:
     angle: int = 1
     overwrite: bool = False
     require_explicit_track_selection: bool = True
+    # Resolved retention decision (``discard``, ``hdr10plus`` or
+    # ``dolby_vision``); the planner only words its advisories accordingly.
+    dynamic_hdr: str = "discard"
 
     def __post_init__(self) -> None:
         if isinstance(self.field_handling, str):
@@ -376,11 +379,16 @@ class EncodePlanner:
                     "Dolby Vision source has no confirmed HDR10 base layer"
                 )
             warnings.append(
-                "Dolby Vision enhancement layer and RPU metadata will be discarded; HDR10 base layer only."
+                "Dolby Vision RPU metadata will be retained as profile 8.1 "
+                "(enhancement layer dropped); HDR10 base layer stays intact."
+                if request.dynamic_hdr == "dolby_vision"
+                else "Dolby Vision enhancement layer and RPU metadata will be discarded; HDR10 base layer only."
             )
         if video_stream.video.hdr10_plus:
             warnings.append(
-                "Dynamic HDR10+ metadata will be discarded; output retains static HDR10 only."
+                "Dynamic HDR10+ metadata will be retained frame by frame."
+                if request.dynamic_hdr == "hdr10plus"
+                else "Dynamic HDR10+ metadata will be discarded; output retains static HDR10 only."
             )
 
         self._validate_hdr_and_color(video_stream, request.settings)
@@ -602,8 +610,10 @@ class EncodePlanner:
             "video_policy": video_policy,
             "field_handling": request.field_handling.value,
             "crop": asdict(request.crop),
-            "dynamic_hdr_retained": False,
-            "dolby_vision_retained": False,
+            "dynamic_hdr_retained": request.dynamic_hdr
+            in {"hdr10plus", "dolby_vision"},
+            "dynamic_hdr_mode": request.dynamic_hdr,
+            "dolby_vision_retained": request.dynamic_hdr == "dolby_vision",
             "three_d_retained": False,
             "hdr10_static_retained": bool(effective_settings.hdr10.enabled),
             "track_selections": [

@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
 
+from .hdr_dynamic import DynamicHdrPlan, validate_retained_side_data
+
 
 @dataclass(frozen=True, slots=True)
 class MuxTrack:
@@ -700,12 +702,22 @@ def validate_hdr10_side_data(
     mastering_display: str | None,
     max_cll: int | None,
     max_fall: int | None,
+    allowed_dynamic: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
+    """Check static HDR10 side data; dynamic layers are forbidden unless planned.
+
+    ``allowed_dynamic`` lists the lower-case tokens a retained-HDR plan allows
+    (see :func:`bdencode.hdr_dynamic.allowed_forbidden_tokens`); the presence
+    of the retained layer itself is proven separately.
+    """
+
     errors: list[str] = []
     side_data = [*_side_data(stream_document), *_side_data(frame_document)]
     types = [str(item.get("side_data_type", "")) for item in side_data]
     lowered = "\n".join(types).casefold()
     for forbidden in ("dolby vision", "dovi", "hdr dynamic", "hdr10+"):
+        if forbidden in allowed_dynamic:
+            continue
         if forbidden in lowered:
             errors.append(f"forbidden dynamic HDR side data is present: {forbidden}")
 
@@ -761,3 +773,20 @@ def validate_hdr10_side_data(
                 "HDR10 MaxCLL/MaxFALL differs from the reviewed static metadata"
             )
     return tuple(dict.fromkeys(errors))
+
+
+def validate_dynamic_hdr_output(
+    stream_document: Mapping[str, Any],
+    frame_document: Mapping[str, Any],
+    plan: DynamicHdrPlan,
+) -> tuple[str, ...]:
+    """Prove the retained HDR10+/Dolby Vision layer reached the final MKV."""
+
+    if not plan.retained:
+        return ()
+    side_data = [*_side_data(stream_document), *_side_data(frame_document)]
+    return validate_retained_side_data(
+        [str(item.get("side_data_type", "")) for item in side_data],
+        side_data,
+        plan,
+    )

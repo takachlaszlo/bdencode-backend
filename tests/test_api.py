@@ -637,6 +637,34 @@ def test_selection_validation_returns_effective_plan_without_mutating_job(tmp_pa
         assert events_after == events_before
 
 
+def test_selection_validation_reports_automatic_crf_search(tmp_path):
+    with make_client(tmp_path) as client:
+        job = awaiting_selection_job(client, warnings=[])
+        selection = valid_selection()
+        selection["video"]["auto_crf"] = {"enabled": True, "target_vmaf": 94.5}
+
+        response = client.post(
+            f"/api/v1/jobs/{job['id']}/selection/validate",
+            json={"selection": selection, "expected_version": job["version"]},
+        )
+
+        assert response.status_code == 200
+        warnings = response.json()["advisory_warnings"]
+        assert any("Automatic CRF search" in item and "94.5" in item for item in warnings)
+
+        selection["video"]["auto_crf"]["target_vmaf"] = 40
+        rejected = client.post(
+            f"/api/v1/jobs/{job['id']}/selection/validate",
+            json={"selection": selection, "expected_version": job["version"]},
+        )
+        assert rejected.status_code in {400, 422}
+        assert "automatic CRF" in rejected.text
+
+        capabilities = client.get("/api/v1/capabilities").json()["constraints"]
+        assert capabilities["auto_crf"] is True
+        assert capabilities["auto_crf_defaults"]["target_vmaf"] == 95.0
+
+
 def test_selection_validation_rejects_invalid_selection_without_mutation(tmp_path):
     with make_client(tmp_path) as client:
         job = awaiting_selection_job(client)

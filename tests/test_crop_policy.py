@@ -189,3 +189,176 @@ def test_crop_policy_rejects_material_overcrop() -> None:
         CropMargins(left=222, right=220), evidence
     )
     assert decision.status == "accepted"
+
+
+def _timed_line(t: float, width: int, height: int, x: int, y: int) -> str:
+    return (
+        f"[Parsed_cropdetect_0 @ 0x55d0] x1:{x} x2:{x + width - 1} y1:{y} "
+        f"y2:{y + height - 1} w:{width} h:{height} x:{x} y:{y} "
+        f"pts:{int(t * 1000)} t:{t:.6f} limit:0.094118 crop={width}:{height}:{x}:{y}"
+    )
+
+
+def _running_envelope_log(events: list[tuple[float, int, int, int, int]], end: float) -> str:
+    """Cumulative cropdetect (reset=0) log: one line per second."""
+
+    lines: list[str] = []
+    current = events[0]
+    pending = list(events[1:])
+    for second in range(int(end)):
+        if pending and second >= pending[0][0]:
+            current = pending.pop(0)
+        lines.append(_timed_line(second, *current[1:]))
+    return "\n".join(lines)
+
+
+def test_aspect_profile_reports_imax_style_expansion() -> None:
+    from bdencode.qc.crop import parse_aspect_profile
+
+    log = _running_envelope_log(
+        [
+            (0, 1920, 500, 0, 290),  # dark opening
+            (40, 1920, 800, 0, 140),  # scope picture
+            (3600, 1920, 1080, 0, 0),  # first expanded (IMAX) scene
+        ],
+        7200,
+    )
+    profile = parse_aspect_profile(
+        log, source_width=1920, source_height=1080, duration_seconds=7200
+    )
+    assert profile is not None and profile.variable
+    assert (profile.baseline_width, profile.baseline_height) == (1920, 800)
+    assert (profile.widest_width, profile.widest_height) == (1920, 1080)
+    assert profile.timing == "exact"
+    assert [item.time_seconds for item in profile.expansions] == [3600.0]
+    assert profile.expansions[0].aspect_ratio == pytest.approx(1.7778)
+    assert "variable aspect ratio" in profile.summary()
+    assert profile.to_dict()["widest"]["aspect_ratio"] == pytest.approx(1.7778)
+
+
+def test_aspect_profile_ignores_the_opening_minutes_and_constant_titles() -> None:
+    from bdencode.qc.crop import parse_aspect_profile
+
+    constant = _running_envelope_log(
+        [(0, 1920, 400, 0, 340), (20, 1920, 800, 0, 140)], 7200
+    )
+    profile = parse_aspect_profile(
+        constant, source_width=1920, source_height=1080, duration_seconds=7200
+    )
+    assert profile is not None and not profile.variable and not profile.expansions
+    assert (profile.baseline_width, profile.baseline_height) == (1920, 800)
+    assert profile.summary() == "constant aspect ratio"
+
+
+def test_aspect_profile_ignores_edge_noise_below_the_change_threshold() -> None:
+    from bdencode.qc.crop import parse_aspect_profile
+
+    log = _running_envelope_log(
+        [(0, 1920, 800, 0, 140), (4000, 1920, 806, 0, 137)], 7200
+    )
+    profile = parse_aspect_profile(
+        log, source_width=1920, source_height=1080, duration_seconds=7200
+    )
+    assert profile is not None and not profile.variable
+
+
+def test_aspect_profile_without_timestamps_is_marked_approximate() -> None:
+    from bdencode.qc.crop import parse_aspect_profile
+
+    lines = ["crop=1920:800:0:140"] * 60 + ["crop=1920:1080:0:0"] * 40
+    profile = parse_aspect_profile(
+        "\n".join(lines),
+        source_width=1920,
+        source_height=1080,
+        duration_seconds=6000,
+    )
+    assert profile is not None and profile.variable
+    assert profile.timing == "approximate"
+    assert 3000 < profile.expansions[0].time_seconds < 4000
+
+
+def test_aspect_profile_edge_cases() -> None:
+    from bdencode.qc.crop import parse_aspect_profile
+
+    assert (
+        parse_aspect_profile(
+            "nothing to see", source_width=1920, source_height=1080, duration_seconds=10
+        )
+        is None
+    )
+    # An observation larger than the source canvas is not trusted.
+    assert (
+        parse_aspect_profile(
+            "crop=4000:3000:0:0",
+            source_width=1920,
+            source_height=1080,
+            duration_seconds=10,
+        )
+        is None
+    )
+    with pytest.raises(ValueError):
+        parse_aspect_profile("", source_width=0, source_height=1, duration_seconds=1)
+    with pytest.raises(ValueError):
+        parse_aspect_profile("", source_width=1, source_height=1, duration_seconds=0)
+
+
+def test_variable_aspect_evidence_accepts_a_few_step_envelope() -> None:
+    from bdencode.qc.crop import variable_aspect_evidence
+
+    log = _running_envelope_log(
+        [(0, 1920, 800, 0, 140), (2500, 1920, 1080, 0, 0)], 7200
+    )
+    with pytest.raises(CropPolicyError) as unstable:
+        parse_stable_cropdetect(log, source_width=1920, source_height=1080)
+    assert unstable.value.code == "unstable_detection"
+
+    evidence = variable_aspect_evidence(
+        log, source_width=1920, source_height=1080, duration_seconds=7200
+    )
+    assert evidence is not None and evidence.variable_aspect
+    assert evidence.crop == evidence.safe_crop == CropMargins(0, 0, 0, 0)
+    assert evidence.to_dict()["variable_aspect"] is True
+    # The widest canvas removes no picture, so it passes the operator policy.
+    decision = validate_operator_crop(automatic_crop(evidence), evidence)
+    assert decision.status == "accepted"
+
+
+def test_variable_aspect_evidence_refuses_noisy_or_flash_only_logs() -> None:
+    from bdencode.qc.crop import variable_aspect_evidence
+
+    noisy = _running_envelope_log(
+        [(0, 1920, 600, 0, 240)]
+        + [(1000 + 900 * step, 1920, 600 + 60 * (step + 1), 0, 240 - 30 * (step + 1)) for step in range(7)],
+        7200,
+    )
+    assert (
+        variable_aspect_evidence(
+            noisy, source_width=1920, source_height=1080, duration_seconds=7200
+        )
+        is None
+    )
+
+    flash_at_the_very_end = _running_envelope_log(
+        [(0, 1920, 800, 0, 140), (7190, 1920, 1080, 0, 0)], 7200
+    )
+    assert (
+        variable_aspect_evidence(
+            flash_at_the_very_end,
+            source_width=1920,
+            source_height=1080,
+            duration_seconds=7200,
+        )
+        is None
+    )
+
+    constant = _running_envelope_log([(0, 1920, 800, 0, 140)], 7200)
+    assert (
+        variable_aspect_evidence(
+            constant, source_width=1920, source_height=1080, duration_seconds=7200
+        )
+        is None
+    )
+
+
+def test_ordinary_evidence_serializes_without_the_variable_flag() -> None:
+    assert "variable_aspect" not in _evidence(CropMargins(0, 138, 0, 138)).to_dict()

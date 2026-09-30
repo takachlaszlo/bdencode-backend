@@ -32,6 +32,14 @@ DEFAULT_FULL_TITLE_SAMPLE_FPS = Decimal("1")
 _CROP_OBSERVATION_PATTERN = re.compile(
     r"(?:^|\s)crop=(?P<width>\d+):(?P<height>\d+):(?P<x>\d+):(?P<y>\d+)"
 )
+_TIMED_CROP_PATTERN = re.compile(
+    r"(?:\bt:(?P<time>-?\d+(?:\.\d+)?)\b.*?)?"
+    r"(?:^|\s)crop=(?P<width>\d+):(?P<height>\d+):(?P<x>\d+):(?P<y>\d+)"
+)
+DEFAULT_ASPECT_WARMUP_FRACTION = 0.05
+DEFAULT_ASPECT_WARMUP_MAX_SECONDS = 600.0
+DEFAULT_ASPECT_MIN_CHANGE_PIXELS = 8
+MAX_REPORTED_EXPANSIONS = 20
 
 
 class CropPolicyError(ValueError):
@@ -78,6 +86,9 @@ class CropDetectionEvidence:
     # Largest active canvas seen across the sampled windows.  This can be more
     # conservative than the modal recommendation for variable-aspect titles.
     safe_crop: CropMargins | None = None
+    # True when the widest envelope was accepted because the title changes
+    # aspect ratio, instead of because one modal border dominated the log.
+    variable_aspect: bool = False
 
     def __post_init__(self) -> None:
         if self.source_width < 1 or self.source_height < 1:
@@ -94,7 +105,7 @@ class CropDetectionEvidence:
             object.__setattr__(self, "safe_crop", self.crop)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "crop": self.crop.to_dict(),
             "source_width": self.source_width,
             "source_height": self.source_height,
@@ -104,6 +115,9 @@ class CropDetectionEvidence:
             "jitter_pixels": self.jitter_pixels,
             "safe_crop": self.safe_crop.to_dict() if self.safe_crop else None,
         }
+        if self.variable_aspect:
+            result["variable_aspect"] = True
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,6 +467,233 @@ def parse_stable_cropdetect(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class AspectExpansion:
+    """One moment at which the running active-picture envelope grew."""
+
+    time_seconds: float
+    width: int
+    height: int
+
+    @property
+    def aspect_ratio(self) -> float:
+        return round(self.width / self.height, 4)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "time_seconds": round(self.time_seconds, 3),
+            "width": self.width,
+            "height": self.height,
+            "aspect_ratio": self.aspect_ratio,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AspectProfile:
+    """Evidence that the picture changes aspect ratio during the title.
+
+    ``cropdetect reset=0`` reports a running maximum, so the envelope can only
+    grow.  A material growth *after* the opening minutes therefore marks the
+    first frame of a taller or wider scene (typically IMAX or full-frame
+    inserts in a scope film).  The crop that protects such a title is the
+    widest envelope, which :func:`automatic_crop` already selects; this profile
+    records why, and when the picture first changes.
+    """
+
+    variable: bool
+    warmup_seconds: float
+    baseline_width: int
+    baseline_height: int
+    widest_width: int
+    widest_height: int
+    expansions: tuple[AspectExpansion, ...]
+    timing: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "variable": self.variable,
+            "warmup_seconds": round(self.warmup_seconds, 3),
+            "baseline": {
+                "width": self.baseline_width,
+                "height": self.baseline_height,
+                "aspect_ratio": round(self.baseline_width / self.baseline_height, 4),
+            },
+            "widest": {
+                "width": self.widest_width,
+                "height": self.widest_height,
+                "aspect_ratio": round(self.widest_width / self.widest_height, 4),
+            },
+            "expansions": [item.to_dict() for item in self.expansions],
+            "timing": self.timing,
+        }
+
+    def summary(self) -> str:
+        if not self.variable:
+            return "constant aspect ratio"
+        first = self.expansions[0]
+        return (
+            f"variable aspect ratio: {self.baseline_width}x{self.baseline_height} "
+            f"({self.baseline_width / self.baseline_height:.2f}:1) grows to "
+            f"{self.widest_width}x{self.widest_height} "
+            f"({self.widest_width / self.widest_height:.2f}:1), first at "
+            f"{first.time_seconds:.0f}s; the widest canvas is kept"
+        )
+
+
+def parse_aspect_profile(
+    log: str,
+    *,
+    source_width: int,
+    source_height: int,
+    duration_seconds: float,
+    warmup_fraction: float = DEFAULT_ASPECT_WARMUP_FRACTION,
+    warmup_max_seconds: float = DEFAULT_ASPECT_WARMUP_MAX_SECONDS,
+    min_change_pixels: int = DEFAULT_ASPECT_MIN_CHANGE_PIXELS,
+) -> AspectProfile | None:
+    """Derive an :class:`AspectProfile` from a full-title cropdetect log.
+
+    Returns ``None`` when the log carries no crop observations.  Timestamps come
+    from FFmpeg's ``t:`` field; a log without them falls back to the relative
+    position of each observation, which is reported as ``timing=approximate``.
+    """
+
+    if source_width < 1 or source_height < 1:
+        raise ValueError("source dimensions must be positive")
+    if duration_seconds <= 0:
+        raise ValueError("title duration must be positive")
+    if not 0 <= warmup_fraction < 1 or warmup_max_seconds < 0:
+        raise ValueError("warm-up policy is invalid")
+    if min_change_pixels < 1:
+        raise ValueError("minimum aspect change must be positive")
+
+    observations: list[tuple[float | None, int, int]] = []
+    for line in log.splitlines():
+        match = _TIMED_CROP_PATTERN.search(line)
+        if match is None:
+            continue
+        width, height = int(match["width"]), int(match["height"])
+        if width < 1 or height < 1 or width > source_width or height > source_height:
+            continue
+        observations.append(
+            (None if match["time"] is None else float(match["time"]), width, height)
+        )
+    if not observations:
+        return None
+
+    timed = all(item[0] is not None for item in observations)
+    total = len(observations)
+    stamped = [
+        (
+            item[0] if timed else duration_seconds * index / max(total - 1, 1),
+            item[1],
+            item[2],
+        )
+        for index, item in enumerate(observations)
+    ]
+    warmup = min(duration_seconds * warmup_fraction, warmup_max_seconds)
+
+    # Running envelope: the log is already cumulative, but a defensive maximum
+    # keeps the profile correct for logs produced with reset=1 as well.
+    events: list[AspectExpansion] = []
+    envelope_w = envelope_h = 0
+    baseline: tuple[int, int] | None = None
+    for moment, width, height in stamped:
+        if moment > warmup and baseline is None:
+            baseline = (envelope_w, envelope_h)
+        grown_w, grown_h = max(envelope_w, width), max(envelope_h, height)
+        changed = (
+            grown_w - envelope_w >= min_change_pixels
+            or grown_h - envelope_h >= min_change_pixels
+        )
+        if changed and envelope_w and moment > warmup:
+            events.append(AspectExpansion(moment, grown_w, grown_h))
+        envelope_w, envelope_h = grown_w, grown_h
+    if baseline is None or baseline[0] == 0:
+        baseline = (envelope_w, envelope_h)
+
+    return AspectProfile(
+        variable=bool(events),
+        warmup_seconds=warmup,
+        baseline_width=baseline[0],
+        baseline_height=baseline[1],
+        widest_width=envelope_w,
+        widest_height=envelope_h,
+        expansions=tuple(events[:MAX_REPORTED_EXPANSIONS]),
+        timing="exact" if timed else "approximate",
+    )
+
+
+def variable_aspect_evidence(
+    log: str,
+    *,
+    source_width: int,
+    source_height: int,
+    duration_seconds: float,
+    minimum_observations: int = DEFAULT_MINIMUM_OBSERVATIONS,
+    maximum_expansions: int = 3,
+    minimum_widest_observations: int = 240,
+    jitter_pixels: int = DEFAULT_BORDER_JITTER_PIXELS,
+) -> CropDetectionEvidence | None:
+    """Explain an otherwise "unstable" log as a variable-aspect title.
+
+    A title that switches between, say, 2.40:1 and full-frame IMAX scenes has no
+    single dominant border, so :func:`parse_stable_cropdetect` refuses it.  Its
+    running-envelope log is nevertheless a clean step function: a few material
+    expansions, each to a larger canvas, that never shrinks.  For such a log the
+    widest canvas is a safe crop by construction because it removes no picture;
+    the cost of being wrong is some encoded black bars, never lost image.
+
+    Returns ``None`` (leaving the original review requirement in place) when the
+    log does not look like a small number of aspect changes, or when the widest
+    canvas is supported by too few observations to be more than a flash.
+    """
+
+    profile = parse_aspect_profile(
+        log,
+        source_width=source_width,
+        source_height=source_height,
+        duration_seconds=duration_seconds,
+    )
+    if (
+        profile is None
+        or not profile.variable
+        or len(profile.expansions) > maximum_expansions
+    ):
+        return None
+    observations = _observed_margins(
+        log, source_width=source_width, source_height=source_height
+    )
+    if len(observations) < minimum_observations:
+        return None
+    widest = CropMargins(
+        **{
+            edge: min(getattr(value, edge) for value in observations)
+            for edge in ("left", "top", "right", "bottom")
+        }
+    )
+
+    def at_widest(value: CropMargins) -> bool:
+        return all(
+            abs(getattr(value, edge) - getattr(widest, edge)) <= jitter_pixels
+            for edge in ("left", "top", "right", "bottom")
+        )
+
+    supporting = sum(at_widest(value) for value in observations)
+    if supporting < minimum_widest_observations:
+        return None
+    return CropDetectionEvidence(
+        crop=widest,
+        source_width=source_width,
+        source_height=source_height,
+        observations=len(observations),
+        supporting_observations=supporting,
+        support_ratio=Decimal(supporting) / Decimal(len(observations)),
+        jitter_pixels=jitter_pixels,
+        safe_crop=widest,
+        variable_aspect=True,
+    )
+
+
 def validate_operator_crop(
     requested: CropMargins | None,
     evidence: CropDetectionEvidence,
@@ -555,6 +796,8 @@ def automatic_crop(
 
 
 __all__ = [
+    "AspectExpansion",
+    "AspectProfile",
     "CropDetectInterval",
     "CropDetectionEvidence",
     "CropPolicyDecision",
@@ -563,7 +806,9 @@ __all__ = [
     "cropdetect_commands",
     "distributed_cropdetect_commands",
     "full_title_cropdetect_command",
+    "parse_aspect_profile",
     "parse_stable_cropdetect",
     "plan_cropdetect_intervals",
     "validate_operator_crop",
+    "variable_aspect_evidence",
 ]
