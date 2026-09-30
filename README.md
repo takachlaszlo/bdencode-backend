@@ -1308,6 +1308,8 @@ Ellenőrzik, hogy minden kötött paraméter (szóközös, ékezetes, idézőjel
 
 A `.github/workflows/ci.yml` minden pushra és pull requestre lefut: frontend (típusellenőrzés, tesztek, build, a commitolt `dist` frissességének ellenőrzése), Python 3.11/3.12/3.13 **Linuxon**, a teljes tesztsor **Windowson** (windows-latest, PowerShell 7 és 5.1 egyaránt), a shellszkriptek szintaxisa és sorvégei, valamint a natív libbluray-szkenner fordítása. A Windows-specifikus hibák (például egy `C:\Users` a TOML-sztringben) így azonnal kiderülnek.
 
+A Windows-leg szándékosan **Python 3.13**-mal fut: ezt használja a Windows-gép, és ezt a WSL-beli Debian 13 is. Windowson 3.12-ig a csak Linuxon használt telepítő- és worker-tesztek platformokozta okból buknak: az `os.fchmod` nem létezik, a `time.time()` pedig durva óra, amely elmarad az NTFS `mtime`-tól, így egy közvetlenül a checkpoint előtt írt fájl újabbnak látszhat nála (helyi méréssel a fájlok kb. 10%-ánál). A 3.11-es és 3.12-es verziót a Linux-leg fedi le.
+
 ### 15.5. Fontos fejlesztői szabály
 
 Tesztadatot vagy API-kulcsot ne commitolj. A valós Blu-ray források helyett kis, mesterséges mintákkal teszteld azokat a funkciókat, amelyekhez nincs szükség teljes lemezre.

@@ -48,8 +48,13 @@ jobs:
           # TOML string, a console code page ...) surface immediately.  The
           # windows-latest image has both PowerShell 7 and Windows PowerShell
           # 5.1, and tests/test_windows_install_powershell.py runs under each.
+          # Python 3.13 on purpose: it is what the Windows PC runs, and up to
+          # 3.12 the Linux-only installer and worker tests fail on Windows for
+          # platform reasons (os.fchmod does not exist there, and time.time()
+          # is a coarse clock that lags the NTFS mtime of a file written just
+          # before it).  The 3.11 and 3.12 legs on Linux cover those versions.
           - os: windows-latest
-            python-version: "3.12"
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
