@@ -1081,6 +1081,12 @@ def extract_y4m_at_timestamp_command(
         [
             "-frames:v",
             "1",
+            # FFmpeg's Y4M muxer refuses every pixel format except 8-bit
+            # yuv420p/422p/444p/gray ("not an official yuv4mpegpipe pixel
+            # format", exit code 234), so a 10-bit UHD title could never reach
+            # the native-YUV comparison without this.
+            "-strict",
+            "-1",
             "-f",
             "yuv4mpegpipe",
             "-y",

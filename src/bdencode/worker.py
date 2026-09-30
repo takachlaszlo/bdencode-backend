@@ -5781,6 +5781,10 @@ class PipelineWorker:
                 "pipe:0",
                 "-frames:v",
                 "1",
+                # The Y4M muxer rejects 10-bit pixel formats without this
+                # (exit code 234), which stopped every UHD HDR10 comparison.
+                "-strict",
+                "-1",
                 "-f",
                 "yuv4mpegpipe",
                 "-y",
