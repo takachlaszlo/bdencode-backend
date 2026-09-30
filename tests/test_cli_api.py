@@ -16,8 +16,8 @@ def api_config(
     source.mkdir()
     config = tmp_path / "config.toml"
     config.write_text(
-        f'[bdencode]\ndata_root = "{tmp_path / "data"}"\n'
-        f'source_roots = ["{source}"]\nbind_port = 8801\n',
+        f'[bdencode]\ndata_root = "{(tmp_path / "data").as_posix()}"\n'
+        f'source_roots = ["{source.as_posix()}"]\nbind_port = 8801\n',
         encoding="utf-8",
     )
     calls: list[dict[str, Any]] = []
