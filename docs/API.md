@@ -170,6 +170,30 @@ A webes felület mentés előtt ugyanazt az objektumot a `POST /jobs/{id}/select
 }
 ```
 
+### Minőségi opciók a `video` objektumban
+
+Az alábbi mezők mind elhagyhatók; elhagyva a viselkedés megegyezik a korábbi kiadásokéval.
+
+```json
+"video": {
+  "auto_crf": {"enabled": true, "target_vmaf": 95.0, "min_crf": 12, "max_crf": 26},
+  "dynamic_hdr": "hdr10plus",
+  "settings": {"noise_reduction": 120}
+}
+```
+
+- `auto_crf`: automatikus CRF-keresés VMAF-célra. Mezők: `enabled`, `target_vmaf` (80–99,5), `min_crf`, `max_crf`, `samples` (4–48), `sample_seconds` (1–10), `max_iterations` (3–10), `tolerance` (0,1–3), `metric` (`mean`, `harmonic_mean`, `percentile_1`), `probe_preset`. Bekapcsolva a `settings.crf` csak kiindulópont. A `GET /capabilities` `constraints.auto_crf_defaults` mezője az alapértékeket adja.
+- `dynamic_hdr`: `discard` (alapértelmezett), `auto`, `hdr10plus` vagy `dolby_vision`. Érvénytelen érték, nem x265 HDR10 kimenet, nem progresszív időzítés vagy a forrásból hiányzó metaadat esetén a `validate` és a mentés `dynamic_hdr_*` kódú hibát ad (`dynamic_hdr_invalid_mode`, `dynamic_hdr_unsupported_output`, `dynamic_hdr_temporal_filter`, `dynamic_hdr_source_missing`, `dynamic_hdr_no_hdr10_base`, `dynamic_hdr_unsupported_profile`). Ha a gazdagépen hiányzik az eszköz vagy az x265 támogatás, az `advisory_warnings` ezt jelzi; a `GET /runtime-capabilities` `dynamic_hdr` szakasza mutatja az elérhetőséget.
+- `settings.noise_reduction`: x264-nél 0–1000, x265-nél 0–2000.
+
+```text
+GET /profiles/{encoder}/noise-profiles?content_type=film
+```
+
+Névre szóló zaj-/szemcsecsomagokat ad vissza (`off`, `preserve_grain`, `light_denoise`, `medium_denoise`, `strong_denoise`). Minden elem `settings` mezője konkrét, szerkeszthető beállításértékeket tartalmaz; a kliens ezeket egyesítheti a `video.settings` objektummal.
+
+Új job-események: `worker.auto-crf-probe`, `worker.auto-crf`, `worker.dynamic-hdr`, `worker.variable-aspect`. Új analysis-artifactok: `crf-search.json`, `dynamic-hdr.json`; a `crop-policy.json` `aspect_profile` mezőt kap. Az elkészült manifest `auto_crf` és `dynamic_hdr` kulcs alatt tartalmazza őket. A befejezéskor a worker `analysis/source-size.json` fájlt is ír (a kiválasztott playlist klipjeinek összmérete), amelyből a statisztika a megtakarítást számolja.
+
 Az `image_upload_provider` értéke `auto`, `imgbb`, `catbox` vagy `freeimage`.
 Automatikus módban a sorrend ImgBB → Catbox → Freeimage, és csak az első
 sikeres kép előtt engedélyezett a váltás. Kézi választásnál nincs failover.
@@ -185,6 +209,55 @@ Ha a videó-bitfolyamból hiányzik a színprimerek, az átviteli karakterisztik
 Ha a job `NEEDS_REVIEW`, a korrigált teljes `selection` ugyanerre az endpointra küldhető. A backend ilyenkor mindig `READY` állapotból játssza újra a függőség-ellenőrzést; egy késői review nem párosíthat régi videót új beállítás-manifesttel.
 
 Nyelv nélkül megtartott audiónál a worker a reference remuxból hat, filmen elosztott CPU-only beszédmintát elemez. Csak magas bizalmú konszenzust alkalmaz automatikusan; konfliktus, kevés beszéd, ismeretlen PGS vagy hiányzó modell esetén a job review-ba kerül, és kézi ISO 639-2/BCP 47 override szükséges.
+
+## Operátori kiegészítők
+
+Ezek az útvonalak a `bdencode.api_extras` modulban vannak, ugyanazt a `/api/v1` előtagot, hibaburkolót és same-origin mutációvédelmet használják, mint a többi.
+
+### Statisztika
+
+```text
+GET /statistics?limit=200
+GET /jobs/{id}/statistics
+```
+
+Az első az elkészült (`COMPLETED`) munkák fájlonkénti statisztikáját és összesítését adja (legutóbb befejezett elöl), a második egy munkáét. Egy sor mezői: `source_bytes`, `output_bytes`, `saved_bytes`, `saved_percent`, `media_seconds`, `frames`, `bitrate_kbps`, `encode_seconds` (az `ENCODING` szakaszban töltött falióra-idő, a szüneteltetett idő nélkül), `encode_fps`, `realtime_factor`, `total_seconds`, `encoder`, `crf`, `preset`, `auto_crf` és a `quality` objektum (`vmaf_sample`, `vmaf_target`, `ssim_mean`, `psnr_mean_db`). Amire nincs tartós bizonyíték (például a forrásméretre régebbi kiadással készült munkánál), az `null`; a rendszer nem becsül. A `vmaf_sample` az automatikus CRF mintakódolásaira vonatkozik, nem a teljes filmre.
+
+### Profilkönyvtár
+
+```text
+GET    /profile-library                       # {"items": [...], "count": n}
+POST   /profile-library[?overwrite=true]      # 201; 409 ha a név már létezik
+GET    /profile-library/{id}
+DELETE /profile-library/{id}                  # 204
+GET    /profile-library/{id}/export           # bdencode-profile JSON (attachment)
+GET    /profile-library/export                # bdencode-profile-bundle JSON (attachment)
+POST   /profile-library/import[?on_conflict=rename|skip|overwrite]
+```
+
+Egy profil: `name`, `description`, `encoder`, `detail_level`, `settings`, opcionálisan `auto_crf` és `dynamic_hdr`. A `settings` csak hordozható mezőket tartalmazhat: a `encoder`, `detail_level`, `profile`, `level`, `bit_depth`, `pixel_format`, `color`, `vbv`, `hdr10`, `aud`, `repeat_headers` és `annexb` `not_portable` hibát ad. Minden mentés és import valódi `EncoderSettings` felépítésével ellenőriz. Hibakódok: `invalid`, `invalid_settings`, `invalid_auto_crf`, `invalid_dynamic_hdr`, `not_portable` (422), `unsupported_version` (422), `too_large` (413), `not_found` (404), `exists` és `limit` (409). Az azonosító a névből képződik; a fájlban megadott `id`, `created_at` és `updated_at` importnál figyelmen kívül marad. Az import válasza bejegyzésenként jelent: `{"imported": [...], "skipped": [...], "errors": [{"name", "code", "message"}]}`. Minden elem `selection` mezője a `video` objektumba egyesíthető töredék.
+
+### Lejátszó és kivonatok
+
+```text
+GET    /jobs/{id}/player                      # MKV-adatok, fejezetek, meglévő kivonatok
+GET    /jobs/{id}/previews
+POST   /jobs/{id}/previews                    # {"start_seconds": 0, "duration_seconds": 20, "height": 720}
+GET    /jobs/{id}/previews/{name}             # video/mp4, HTTP range támogatással
+DELETE /jobs/{id}/previews/{name}
+```
+
+Csak kész (`OUTPUT` artifaktummal rendelkező) munkánál, és csak akkor, ha az MKV a `completed` vagy a `jobs` gyökéren belül van. A `duration_seconds` 5–30, a `height` 360, 480 vagy 720. A `POST` `201`-et ad új és `200`-at már meglévő (gyorsítótárból kiszolgált) kivonatnál; a válasz `created` mezője jelzi. Hibakódok: `invalid` (422), `no_output` (409), `not_found` (404), `unavailable` (503, hiányzó ffmpeg/ffprobe), `timeout` (504), `probe_failed` és `transcode_failed` (502). A kivonat H.264/AAC MP4, HDR forrásnál SDR-re tone-map-elt; nem része a kiadásnak, a completed fának vagy a torrentnek.
+
+### Adatbázis és mentések
+
+```text
+GET  /system/database        # séma, méret, integritás (quick_check), migrációs előzmények, legutóbbi mentés
+GET  /system/backups
+POST /system/backups         # 201; ellenőrzött "manual" mentés
+```
+
+A visszaállítás szándékosan nincs az API-n: `bdencode db-restore`, leállított szolgáltatásokkal (lásd a README 14.5. pontját). Memóriában lévő adatbázis mentése `422`.
 
 ## Release-előkészítés
 

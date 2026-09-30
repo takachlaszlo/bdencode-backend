@@ -60,12 +60,20 @@ A főbb funkciók:
 - MPLS/CLPI/PMT nyelvi adatok összesítése, ismeretlen hangnál választható CPU-s beszédfelismerési segítség és bizonytalanságnál kézi ellenőrzés;
 - privát nyers és tisztított napló; a publikus MKV nem kap naplót vagy más csatolmányt, a comparison külön sidecar marad;
 - privát v1 torrent, upload kit, dupe check, qBittorrentbe leállítva felvétel és explicit jóváhagyású tracker-feltöltés;
-- napi automatikus alkalmazás- és eszközfrissítés.
+- napi automatikus alkalmazás- és eszközfrissítés;
+- opcionális **automatikus CRF-keresés**: rövid, VMAF-pontozott mintakódolásokból választja ki a célminőséghez tartozó CRF-et;
+- **zaj- és szemcseprofilok** (szemcse megtartása, enyhe/közepes/erős kódolóoldali zajszűrés);
+- **változó képarányú** (például IMAX-jeleneteket tartalmazó) filmek felismerése és biztonságos, veszteségmentes kezelése;
+- opcionális **HDR10+ és Dolby Vision (8.1) megtartás** külső eszközökkel, a kész MKV kötelező bizonyításával;
+- **beépített lejátszó** a kész MKV böngészőbarát kivonataival, és nagyítható, húzható előtte/utána **pixelnézet** a comparison képekhez;
+- **statisztika**: helymegtakarítás, VMAF/SSIM/PSNR és kódolási sebesség fájlonként és összesítve, CSV exporttal;
+- **profilkönyvtár**: kódolási profilok mentése, exportja és importja;
+- **adatbázis-migráció előtti automatikus mentés**, ütemezett ellenőrzött mentések és parancssori visszaállítás.
 
 A rendszer nem támogatja:
 
 - a 3D Blu-ray megtartását;
-- a Dolby Vision és a HDR10+ dinamikus metaadat megtartását;
+- a Dolby Vision profil 5 és a dual-layer (FEL) enhancement réteg megtartását;
 - egyszerre több teljes encode futtatását;
 - GPU-s kódolást. A rendszer CPU-val dolgozik, ezért kijelző vagy videokártya nélküli szerveren is használható.
 
@@ -599,10 +607,89 @@ Az átalakítás veszteséges lehet. Ha nincs kompatibilitási vagy méretprobl�
 
 - Normál BD esetén az alapértelmezett választás x264.
 - UHD esetén az alapértelmezett választás x265 és HDR10.
-- Dolby Vision réteg nem marad meg.
+- Alapértelmezetten a dinamikus HDR (Dolby Vision, HDR10+) nem marad meg; a HDR10 statikus réteg igen. A megtartás opcionális, lásd a 7.4.3. pontot.
 - 3D tartalom nem támogatott.
 
 Kezdő módban a rendszer biztonságos alapértékeket ad. Haladó és Profi módban több x264/x265 paraméter külön állítható. Ha nem tudod pontosan, mit jelent egy paraméter, hagyd a profil ajánlott értékén.
+
+#### 7.4.1. Automatikus CRF (VMAF-cél)
+
+A rögzített CRF nem ad azonos minőséget minden filmnél. Az **automatikus CRF** bekapcsolásakor a worker az előkészítés végén:
+
+1. a film törzséből egyenletesen elosztott, néhány másodperces mintákat választ (alapból 12 × 3 s; az első és utolsó 3% kimarad),
+2. ezeket ugyanazzal a crop/IVTC/deinterlace gráffal és ugyanazokkal a kódolóbeállításokkal kódolja, mint a végleges kódolást,
+3. a hivatalos libvmaf-fel megméri a pontszámot, és néhány próbálkozással megkeresi a célhoz tartozó legmagasabb CRF-et.
+
+A kiválasztási JSON `video.auto_crf` objektuma:
+
+```json
+"auto_crf": {"enabled": true, "target_vmaf": 95.0, "min_crf": 12, "max_crf": 26}
+```
+
+Az opcionális mezők: `samples` (4–48), `sample_seconds` (1–10), `max_iterations` (3–10), `tolerance` (0,1–3), `metric` (`mean`, `harmonic_mean`, `percentile_1`) és `probe_preset` (gyorsabb preset a próbákhoz). Ilyenkor a megadott `crf` csak a keresés kiindulópontja.
+
+- Minden próba önálló checkpoint: szünet, megszakítás vagy újraindítás után a kész próbák nem ismétlődnek.
+- A minták csak pontozásra szolgálnak, a próbafájlok azonnal törlődnek. A `crf-search.json` jelentés (próbák, pontszámok, döntés) a manifestbe és a job artifactjai közé kerül.
+- Ha a célpont a megadott CRF-tartományban nem érhető el, a job **felülvizsgálatra** kerül; a rendszer nem választ csendben gyengébb minőséget. Ilyenkor csökkentsd a célt, bővítsd a tartományt, vagy add meg fix CRF-et.
+- UHD (1440 sor felett) esetén a 4K VMAF-modell, HDR10 esetén a rögzített, mindkét oldalra azonos tone-map proof átalakítás dolgozik; a HDR pontszámok ezért iránymutatók, nem abszolút mérőszámok.
+- Költség: egy próba a minták teljes hosszát kódolja (alapból kb. 36 s videó), tipikusan 4–6 próbával. Lassú x265 preset mellett ez UHD-nál akár órákat is igénybe vehet; erre való a `probe_preset`.
+
+#### 7.4.2. Zaj- és szemcseprofilok
+
+Haladó és Profi módban új **`noise_reduction`** mező jelenik meg: x264-nél az `nr` (0–1000), x265-nél az `nr-intra`/`nr-inter` (0–2000) értéke. A 0 érintetlenül hagyja a forrás zaját. A `GET /api/v1/profiles/{encoder}/noise-profiles` névre szóló, szerkeszthető csomagokat ad vissza konkrét beállításértékekkel:
+
+| Profil | Hatás |
+| --- | --- |
+| `off` | nincs külön zaj- vagy szemcsekezelés |
+| `preserve_grain` | filmszemcsés forráshoz: grain tune, magasabb qcomp (x265-nél psy-rd/psy-rdoq is), enyhébb deblock; nagyobb fájl |
+| `light_denoise` | enyhe kódolóoldali zajcsökkentés (x264 nr 40, x265 nr 100) |
+| `medium_denoise` | közepes (x264 nr 120, x265 nr 250) |
+| `strong_denoise` | erős (x264 nr 300, x265 nr 500); részletvesztést okozhat |
+
+A profilok kölcsönösen kizárják egymást: egy profil mindig az ajánlott alapértékekből indul, ezért a szemcsemegtartó profil értékei nem maradnak vissza egy zajszűrő választása után.
+
+A zajszűrés szándékosan a **kódolóban** történik, nem előszűrőként. Így a referencia érintetlen marad, és az SSIM/PSNR/VMAF-kapuk továbbra is a kodek hűségét mérik, nem egy előszűrő hatását. Erős zajszűrésnél a QC-kapuk jelezhetik az eltérést; ez szándékos védelem az észrevétlen túlszűrés ellen.
+
+#### 7.4.3. HDR10+ és Dolby Vision megtartása
+
+Az alapértelmezés (`discard`) változatlan: csak a statikus HDR10 marad meg, és a kész MKV-ban dinamikus metaadat hard hiba. Megtartás a `video.dynamic_hdr` mezővel kérhető:
+
+| Érték | Jelentés |
+| --- | --- |
+| `discard` | alapértelmezett: dinamikus réteg eldobása |
+| `hdr10plus` | a forrás HDR10+ metaadatát képkockánként megtartja |
+| `dolby_vision` | a Dolby Vision RPU-t profil 8.1-ként tartja meg (a 7-es profil `dovi_tool -m 2`-vel alakul át, az enhancement réteg elmarad) |
+| `auto` | ami a forrásban van és biztonságosan megtartható (előbb HDR10+, aztán Dolby Vision); különben csendben `discard`, indoklással |
+
+Feltételek (a `selection/validate` végpont korán jelzi őket): x265 HDR10 (Main 10) kimenet; **progresszív** időzítés (a metaadat forráskockánkénti, IVTC/deinterlace után nem vihető át); a forrásnak ténylegesen hordoznia kell a metaadatot; Dolby Visionnél megerősített HDR10 alapréteg és 7-es vagy 8-as profil.
+
+Eszközigény: `hdr10plus_tool` (HDR10+), `dovi_tool` (Dolby Vision) és olyan x265, amely elfogadja a `--dhdr10-info`, illetve `--dolby-vision-rpu` paramétert. Ezek nem részei az automatikus telepítésnek; töltsd le őket a hivatalos kiadásokból (quietvoid/hdr10plus_tool, quietvoid/dovi_tool), ellenőrizd az ellenőrzőösszeget, és tedd a `PATH`-ra. A `bdencode doctor` kimenetének `dynamic_hdr` szakasza mutatja, mi érhető el; hiányzó eszköz nem befolyásolja a `status` értékét.
+
+A biztonsági modell:
+
+1. A worker a referencia HEVC-folyamát kinyeri, és az eszközzel metaadatot készít. Dolby Visionnél a `dovi_tool info --summary` megerősíti a 8-as profilt, cropolt kimenetnél a `-c` kapcsoló nullázza az active area értékeket.
+2. A metaadat **képkockaszáma pontosan egyezik** a kódolt idővonaléval, különben a job felülvizsgálatra kerül.
+3. Az FFmpeg libx265 burkolója ismeretlen paraméternél csak figyelmeztet, és megtartás nélkül kódol; ezért a kész MKV-ból a QC **bizonyítja** a réteg meglétét (HDR10+: `SMPTE2094-40` side data; Dolby Vision: `DOVI configuration record`, profil 8, HDR10-kompatibilis, RPU jelen). Bármi hiányzik, a job felülvizsgálatra kerül, és nem készül félrecímkézett kiadás.
+4. Dolby Visionnél, ha nem adtál meg VBV-t, a rendszer 160000/160000 kb/s VBV-t alkalmaz.
+
+> [!WARNING]
+> A HDR10+ út a bitfolyamba (SEI) írja a metaadatot, ezért a mux nem érinti. A Dolby Vision megtartás **kísérleti**: az MKV-be kerülő Dolby Vision konfigurációs rekord (`dvcC`/`dvvC`) létrejötte az adott mkvmerge/FFmpeg verziótól függ. Ha a rekord hiányzik, a QC kapu nem engedi tovább a jobot; ilyenkor használd a `hdr10plus`/`discard` módot. Első használat előtt próbáld ki egy rövid, valódi Dolby Vision lemezrészen.
+
+#### 7.4.4. Változó képarány (IMAX-jelenetek)
+
+A worker a teljes film crop-vizsgálatából **képarányprofilt** is készít (`crop-policy.json` › `aspect_profile`). Ha a kép a film elején mért képarányról később nagyobb vászonra bővül (tipikusan IMAX- vagy teljes képes jelenetek egy scope filmben), a job eseménynaplójába `worker.variable-aspect` bejegyzés kerül az első bővülés időpontjával.
+
+Az ilyen film korábban gyakran felesleges kézi crop-felülvizsgálatot igényelt, mert nincs egyetlen domináns fekete sáv. Mostantól, ha a napló néhány (legfeljebb három) lépcsős, szigorúan csak növekvő burkológörbét mutat, és a legszélesebb vásznat legalább 240 megfigyelés támasztja alá, az automatikus crop a **legszélesebb vásznat** tartja meg. Ez konstrukció szerint nem vág le képet; legrosszabb esetben néhány kódolt fekete sáv marad a szűkebb jelenetekben. Zajos vagy sok lépcsős napló továbbra is felülvizsgálatot kér, kézi cropnál a meglévő `variable_aspect_ratio` védelem érvényes.
+
+#### 7.4.5. Profilkönyvtár
+
+A videóbeállítások között a **Profilkönyvtár** kártya a beállítások újrahasznosítására és megosztására való.
+
+- **Alkalmaz**: a profil beállításai, az automatikus CRF és a dinamikus HDR választása bekerül a szerkeszthető mezőkbe. Ez nem jóváhagyás: a Terv ellenőrzése lépés továbbra is kötelező.
+- **Mentés**: az aktuális beállításokból profil készül. Csak *hordozható* mezők kerülnek bele; a lemezhez vagy a bitfolyam-szabályokhoz kötött értékek (`encoder`, `profile`, `level`, `bit_depth`, `pixel_format`, `color`, `vbv`, `hdr10`, `aud`, `repeat_headers`, `annexb`) nem, mert egy másik lemezen hibás vagy veszélyes eredményt adnának.
+- **Export / Import**: egy profil `bdencode-profile`, a teljes könyvtár `bdencode-profile-bundle` JSON-ként tölthető le. Importnál minden bejegyzést valódi `EncoderSettings` felépítésével ellenőriz a backend, ezért egy megosztott fájl nem csempészhet be nem támogatott vagy nem hordozható paramétert. A fájlban lévő azonosító és időbélyeg figyelmen kívül marad; az azonosító a névből származik. Név ütközésekor választható az átnevezés (alapértelmezett), a kihagyás és a felülírás.
+
+A profilok a `<data_root>/state/profile-library` mappában, profilonként egy JSON fájlban vannak (legfeljebb 200), ezért a `state` mappa mentésekor együtt mentődnek.
 
 #### AI-javaslat kérése
 
@@ -757,6 +844,25 @@ FFmpeg libvmaf filter missing; the official standalone VMAF CLI will be used
 ```
 
 az nem telepítési hiba. Az FFmpegből hiányzik a `libvmaf` szűrő, ezért a rendszer a telepített hivatalos önálló VMAF parancssori programot használja.
+
+### 9.5. Beépített lejátszó és pixelnézet
+
+**Pixelnézet.** A comparison képpárok kártyáján a *Nagyítás és pixelnézet* gomb nagy ablakot nyit. A source és az encode **ugyanabban a görgethető konténerben** fekszik, ezért nagyításkor és mozgatáskor sosem csúszhat el egymáshoz képest; az elválasztó a kép koordinátáiban mozog. Nagyítás: Illesztés, 100% és 200% (200%-nál pixelesen, simítás nélkül); a nagyított kép húzással mozgatható. Billentyűk: `Z` – nagyítás váltása, `[` és `]` – előző/következő képpár, `Esc` – bezárás. A korábbi kártyán belüli csúszka, A/B, villogtató és diff mód megmaradt.
+
+**Lejátszó.** Elkészült munkánál a *Lejátszó* fül a kész MKV-ból készít néhány másodperces kivonatot. A böngészők a legtöbb kiadási MKV-t nem tudják lejátszani (HEVC, DTS, FLAC, HDR), ezért a backend kérésre H.264/AAC MP4-be kódolja a kijelölt részt (10/20/30 másodperc, 360p/480p/720p); HDR forrásnál SDR-re tone-map-elve. A kezdőpont csúszkával, percenkénti léptetéssel vagy a fejezetlistából választható. A kivonat:
+
+- csak nézési segéd: **nem része** a kiadásnak, a completed mappának és a torrentnek;
+- a `<data_root>/cache/previews/<job>` mappába kerül, jobonként legfeljebb 12 darab és összesen 2 GiB, a legrégebbi törlődik;
+- egyszerre egy készül (`ffmpeg`, timeout 240 s); ugyanaz a kérés a gyorsítótárból szolgálódik ki;
+- HTTP range-kéréssel tölt, ezért a tekerés működik.
+
+Az `ffmpeg`/`ffprobe` hiánya esetén a fül érthető üzenettel jelzi, hogy a lejátszó nem érhető el.
+
+### 9.6. Statisztika
+
+A **Statisztika** oldal az elkészült munkákat összesíti: megtakarított hely (GiB és %), átlagos VMAF/SSIM/PSNR, átlagos CRF és bitráta, kódolási sebesség (fps és valós idejű többszörös) és a kódolással töltött órák. Fájlonként rendezhető táblázat és CSV-letöltés (UTF-8 BOM-mal, hogy a táblázatkezelők helyesen olvassák az ékezeteket) tartozik hozzá; a munka oldalán az áttekintés jobb oldalán ugyanez egy kártyán látszik.
+
+Az adatok tartós bizonyítékból származnak: manifest, `comparison/video-metrics.json`, `analysis/crf-search.json`, a worker által a befejezéskor rögzített `analysis/source-size.json` (a kiválasztott playlist klipjeinek összmérete) és az eseménynapló. A kódolási idő az `ENCODING` szakaszban töltött falióra-idő, a szüneteltetett időt levonva; több próbálkozásnál minden szakasz beleszámít. Hiányzó bizonyíték (például régebbi kiadással készült munka) esetén a mező **üres marad („—”)**, a rendszer nem becsül. A VMAF csak az automatikus CRF mintakódolásaira vonatkozik, nem a teljes filmre; ezt az oldal is kiírja.
 
 ## 10. Gyakori hibák és javításuk
 
@@ -1114,7 +1220,43 @@ A trackerprofilok külön, root által kezelt fájlban vannak:
 
 A fix dupe/publish endpointokat és host-allowlisteket itt, a hozzájuk tartozó API-titkokat kizárólag titkosított systemd credentialként állítsd be. Az announce URL személyes passkeyt tartalmazhat, ezért magát a root-only profilfájlt és az abból készülő torrentet/upload kitet is titokként kezeld. A részletes lépések az [5.3. fejezetben](#53-trackerprofil-és-qbittorrent-beállítása) találhatók.
 
-### 14.4. Adatbiztonság
+### 14.4. Opcionális eszközök a dinamikus HDR-hez
+
+A `hdr10plus_tool` és a `dovi_tool` (7.4.3. pont) nem része a telepítőnek. A telepítés után a `bdencode doctor` kimenetében ellenőrizd:
+
+```bash
+bdencode doctor | python3 -m json.tool | grep -A10 '"dynamic_hdr"'
+```
+
+Minden módnál négy érték látszik: az eszköz neve, elérhetősége, verziója és az, hogy az x265 támogatja-e a szükséges paramétert. Csak akkor `available: true`, ha mindkettő teljesül. Hiányzó eszköz mellett az `auto` mód csendben eldob, az explicit `hdr10plus`/`dolby_vision` mód felülvizsgálatot kér.
+
+### 14.5. Adatbázis: migráció, mentés és visszaállítás
+
+A várólista egyetlen SQLite adatbázis (`<data_root>/state/encoder.sqlite3`). Három védelem szól mellette:
+
+1. **Migráció előtti mentés.** Sémafrissítés (jelenleg v1 → v2) előtt az adatbázis induláskor automatikusan mentésre kerül `pre-migration-v<N>` címkével. A telepítő ettől függetlenül saját pillanatképet is készít; ha a belső mentés valamiért nem sikerül, a hiba naplózódik és a (tranzakciós) migráció folytatódik, mert a telepítői pillanatkép így is megvan. Minden migráció bekerül a `schema_migrations` táblába (mikor, melyik verzióról melyikre, melyik mentéssel, melyik BDEncode-verzióval).
+2. **Ütemezett mentés.** A worker üresjáratban naponta ellenőrzött online mentést ír a `state/backups` mappába. Beállítás a `config.toml`-ban (vagy `BDENCODE_BACKUP_INTERVAL_HOURS`, `BDENCODE_BACKUP_KEEP_SCHEDULED` környezeti változóval): `backup_interval_hours = 24` (0 = kikapcsolva), `backup_keep_scheduled = 14`. Megőrzés fajtánként: ütemezett 14, kézi 10, migráció előtti 5, visszaállítás előtti 3.
+3. **Kézi mentés.** A Rendszer oldal „Mentés most” gombjával, vagy parancssorból.
+
+A mentés SQLite online backup API-val készül, ezért futó API és worker mellett is konzisztens (a WAL-ba még nem checkpointolt, véglegesített adatokkal együtt), a másolat egyetlen önálló fájl (`journal_mode=DELETE`), és csak `PRAGMA integrity_check` sikere után, atomi átnevezéssel kerül a végleges nevére. Mellé JSON manifest kerül (méret, SHA-256, sémaverzió, munkák száma).
+
+```bash
+bdencode db-status                 # séma, integritás, migrációs előzmények, mentések
+bdencode db-backup                # kézi mentés (--label, --output-dir)
+bdencode db-backups --verify      # a mentések újrahashelése és integritásellenőrzése
+```
+
+**Visszaállítás** szándékosan csak parancssorból, leállított szolgáltatásokkal lehetséges:
+
+```bash
+sudo systemctl stop bdencode-api.service bdencode-worker.service
+bdencode db-restore encoder-20260501T030000Z-scheduled-1a2b3c4d.sqlite3 --yes
+sudo systemctl start bdencode-worker.service bdencode-api.service
+```
+
+A parancs előbb ellenőrzi a mentést (hash, integritás, támogatott séma), majd a jelenlegi adatbázisról `pre-restore` mentést készít, törli a régi `-wal`/`-shm` fájlokat, és atomi cserével visszaírja a mentést. Ha még van olyan munka, amely a pipeline-t foglalja, a parancs megtagadja a futást (`--force` felülírja). Régebbi sémájú mentés is visszaállítható: a következő indulás migrálja, előtte újabb `pre-migration` mentéssel. A visszaállítás csak az adatbázist érinti, a fájlrendszeren lévő munkamappákat nem.
+
+### 14.6. Adatbiztonság
 
 - A forrást a BDEncode olvassa, nem módosítja.
 - A munkamappában nagy ideiglenes fájlok keletkezhetnek.
@@ -1129,7 +1271,7 @@ A fix dupe/publish endpointokat és host-allowlisteket itt, a hozzájuk tartozó
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[test]'
 pytest
 ```
 
@@ -1138,7 +1280,7 @@ Windows PowerShellben:
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[test]"
 pytest
 ```
 
@@ -1146,13 +1288,27 @@ pytest
 
 ```bash
 cd frontend
-npm install
-npm run build
+corepack pnpm install --frozen-lockfile   # pnpm 11.9.0, a lockfile szerint
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build                        # újraépíti a commitolt frontend/dist mappát
 ```
+
+A `frontend/dist` előre lefordítva a tárolóban van, mert a telepítő ezt publikálja. Felületi módosítás után építsd újra és commitold; a CI ellenőrzi, hogy a commitolt kiadás megegyezik a forrás buildjével. Windowson a Vite az `index.html` sorvégeit CRLF-re alakíthatja: commit előtt a `dist/index.html`-ben csak a két eszköznév (`assets/index-….js/css`) térhet el, a sorvégek LF-ek maradjanak.
 
 Fejlesztői szerverhez a projekt `frontend` mappájának csomagszkriptjeit használd. A telepített produkciós frontend a buildelt fájlokat nginx mögül szolgálja ki; a fejlesztői szerver nem helyettesíti a telepített API-t és workert.
 
-### 15.3. Fontos fejlesztői szabály
+### 15.3. Tesztek Windowson (PowerShell 5.1 és 7)
+
+A `tests/test_windows_install_powershell.py` a `install/windows.ps1` argumentumkezelő útjait **ténylegesen lefuttatja**, a WSL, a rendszerleíró adatbázis és az UAC érintése nélkül. A `tests/powershell/build_windows_harness.ps1` a PowerShell-elemzővel (AST) kivágja a valódi telepítőből a paraméterblokkot, a fenntartott 8796-os port védelmét, az argumentum-továbbító függvényeket, az emelt jogú újraindítás blokkját és a `Register-ContinuationAfterRestart` függvényt; csak a rendszert érintő parancsokat (`Start-Process`, `New-Item`, `New-ItemProperty`) cseréli felvevőkre. A tesztek minden telepített shellben lefutnak: a `pwsh` (PowerShell 7) mellett Windowson a **Windows PowerShell 5.1**-ben is, amelyre a telepítő valójában készül.
+
+Ellenőrzik, hogy minden kötött paraméter (szóközös, ékezetes, idézőjeles és visszaperjeles útvonalak) pontosan átmegy az emelt jogú újraindításon és a reboot utáni RunOnce folytatáson; hogy a második lépésben a shell **saját parancssor-értelmezője** ugyanazokra a paraméterekre köti vissza az átadott sort; hogy a 8796-os port és a tartományon kívüli portok az újraindítás előtt elutasítódnak; hogy az elutasított emelés hibaüzenettel, 1-es kilépőkóddal végződik; és hogy maga az `install/windows.ps1` mindkét verzióban hibátlanul elemezhető, valamint megőrzi az UTF-8 BOM-ot.
+
+### 15.4. Folyamatos integráció
+
+A `.github/workflows/ci.yml` minden pushra és pull requestre lefut: frontend (típusellenőrzés, tesztek, build, a commitolt `dist` frissességének ellenőrzése), Python 3.11/3.12/3.13 **Linuxon**, a teljes tesztsor **Windowson** (windows-latest, PowerShell 7 és 5.1 egyaránt), a shellszkriptek szintaxisa és sorvégei, valamint a natív libbluray-szkenner fordítása. A Windows-specifikus hibák (például egy `C:\Users` a TOML-sztringben) így azonnal kiderülnek.
+
+### 15.5. Fontos fejlesztői szabály
 
 Tesztadatot vagy API-kulcsot ne commitolj. A valós Blu-ray források helyett kis, mesterséges mintákkal teszteld azokat a funkciókat, amelyekhez nincs szükség teljes lemezre.
 
