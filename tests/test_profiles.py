@@ -549,3 +549,25 @@ def test_hdr10_luminance_fields_require_exact_non_boolean_ints(
 def test_unknown_profile_override_is_rejected() -> None:
     with pytest.raises(ValueError, match="unknown encoder setting"):
         recommended_profile("x264", overrides={"magic": True})
+
+
+@pytest.mark.parametrize("value", [-1, 3, 7])
+def test_x264_weightp_outside_the_encoder_range_is_rejected(value: int) -> None:
+    with pytest.raises(ValueError, match="weightp"):
+        recommended_profile(
+            VideoEncoder.X264,
+            detail_level=DetailLevel.PRO,
+            content_type="film",
+            overrides={"weightp": value},
+        )
+
+
+@pytest.mark.parametrize("value", [0, 1, 2])
+def test_x264_weightp_within_the_encoder_range_is_accepted(value: int) -> None:
+    settings = recommended_profile(
+        VideoEncoder.X264,
+        detail_level=DetailLevel.PRO,
+        content_type="film",
+        overrides={"weightp": value},
+    )
+    assert settings.private_params()["weightp"] == value

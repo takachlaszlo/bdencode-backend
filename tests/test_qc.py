@@ -705,3 +705,19 @@ def test_streamed_vmaf_wrapper_records_hdr_mode() -> None:
     assert command[0] == "bdencode-vmaf"
     assert "--hdr10" in command
     assert command[command.index("--model") + 1] == "vmaf_4k_v0.6.1"
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        {"codec_type": "audio", "channels": 2},
+        {"codec_type": "audio", "sample_rate": "48000"},
+        {"codec_type": "audio", "sample_rate": None, "channels": 2},
+        {"codec_type": "audio", "sample_rate": "48000", "channels": "stereo"},
+    ],
+)
+def test_audio_probe_missing_stream_fields_raise_a_reviewable_value_error(
+    stream: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="sample_rate and channels"):
+        parse_audio_probe({"streams": [stream]})

@@ -873,7 +873,15 @@ def parse_audio_probe(document: str | bytes | Mapping[str, Any]) -> AudioProbe:
     if len(streams) != 1:
         raise ValueError("audio probe must contain exactly one selected stream")
     item = streams[0]
-    sample_rate = int(item["sample_rate"])
+    try:
+        sample_rate = int(item["sample_rate"])
+        channels = int(item["channels"])
+    except (KeyError, TypeError, ValueError) as exc:
+        # Callers translate ValueError into a reviewable QC result; a missing
+        # ffprobe field must not surface as an unclassified worker failure.
+        raise ValueError(
+            "audio probe stream has no usable sample_rate and channels"
+        ) from exc
     if sample_rate <= 0:
         raise ValueError("audio probe sample rate must be positive")
     stream_start = _decimal_or_none(item.get("start_time"))
@@ -910,7 +918,7 @@ def parse_audio_probe(document: str | bytes | Mapping[str, Any]) -> AudioProbe:
         profile=_optional_str(item.get("profile")),
         bit_rate=_optional_int(item.get("bit_rate")),
         sample_rate=sample_rate,
-        channels=int(item["channels"]),
+        channels=channels,
         channel_layout=item.get("channel_layout"),
         sample_count=sample_count,
         start_time=start_time,
