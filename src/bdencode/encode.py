@@ -119,6 +119,10 @@ def encode_pipeline_commands(
         "info",
         "-f",
         "yuv4mpegpipe",
+        # The Y4M from vspipe has no colour properties; without describing the
+        # input here, the scaler FFmpeg inserts converts the picture to the
+        # matrix requested for the output.
+        *settings.ffmpeg_color_input_args(),
         "-i",
         "pipe:0",
         "-map",
