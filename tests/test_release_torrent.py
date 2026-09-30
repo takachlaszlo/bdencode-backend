@@ -145,6 +145,45 @@ def test_piece_size_selection_fails_if_profile_maximum_cannot_fit_payload() -> N
         select_piece_size(3 * 16 * 1024, profile)
 
 
+def test_piece_size_selection_prefers_the_maximum_over_overshooting_narrow_windows() -> (
+    None
+):
+    # A 1500..1600 window is narrower than one octave: halving 1450 pieces would
+    # give 2900, so the larger piece size (below the minimum) is the valid answer.
+    profile = _profile(
+        piece_size_min=256 * 1024,
+        piece_size_max=16 * 1024 * 1024,
+        piece_size_default=1024 * 1024,
+        target_piece_count_min=1500,
+        target_piece_count_max=1600,
+    )
+    size = int(1.45 * 1024**3)
+
+    chosen = select_piece_size(size, profile)
+
+    assert chosen == 1024 * 1024
+    assert -(-size // chosen) <= profile.target_piece_count_max
+
+
+def test_default_style_window_selection_is_unchanged_by_the_overshoot_guard() -> None:
+    profile = _profile(
+        piece_size_min=256 * 1024,
+        piece_size_max=16 * 1024 * 1024,
+        piece_size_default=1024 * 1024,
+        target_piece_count_min=1000,
+        target_piece_count_max=2000,
+    )
+    for gib_tenths in range(1, 300):
+        size = gib_tenths * 1024**3 // 10
+        chosen = select_piece_size(size, profile)
+        count = -(-size // chosen)
+        assert chosen & (chosen - 1) == 0
+        assert 256 * 1024 <= chosen <= 16 * 1024 * 1024
+        assert count <= 2000
+        if chosen > 256 * 1024:
+            assert count >= 1000
+
+
 def test_builder_is_deterministic_private_and_has_one_virtual_payload(
     tmp_path: Path,
 ) -> None:

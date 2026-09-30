@@ -281,9 +281,14 @@ def select_piece_size(
         and piece_size < policy.piece_size_max
     ):
         piece_size *= 2
+    # Shrink towards the minimum piece count, but never past the maximum: a
+    # profile whose count window is narrower than one octave has no power of two
+    # inside it for most sizes, and overshooting would reject a payload that a
+    # slightly larger piece size accommodates.
     while (
         _piece_count(file_size, piece_size) < policy.target_piece_count_min
         and piece_size > policy.piece_size_min
+        and _piece_count(file_size, piece_size // 2) <= policy.target_piece_count_max
     ):
         piece_size //= 2
     piece_size = min(policy.piece_size_max, max(policy.piece_size_min, piece_size))

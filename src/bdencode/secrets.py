@@ -20,13 +20,20 @@ def read_secret(
     env = os.environ if environment is None else environment
     credentials_dir = env.get("CREDENTIALS_DIRECTORY")
     if credentials_dir:
-        target = (Path(credentials_dir) / name).resolve(strict=True)
-        root = Path(credentials_dir).resolve(strict=True)
-        if target.parent != root or not target.is_file():
-            raise SecretUnavailable(f"invalid credential path for {name}")
-        value = target.read_text(encoding="utf-8").strip()
-        if value:
-            return value
+        # systemd only exposes the credentials that were configured, so a
+        # missing entry is an ordinary "not configured" answer that must reach
+        # the caller's fallback path as SecretUnavailable, not a raw OSError.
+        try:
+            root = Path(credentials_dir).resolve(strict=True)
+            target: Path | None = (root / name).resolve(strict=True)
+        except (FileNotFoundError, NotADirectoryError):
+            target = None
+        if target is not None:
+            if target.parent != root or not target.is_file():
+                raise SecretUnavailable(f"invalid credential path for {name}")
+            value = target.read_text(encoding="utf-8").strip()
+            if value:
+                return value
     if allow_environment:
         key = name.upper().replace("-", "_")
         if env.get(key):

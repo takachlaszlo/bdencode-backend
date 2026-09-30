@@ -213,6 +213,21 @@ class CompletedReleaseDeleteRequest(_ApiRequest):
         return dict(value)
 
 
+def _resolve_existing(path: str | Path, *, description: str) -> Path:
+    """Resolve operator-supplied input, mapping filesystem misses to API errors.
+
+    A missing path is a 404 and an unresolvable one (symlink loop, permission
+    error, embedded NUL) a 422; neither may escape as an unhandled 500.
+    """
+
+    try:
+        return Path(path).expanduser().resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise NotFoundError(f"{description} does not exist") from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigurationError(f"{description} cannot be resolved") from exc
+
+
 def default_database_path() -> Path:
     configured = os.environ.get("BDENCODE_DB_PATH")
     if configured:
@@ -622,7 +637,11 @@ def create_app(
         if not selected.is_dir():
             raise ConfigurationError("source browser path must be a directory")
         entries: list[dict[str, object]] = []
-        for item in sorted(selected.iterdir(), key=lambda value: value.name.casefold()):
+        try:
+            children = sorted(selected.iterdir(), key=lambda value: value.name.casefold())
+        except OSError as exc:
+            raise ConfigurationError("source directory cannot be read") from exc
+        for item in children:
             if item.is_symlink():
                 try:
                     settings.authorize_source(item)
@@ -647,7 +666,7 @@ def create_app(
 
     @application.get(f"{API_PREFIX}/analyze-mkv")
     def analyze_mkv(path: str) -> dict[str, object]:
-        target = Path(path).expanduser().resolve(strict=True)
+        target = _resolve_existing(path, description="MKV file")
         if settings is not None and not (
             target.is_relative_to(settings.completed_root)
             or target.is_relative_to(settings.jobs_root)
@@ -1477,7 +1496,10 @@ def create_app(
     )
     def artifact_content(artifact_id: str) -> FileResponse:
         artifact = db.get_artifact(artifact_id)
-        target = Path(artifact.path).expanduser().resolve(strict=True)
+        try:
+            target = _resolve_existing(artifact.path, description="artifact file")
+        except NotFoundError as exc:
+            raise NotFoundError(f"artifact file is missing: {artifact_id}") from exc
         if settings is not None and not (
             target.is_relative_to(settings.jobs_root)
             or target.is_relative_to(settings.completed_root)

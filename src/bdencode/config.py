@@ -132,7 +132,16 @@ class Settings:
     def authorize_source(
         self, candidate: str | Path, *, must_exist: bool = True
     ) -> Path:
-        path = Path(candidate).expanduser().resolve(strict=must_exist)
+        try:
+            path = Path(candidate).expanduser().resolve(strict=must_exist)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise ConfigurationError(f"source does not exist: {candidate}") from exc
+        except (OSError, RuntimeError, ValueError) as exc:
+            # Symlink loops (RuntimeError before Python 3.13), permission
+            # errors and embedded NUL bytes are operator input problems too.
+            raise ConfigurationError(
+                f"source path cannot be resolved: {candidate}"
+            ) from exc
         if not any(
             path == root or path.is_relative_to(root) for root in self.source_roots
         ):
