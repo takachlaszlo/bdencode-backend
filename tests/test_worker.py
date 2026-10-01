@@ -2290,6 +2290,7 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     assert metrics["sample_count"] == 24
     assert metrics["quality_gate"]["status"] == "passed"
     assert set(metrics["aggregate"]) == {
+        "plane_bias_8bit_mean",
         "psnr_average_db_mean",
         "ssim_all_mean",
     }
