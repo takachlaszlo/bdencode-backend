@@ -7,6 +7,8 @@ same-origin mutation guard and the same error envelope.
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -26,6 +28,9 @@ from .profile_library import (
     ProfileLibraryError,
     ProfileNotFound,
 )
+
+#: Written by the root-owned daily release check; world-readable, no secrets.
+RELEASE_UPDATE_STATUS_PATH = Path("/var/lib/bdencode/release-update/status.json")
 
 _PREVIEW_STATUS = {
     "invalid": 422,
@@ -310,6 +315,23 @@ def register_extra_routes(
             "directory": str(directory),
             "items": [item.to_dict() for item in list_backups(directory)],
         }
+
+    @application.get(f"{prefix}/system/release-update")
+    def release_update_status() -> dict[str, Any]:
+        """The daily release check's last outcome (written by bdencode-release-update)."""
+
+        path = Path(os.environ.get("BDENCODE_RELEASE_STATUS_PATH") or RELEASE_UPDATE_STATUS_PATH)
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"available": False, "status": None}
+        if not isinstance(document, dict):
+            return {"available": False, "status": None}
+        keys = (
+            "state", "message", "checked_at", "last_successful_check_at", "installed_version",
+            "latest_version", "latest_tag", "installed_at", "installed_commit", "media_updates",
+        )
+        return {"available": True, "status": {key: document.get(key) for key in keys if key in document}}
 
     @application.post(f"{prefix}/system/backups", status_code=status.HTTP_201_CREATED)
     def create_backup_now() -> dict[str, Any]:

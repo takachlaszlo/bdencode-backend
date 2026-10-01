@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,6 +72,12 @@ INSTALL_TERMINATE_GRACE_SECONDS = 300
 SHORT_TERMINATE_GRACE_SECONDS = 10
 TAIL_LINES = 25
 LOG_LIMIT_BYTES = 5 * 1024 * 1024
+
+# Debian packages whose security fixes the daily check only reports (it never installs them).
+MEDIA_PACKAGES = ("ffmpeg", "x264", "x265", "mkvtoolnix", "mediainfo", "libbluray-bin", "libbluray2")
+INST_RE = re.compile(r"^Inst (\S+) \[([^\]]+)\] \(([^ ]+)")
+NOTIFY_TIMEOUT_SECONDS = 15
+NOTIFY_STATES = frozenset({"installed", "install_failed", "blocked", "invalid_release"})
 
 STATE_UP_TO_DATE = "up_to_date"
 STATE_AVAILABLE = "update_available"
@@ -155,6 +162,7 @@ def validate_repository(value: object) -> str:
 class ReleaseConfig:
     repository: str = DEFAULT_REPOSITORY
     automatic_install: bool = True
+    notify_url: str | None = None
 
 
 def load_release_config(path: Path, *, require_root_owner: bool = False) -> ReleaseConfig:
@@ -173,15 +181,21 @@ def load_release_config(path: Path, *, require_root_owner: bool = False) -> Rele
             raw = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ReleaseUpdateError(f"unreadable release update configuration {path}: {error}") from error
-    unknown = sorted(set(raw) - {"repository", "automatic_install"})
+    unknown = sorted(set(raw) - {"repository", "automatic_install", "notify_url"})
     if unknown:
         raise ReleaseUpdateError(f"unknown key(s) in {path}: {', '.join(unknown)}")
     automatic = raw.get("automatic_install", True)
     if not isinstance(automatic, bool):
         raise ReleaseUpdateError("automatic_install must be true or false")
+    notify_url = raw.get("notify_url")
+    if notify_url is not None and not (
+        isinstance(notify_url, str) and HTTPS_REPOSITORY_RE.fullmatch(notify_url)
+    ):
+        raise ReleaseUpdateError("notify_url must be an https:// URL without credentials, query or fragment")
     return ReleaseConfig(
         repository=validate_repository(raw.get("repository", DEFAULT_REPOSITORY)),
         automatic_install=automatic,
+        notify_url=notify_url,
     )
 
 
@@ -422,8 +436,10 @@ class ReleaseUpdater:
         report: Reporter,
         *,
         check_only: bool = False,
+        install_tag: str | None = None,
         clock: Callable[[], str] = utc_now,
         release_id: str | None = None,
+        post: Callable[[str, bytes], None] | None = None,
     ) -> None:
         self.deployment = deployment
         self.config = config
@@ -431,6 +447,9 @@ class ReleaseUpdater:
         self.store = store
         self.report = report
         self.check_only = check_only
+        # An explicit, operator-requested installation of one tag (also an older one: a rollback).
+        self.install_tag = install_tag
+        self.post = post or self._post_json
         self.clock = clock
         self.release_id = release_id or f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}"
         self.document = store.load()
@@ -604,14 +623,61 @@ class ReleaseUpdater:
         return result.returncode
 
     # -- status -------------------------------------------------------------------------------------
+    @staticmethod
+    def _post_json(url: str, payload: bytes) -> None:
+        request = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=NOTIFY_TIMEOUT_SECONDS):  # noqa: S310 - https only
+            pass
+
+    def notify(self, state: str, message: str) -> None:
+        if not self.config.notify_url:
+            return
+        payload = json.dumps(
+            {
+                "event": f"bdencode-release-update.{state}",
+                "state": state,
+                "message": message,
+                "installed_version": self.document.get("installed_version"),
+                "latest_version": self.document.get("latest_version"),
+                "text": f"BDEncode: {message}",
+            }
+        ).encode("utf-8")
+        try:
+            self.post(self.config.notify_url, payload)
+        except Exception as error:  # noqa: BLE001 - a notification must never fail the update
+            self.report(f"notification failed: {error}")
+
+    def media_updates(self) -> list[str]:
+        """Pending Debian updates of the media packages, for the status only (nothing is installed)."""
+
+        try:
+            result = self.runner.run(
+                ["apt-get", "-s", "-qq", "install", "--only-upgrade", *MEDIA_PACKAGES],
+                env={"LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except (ReleaseUpdateError, OSError):
+            return []
+        updates = []
+        for line in result.stdout.splitlines():
+            match = INST_RE.match(line.strip())
+            if match:
+                updates.append(f"{match[1]} {match[2]} -> {match[3]}")
+        return updates
+
     def record(self, state: str, message: str, **fields: Any) -> None:
         now = self.clock()
+        previous_state = self.document.get("state")
         self.document.update({"schema": STATUS_SCHEMA, "state": state, "message": message, "checked_at": now})
         if state in HEALTHY_STATES:
             self.document["last_successful_check_at"] = now
         self.document.update({key: value for key, value in fields.items() if value is not None})
         self.store.save(self.document)
         self.report(f"{state}: {message}")
+        if state in NOTIFY_STATES and (state != previous_state or state == STATE_INSTALLED):
+            self.notify(state, message)
 
     def failed_attempts(self, tag: str) -> int:
         attempts = self.document.get("failed_attempts")
@@ -626,34 +692,47 @@ class ReleaseUpdater:
     def run(self) -> int:
         self.report("release check started")
         try:
-            return self._run()
+            code = self._run()
         except InvalidReleaseError as error:
             tag = self.document.get("latest_tag")
             if isinstance(tag, str):
                 self.set_failed_attempts(tag, MAX_FAILED_ATTEMPTS)
             self.record(STATE_INVALID, str(error))
-            return 1
+            code = 1
         except ReleaseUpdateError as error:
             self.record(STATE_CHECK_FAILED, str(error))
-            return 1
+            code = 1
+        updates = self.media_updates()
+        if updates != self.document.get("media_updates", []):
+            self.document["media_updates"] = updates
+            self.store.save(self.document)
+        if updates:
+            self.report(f"media package updates pending (not installed automatically): {', '.join(updates)}")
+        return code
 
     def _run(self) -> int:
         deployment = self.deployment
         installed = self.installed_version()
-        tag, latest = self.latest_release()
+        if self.install_tag is not None:
+            tag = self.install_tag
+            if TAG_RE.match(tag) is None:
+                raise ReleaseUpdateError(f"{tag!r} is not a vX.Y.Z tag")
+            latest = parse_version(tag.removeprefix("v"))
+        else:
+            tag, latest = self.latest_release()
         self.document.update(
             installed_version=format_version(installed),
             latest_version=format_version(latest),
             latest_tag=tag,
         )
-        if latest <= installed:
+        if self.install_tag is None and latest <= installed:
             self.record(STATE_UP_TO_DATE, f"BDEncode {format_version(installed)} is the newest release")
             return 0
-        if self.check_only or not self.config.automatic_install:
+        if self.install_tag is None and (self.check_only or not self.config.automatic_install):
             reason = "check only" if self.check_only else "automatic_install is off"
             self.record(STATE_AVAILABLE, f"{tag} is available ({reason}); install it manually")
             return 0
-        if self.failed_attempts(tag) >= MAX_FAILED_ATTEMPTS:
+        if self.install_tag is None and self.failed_attempts(tag) >= MAX_FAILED_ATTEMPTS:
             self.record(
                 STATE_BLOCKED,
                 f"automatic installation of {tag} stopped after {MAX_FAILED_ATTEMPTS} failed attempts; "
@@ -728,9 +807,11 @@ def parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="run",
-        choices=("run", "check"),
-        help="run: install a newer release unattended; check: only report",
+        choices=("run", "check", "install"),
+        help="run: install a newer release unattended; check: only report; "
+        "install --tag vX.Y.Z: install exactly that release now, also an older one (rollback)",
     )
+    result.add_argument("--tag", help="release tag for the install command, for example v2.2.1")
     result.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     result.add_argument("--release-config", type=Path, default=DEFAULT_RELEASE_CONFIG)
     result.add_argument("--service-config", type=Path, default=DEFAULT_SERVICE_CONFIG)
@@ -750,6 +831,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if not args.user:
         print("BDEncode account is unknown: set BDENCODE_USER or pass --user", file=sys.stderr)
+        return 2
+    if args.command == "install" and not (args.tag and TAG_RE.match(args.tag)):
+        print("install needs --tag vX.Y.Z", file=sys.stderr)
         return 2
     state_root: Path = args.state_root
     state_root.mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -785,7 +869,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         report(f"{STATE_CHECK_FAILED}: {error}")
         return 1
     updater = ReleaseUpdater(
-        deployment, config, SystemRunner(), store, report, check_only=args.command == "check"
+        deployment, config, SystemRunner(), store, report, check_only=args.command == "check",
+        install_tag=args.tag if args.command == "install" else None,
     )
     return updater.run()
 

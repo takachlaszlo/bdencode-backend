@@ -1,0 +1,67 @@
+name: End-to-end
+
+# The whole worker pipeline on a synthetic HDR10 "disc" with the real tools (ffmpeg/x265, VapourSynth +
+# BestSource, the standalone libvmaf, mkvmerge): only the disc scan and the libbluray remux are faked.
+# This is what found the defects the unit tests could not see; run it nightly and on demand.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/e2e.yml"
+      - "tools/e2e/**"
+      - "tools/requirements-vapoursynth.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-disc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      VMAF_COMMIT: 6375a4be62fd2673bba2c356b26867d8af01a685
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Media tools and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix mediainfo build-essential meson ninja-build nasm git
+          ffmpeg -hide_banner -version | head -1
+      - name: VapourSynth with BestSource (pinned wheels, as the installer does)
+        run: |
+          python -m pip install --upgrade pip 'uv>=0.8,<1'
+          uv venv --python "$(which python)" "$RUNNER_TEMP/tools"
+          uv pip install --python "$RUNNER_TEMP/tools/bin/python" --requirement tools/requirements-vapoursynth.lock
+          mkdir -p "$RUNNER_TEMP/vsconfig"
+          XDG_CONFIG_HOME="$RUNNER_TEMP/vsconfig" "$RUNNER_TEMP/tools/bin/vapoursynth" config
+          echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/vsconfig" >> "$GITHUB_ENV"
+      - name: Cache the standalone libvmaf build
+        id: vmaf-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vmaf-install
+          key: vmaf-${{ env.VMAF_COMMIT }}-${{ runner.os }}
+      - name: Build the standalone libvmaf (pinned commit, as the installer does)
+        if: steps.vmaf-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/Netflix/vmaf.git "$RUNNER_TEMP/vmaf-src"
+          git -C "$RUNNER_TEMP/vmaf-src" checkout --detach "$VMAF_COMMIT"
+          meson setup --buildtype release --default-library=static --prefix "$RUNNER_TEMP/vmaf-install" \
+            "$RUNNER_TEMP/vmaf-src/libvmaf/build" "$RUNNER_TEMP/vmaf-src/libvmaf"
+          ninja -C "$RUNNER_TEMP/vmaf-src/libvmaf/build"
+          ninja -C "$RUNNER_TEMP/vmaf-src/libvmaf/build" install
+      - name: Tool inventory
+        run: |
+          echo "$RUNNER_TEMP/vmaf-install/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/vmaf-install/bin/vmaf" --version
+          vspipe --version
+          python -m pip install '.[test]'
+      - name: Synthetic disc, end to end
+        run: python tools/e2e/synthetic_disc.py --work "$RUNNER_TEMP/e2e"

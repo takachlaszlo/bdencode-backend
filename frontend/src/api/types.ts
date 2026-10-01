@@ -854,6 +854,26 @@ export interface PlayerInfo {
   limits: { min_duration_seconds: number; max_duration_seconds: number; heights: number[] };
 }
 
+// -- Release check ---------------------------------------------------------------------------------
+
+export interface ReleaseUpdateStatus {
+  state: string;
+  message: string;
+  checked_at: string;
+  last_successful_check_at?: string;
+  installed_version?: string;
+  latest_version?: string;
+  latest_tag?: string;
+  installed_at?: string;
+  installed_commit?: string;
+  media_updates?: string[];
+}
+
+export interface ReleaseUpdateResponse {
+  available: boolean;
+  status: ReleaseUpdateStatus | null;
+}
+
 // -- Database status and backups ------------------------------------------------------------------
 
 export interface BackupInfo {

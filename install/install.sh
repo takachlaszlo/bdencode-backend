@@ -670,6 +670,9 @@ if ! sudo test -e /etc/bdencode/release-update.toml; then
 # repository is installed unattended when it is newer than the installed version.
 repository = "$update_repository"
 # false: only record that a newer release exists and install it manually.
+# Optional: an https URL (for example an ntfy.sh topic) that receives a JSON POST when an update was
+# installed or failed.
+# notify_url = "https://ntfy.sh/your-topic"
 automatic_install = true
 EOF
     sudo chown root:root /etc/bdencode/release-update.toml
