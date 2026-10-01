@@ -1339,6 +1339,8 @@ Ellenőrzik, hogy minden kötött paraméter (szóközös, ékezetes, idézőjel
 
 A `.github/workflows/ci.yml` minden pushra és pull requestre lefut: frontend (típusellenőrzés, tesztek, build, a commitolt `dist` frissességének ellenőrzése), Python 3.11/3.12/3.13 **Linuxon**, a teljes tesztsor **Windowson** (windows-latest, PowerShell 7 és 5.1 egyaránt), a shellszkriptek szintaxisa és sorvégei, valamint a natív libbluray-szkenner fordítása. A Windows-specifikus hibák (például egy `C:\Users` a TOML-sztringben) így azonnal kiderülnek.
 
+A Linux-legek telepítik az `ffmpeg`, `mkvtoolnix` és `mediainfo` csomagot, hogy a valódi-eszközös tesztek (színkonverzió a kódolócsőben, 10 bites Y4M, mux) ne maradjanak ki. A VapourSynth és a libvmaf nincs a CI-ben, ezért a teljes csővezetéket szintetikus HDR10 „lemezen" a `tools/e2e/synthetic_disc.py` próbálja ki valódi eszközökkel (a lemezbeolvasás és a libbluray-remux kivételével). Futtasd a kódolás-, QC- vagy comparison-kód módosítása, valamint az ffmpeg, x265, VapourSynth vagy libvmaf frissítése után, a telepített eszközkészlettel (kb. 8 perc): `python tools/e2e/synthetic_disc.py --work /tmp/bdencode-e2e`, vagy `BDENCODE_E2E=1 python -m pytest tests/test_e2e_synthetic.py`.
+
 A Windows-leg szándékosan **Python 3.13**-mal fut: ezt használja a Windows-gép, és ezt a WSL-beli Debian 13 is. Windowson 3.12-ig a csak Linuxon használt telepítő- és worker-tesztek platformokozta okból buknak: az `os.fchmod` nem létezik, a `time.time()` pedig durva óra, amely elmarad az NTFS `mtime`-tól, így egy közvetlenül a checkpoint előtt írt fájl újabbnak látszhat nála (helyi méréssel a fájlok kb. 10%-ánál). A 3.11-es és 3.12-es verziót a Linux-leg fedi le.
 
 ### 15.5. Fontos fejlesztői szabály
