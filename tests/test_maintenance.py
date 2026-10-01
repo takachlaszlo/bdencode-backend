@@ -465,6 +465,71 @@ def test_destructive_intent_and_remote_claim_block_both_interleavings(
     database.close()
 
 
+def test_destructive_intent_blocks_the_publication_lease(tmp_path: Path) -> None:
+    settings, database, journal = _journal_context(tmp_path)
+    job_id, created = _release_record(settings, database)
+    store = ReleaseStore(database)
+    preparing = store.transition(
+        created.id,
+        ReleasePreparationState.PREPARING,
+        expected_version=created.version,
+    )
+    ready = store.transition(
+        created.id,
+        ReleasePreparationState.READY,
+        expected_version=preparing.version,
+        values={
+            "manifest_sha256": "c" * 64,
+            "torrent_infohash": "d" * 40,
+            "torrent_sha256": "e" * 64,
+        },
+    )
+    checking = store.transition(
+        created.id,
+        ReleasePreparationState.SEEDING_CHECK,
+        expected_version=ready.version,
+    )
+    publishable = store.transition(
+        created.id,
+        ReleasePreparationState.READY_TO_PUBLISH,
+        expected_version=checking.version,
+    )
+    release = settings.completed_root / publishable.metadata.release_name
+    release.mkdir()
+    (release / publishable.payload_name).write_bytes(b"payload")
+    job = database.get_job(job_id)
+    operation = journal.begin(
+        "completed-release-delete",
+        job_id,
+        [MaintenanceTargetSpec(release, settings.completed_root)],
+        guard=MaintenanceDomainGuard(
+            job_id=job_id,
+            expected_job_version=job.version,
+            allowed_job_states=("COMPLETED",),
+            expected_preparation_versions={publishable.id: publishable.version},
+            forbid_active_preparations=True,
+        ),
+    )
+
+    def claim() -> ReleasePreparation:
+        return store.claim_publication(
+            publishable.id,
+            expected_version=publishable.version,
+            expected_profile_digest="a" * 64,
+            expected_manifest_sha256="c" * 64,
+            expected_payload_sha256="b" * 64,
+            dupe_receipt={"outcome": "CLEAR"},
+        )
+
+    with pytest.raises(StateConflictError, match="destructive maintenance intent"):
+        claim()
+    assert store.get(publishable.id).state is ReleasePreparationState.READY_TO_PUBLISH
+
+    journal.rollback(operation.id)
+    assert claim().state is ReleasePreparationState.PUBLISHING
+    database.close()
+
+
 def test_committed_journal_reaps_missing_quarantine_idempotently(
     tmp_path: Path,
 ) -> None:

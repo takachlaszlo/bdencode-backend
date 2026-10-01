@@ -20,6 +20,7 @@ from typing import Callable, Literal, Mapping, Sequence
 
 SECRET_MARKERS = (
     "api_key",
+    "api-key",
     "apikey",
     "authorization",
     "token",
@@ -106,33 +107,52 @@ class ProcessResult:
         return shlex.join(redact_argv(self.argv))
 
 
+_URL_SECRET_QUERY = re.compile(r"(?i)([?&](?:key|token|userhash|api[_-]?key)=)[^&\s]+")
+
+
+def _secret_key_length(item: str) -> int | None:
+    """Return the length of a secret-looking ``key`` that opens ``item``.
+
+    Only an option name (``--token``) or a ``key=value`` / ``Header: value``
+    prefix counts.  A marker word inside a path or a title (``The Secret Life
+    of Pets``) is not a credential and must not hide neighbouring arguments.
+    Returns ``None`` when ``item`` does not open with such a key.
+    """
+
+    separators = [
+        position for token in ("=", ":") if (position := item.find(token)) >= 0
+    ]
+    key = item[: min(separators)] if separators else item
+    if not key or any(char.isspace() or char in "/\\" for char in key):
+        return None
+    if "://" in item and any(marker in item.lower() for marker in SECRET_MARKERS):
+        # URLs may carry credentials in their path or authority; keep the
+        # scheme only.
+        return len(key)
+    if not any(marker in key.lower() for marker in SECRET_MARKERS):
+        return None
+    return len(key)
+
+
 def redact_argv(argv: Sequence[str]) -> list[str]:
     redacted: list[str] = []
     hide_next = False
     for item in argv:
-        lowered = item.lower()
         if hide_next:
             redacted.append("<redacted>")
             hide_next = False
             continue
-        if any(marker in lowered for marker in SECRET_MARKERS):
-            separators = [
-                position for token in ("=", ":") if (position := item.find(token)) >= 0
-            ]
-            if separators:
-                position = min(separators)
-                redacted.append(item[: position + 1] + " <redacted>")
+        key_length = _secret_key_length(item)
+        if key_length is not None:
+            if key_length < len(item):
+                redacted.append(item[: key_length + 1] + " <redacted>")
             else:
                 redacted.append(item)
-                hide_next = True
-        elif re.search(r"(?i)([?&](?:key|token|userhash|api[_-]?key)=)[^&\s]+", item):
-            redacted.append(
-                re.sub(
-                    r"(?i)([?&](?:key|token|userhash|api[_-]?key)=)[^&\s]+",
-                    r"\1<redacted>",
-                    item,
-                )
-            )
+                # A bare ``--password`` style option carries its value in the
+                # next argument.
+                hide_next = item.startswith("-")
+        elif _URL_SECRET_QUERY.search(item):
+            redacted.append(_URL_SECRET_QUERY.sub(r"\1<redacted>", item))
         else:
             redacted.append(item)
     return redacted

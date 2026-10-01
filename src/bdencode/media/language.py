@@ -268,10 +268,17 @@ class LanguageResolver:
         declared_codes = {item.normalized_code for item in declared}
         strong_content = [item for item in content if item.confidence >= 0.85]
         # Authored MPLS/CLPI/PMT tags often repeat the same wrong language.  A
-        # strong content result must therefore be allowed to contradict even a
-        # unanimous declaration instead of being silently discarded.
-        if len(declared_codes) == 1 and strong_content:
-            declared_code = next(iter(declared_codes))
+        # strong content result must therefore be allowed to contradict the
+        # declaration that would otherwise be accepted: a unanimous one, or the
+        # MPLS+CLPI pair when only the weaker PMT tag dissents.  Extra dissent
+        # among the declarations must never reduce the scrutiny.
+        accepted_declaration: str | None = None
+        if mpls_code and clpi_code and mpls_code == clpi_code:
+            accepted_declaration = mpls_code
+        elif len(declared_codes) == 1:
+            accepted_declaration = next(iter(declared_codes))
+        if accepted_declaration is not None and strong_content:
+            declared_code = accepted_declaration
             disagreeing = [
                 item for item in strong_content if item.normalized_code != declared_code
             ]

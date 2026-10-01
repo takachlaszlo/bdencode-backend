@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
-from .config import Settings, load_settings
+from .config import ConfigurationError, Settings, load_settings
 from .db import Database
 from .models import JobState
 
@@ -118,10 +118,23 @@ def _run_api(args: argparse.Namespace) -> int:
     from .api import create_app
 
     settings = _settings(args)
+    overrides: dict[str, object] = {}
+    if args.host:
+        overrides["bind_host"] = args.host
+    if args.port is not None:
+        overrides["bind_port"] = args.port
+    if overrides:
+        # Command-line overrides must satisfy the same loopback-only and port
+        # invariants as configured values; the API relies on a trusted proxy.
+        try:
+            settings = replace(settings, **overrides).validate()
+        except ConfigurationError as exc:
+            print(f"bdencode: {exc}", file=sys.stderr)
+            return 2
     uvicorn.run(
         create_app(_database(args, settings), settings=settings),
-        host=args.host or settings.bind_host,
-        port=args.port or settings.bind_port,
+        host=settings.bind_host,
+        port=settings.bind_port,
         log_level=(args.log_level or settings.log_level).lower(),
         root_path=settings.api_root_path,
     )

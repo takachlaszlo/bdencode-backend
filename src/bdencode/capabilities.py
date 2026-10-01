@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -66,7 +67,10 @@ def discover_tool(name: str, runner: CommandRunner | None = None) -> ToolCapabil
         )
         content = (completed.stdout or completed.stderr).strip()
         version = content.splitlines()[0][:500] if content else None
-    except (OSError, TimeoutError):
+    except (OSError, TimeoutError, subprocess.SubprocessError):
+        # A hung or crashing --version probe (TimeoutExpired is a
+        # SubprocessError, not a TimeoutError) must not abort the whole
+        # snapshot that the doctor, the API and the job manifest depend on.
         version = None
     return ToolCapability(name, str(path), version, _hash_binary(path))
 
@@ -87,10 +91,15 @@ def ffmpeg_features(runner: CommandRunner | None = None) -> dict[str, list[str]]
         ("protocols", "-protocols"),
         ("bitstream_filters", "-bsfs"),
     ):
-        completed = command_runner.capture(
-            ["ffmpeg", "-hide_banner", flag], check=False
-        )
-        text = completed.stdout + completed.stderr
+        try:
+            completed = command_runner.capture(
+                ["ffmpeg", "-hide_banner", flag], check=False
+            )
+            text = completed.stdout + completed.stderr
+        except (OSError, subprocess.SubprocessError):
+            # Report the capabilities as absent (fail closed) instead of
+            # raising from the diagnostics path.
+            text = ""
         wanted = {
             "encoders": ("libx264", "libx265", "flac", "ac3", "eac3", "dca"),
             "filters": (

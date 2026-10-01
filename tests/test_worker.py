@@ -4190,6 +4190,27 @@ def test_native_yuv_metric_gate_accepts_all_exact_policy_boundaries() -> None:
     )
 
 
+def test_identical_sample_does_not_mask_the_mean_psnr_gate() -> None:
+    from bdencode.qc.video import parse_ffmpeg_metric_stats
+
+    def measured(psnr_line: str, category: str) -> dict[str, object]:
+        psnr = parse_ffmpeg_metric_stats(psnr_line)
+        return {
+            "category": category,
+            "ssim_all": 0.99,
+            "psnr_average_db": psnr["psnr_avg"],
+        }
+
+    samples = [
+        measured("n:1 psnr_avg:inf psnr_y:inf\n", "I"),
+        measured("n:1 psnr_avg:36.0 psnr_y:36.0\n", "P"),
+        measured("n:1 psnr_avg:36.5 psnr_y:36.5\n", "B"),
+    ]
+    assert worker_module._sampled_video_metric_errors(samples) == (
+        "mean sampled PSNR is below 38 dB",
+    )
+
+
 @pytest.mark.parametrize(
     ("samples", "message"),
     (

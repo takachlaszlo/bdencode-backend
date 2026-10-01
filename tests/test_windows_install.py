@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).parents[1]
@@ -87,3 +93,135 @@ def test_media_sources_render_for_supported_debian_releases() -> None:
     assert "@DATA_ROOT@/release-kits" in worker_unit
     assert '"$data_root/release-kits"' in installer
     assert "dpkg-repack man-db mediainfo" in installer
+
+
+def test_windows_bootstrap_forwards_explicit_parameters_when_relaunching() -> None:
+    script = (ROOT / "install" / "windows.ps1").read_text(encoding="utf-8")
+
+    # Functions get their own $PSBoundParameters, so the script-level value is
+    # captured once and reused by the elevation and RunOnce continuation paths.
+    assert "$script:InstallArguments = $PSBoundParameters" in script
+    assert script.count("Get-ForwardedArgumentLine") == 3
+    assert '$argumentLine = "$argumentLine $forwarded"' in script
+    assert '$command = "$command $forwarded"' in script
+    assert "if ($Port -eq 8796)" in script
+    assert "/etc/wsl.conf.bdencode-backup" in script
+
+
+def _parse_windows_command_line(line: str) -> list[str]:
+    """Split a command line with the CommandLineToArgvW backslash/quote rules."""
+
+    arguments: list[str] = []
+    index, length = 0, len(line)
+    while index < length:
+        while index < length and line[index] in " \t":
+            index += 1
+        if index >= length:
+            break
+        current: list[str] = []
+        quoted = False
+        while index < length and (quoted or line[index] not in " \t"):
+            char = line[index]
+            if char == "\\":
+                end = index
+                while end < length and line[end] == "\\":
+                    end += 1
+                count = end - index
+                if end < length and line[end] == '"':
+                    current.append("\\" * (count // 2))
+                    if count % 2:
+                        current.append('"')
+                        index = end + 1
+                    else:
+                        index = end
+                else:
+                    current.append("\\" * count)
+                    index = end
+            elif char == '"':
+                quoted = not quoted
+                index += 1
+            else:
+                current.append(char)
+                index += 1
+        arguments.append("".join(current))
+    return arguments
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell is not installed")
+def test_forwarded_argument_line_round_trips_awkward_values(tmp_path: Path) -> None:
+    harness = tmp_path / "harness.ps1"
+    harness.write_text(
+        """
+param([string]$Script, [string]$CasesJson)
+$parseTokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$parseTokens, [ref]$errors)
+if ($errors.Count) { exit 2 }
+$wanted = 'ConvertTo-CommandLineArgument', 'Get-ForwardedArgumentLine'
+$definitions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $wanted }, $true)
+foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
+$cases = Get-Content -Raw -Encoding UTF8 $CasesJson | ConvertFrom-Json
+$lines = foreach ($case in $cases) {
+    $script:InstallArguments = [ordered]@{}
+    foreach ($property in $case.PSObject.Properties) {
+        if ($property.Value -is [bool]) {
+            $script:InstallArguments[$property.Name] = [System.Management.Automation.SwitchParameter]::new($property.Value)
+        } else {
+            $script:InstallArguments[$property.Name] = $property.Value
+        }
+    }
+    , (Get-ForwardedArgumentLine)
+}
+ConvertTo-Json -Compress -InputObject @($lines)
+""",
+        encoding="utf-8",
+    )
+    values = [
+        "9000",
+        "D:\\Filmek",
+        "D:\\Filmek\\",
+        "D:\\Mozi filmek\\",
+        'a "quoted" name',
+        'ends with quote"',
+        'back\\\\"slash',
+        "trailing\\",
+        "\u00fc\u00f1\u00ed \u0151",
+        "",
+    ]
+    cases: list[dict[str, object]] = [
+        {"SourcePath": value, "AllowExistingDistro": True, "Verbose": False}
+        for value in values
+    ]
+    cases += [{}, {"Port": 9000, "DistroName": "Debian"}]
+    cases_path = tmp_path / "cases.json"
+    cases_path.write_text(json.dumps(cases), encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(harness),
+            "-Script",
+            str(ROOT / "install" / "windows.ps1"),
+            "-CasesJson",
+            str(cases_path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={**os.environ, "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT": "1"},
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    lines = json.loads(completed.stdout)
+    assert len(lines) == len(cases)
+    for case, line in zip(cases, lines, strict=True):
+        expected: list[str] = []
+        for name, value in case.items():
+            if isinstance(value, bool):
+                if value:
+                    expected.append(f"-{name}")
+            else:
+                expected.extend((f"-{name}", str(value)))
+        assert _parse_windows_command_line(line) == expected

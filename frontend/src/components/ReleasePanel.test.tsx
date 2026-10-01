@@ -144,6 +144,33 @@ describe("ReleasePanel 2.1 release workflow", () => {
     }));
   });
 
+  it("derives UHD release defaults from the x265 selection when the job requested AUTO", async () => {
+    const uhdJob = makeJob({
+      state: "COMPLETED",
+      disc_type: "AUTO",
+      output_path: "/release/Mintafilm.2024.2160p.UHD.BluRay.x265.mkv",
+      selection: { video: { settings: { encoder: "x265" } }, tracks: [] },
+    });
+    renderApp(<ReleasePanel job={uhdJob} />);
+
+    expect(await screen.findByRole("textbox", { name: "Forrás" })).toHaveValue("UHD Blu-ray");
+    expect(screen.getByRole("textbox", { name: "Felbontás" })).toHaveValue("2160p");
+    expect(screen.getByRole("textbox", { name: "Videokodek" })).toHaveValue("H.265");
+  });
+
+  it("keeps Blu-ray defaults for an AUTO job encoded with x264", async () => {
+    const bdJob = makeJob({
+      state: "COMPLETED",
+      disc_type: "AUTO",
+      output_path: "/release/Mintafilm.2024.1080p.BluRay.x264.mkv",
+      selection: { video: { settings: { encoder: "x264" } }, tracks: [] },
+    });
+    renderApp(<ReleasePanel job={bdJob} />);
+
+    expect(await screen.findByRole("textbox", { name: "Forrás" })).toHaveValue("Blu-ray");
+    expect(screen.getByRole("textbox", { name: "Felbontás" })).toHaveValue("1080p");
+  });
+
   it("exposes the valid READY preparation actions and pins mutations to its version", async () => {
     const user = userEvent.setup();
     vi.mocked(api.releasePreparations).mockResolvedValue([readyPreparation]);

@@ -392,13 +392,14 @@ class BluRayScanner:
         warnings: list[str] = []
         native = self._native_metadata(root)
         mpls_files = sorted((root / "BDMV" / "PLAYLIST").glob("*.mpls"))
-        playlist_ids = [item.stem.zfill(5) for item in mpls_files[: self.max_playlists]]
         native_by_id = {
             str(item.get("id", item.get("playlist_id", ""))).zfill(5): item
             for item in native.get("playlists", [])
             if isinstance(item, Mapping)
         }
-        playlist_ids = sorted(set(playlist_ids) | set(native_by_id))
+        playlist_ids, discovered_playlists = self._select_playlist_ids(
+            mpls_files, native_by_id
+        )
 
         playlists: list[PlaylistCandidate] = []
         if self.capabilities.ffprobe and self.capabilities.ffprobe_bluray:
@@ -418,8 +419,9 @@ class BluRayScanner:
                 )
         elif native_by_id:
             playlists.extend(
-                self._playlist_from_payload(playlist_id, {}, payload)
-                for playlist_id, payload in native_by_id.items()
+                self._playlist_from_payload(playlist_id, {}, native_by_id[playlist_id])
+                for playlist_id in playlist_ids
+                if playlist_id in native_by_id
             )
         else:
             fallback = self._fallback_largest_clip(root)
@@ -429,9 +431,11 @@ class BluRayScanner:
                     "No libbluray playlist backend is available; only the largest M2TS clip was inspected."
                 )
 
-        if len(mpls_files) > self.max_playlists:
+        if discovered_playlists > len(playlist_ids):
             warnings.append(
-                f"Playlist safety limit reached: scanned {self.max_playlists} of {len(mpls_files)} MPLS files."
+                "Playlist safety limit reached: scanned "
+                f"{len(playlist_ids)} of {discovered_playlists} playlists "
+                "(recommended and longest first)."
             )
         if not playlists:
             raise RuntimeError(
@@ -461,6 +465,37 @@ class BluRayScanner:
             fingerprint=_disc_fingerprint(root),
             warnings=tuple(warnings),
         )
+
+    def _select_playlist_ids(
+        self,
+        mpls_files: Sequence[Path],
+        native_by_id: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[list[str], int]:
+        """Bound the probed playlists, whichever backend discovered them.
+
+        Native metadata can list far more playlists than the MPLS-file limit
+        (obfuscated discs carry hundreds of decoys), and every listed playlist
+        costs an ffprobe run.  Above the limit keep the backend-recommended
+        playlist(s) and then the longest ones, which is where the feature is.
+        """
+
+        candidates = {item.stem.zfill(5) for item in mpls_files} | set(native_by_id)
+        total = len(candidates)
+        if total <= self.max_playlists:
+            return sorted(candidates), total
+
+        def rank(playlist_id: str) -> tuple[bool, float, str]:
+            metadata = native_by_id.get(playlist_id, {})
+            try:
+                duration = float(
+                    metadata.get("duration", metadata.get("duration_seconds")) or 0.0
+                )
+            except (TypeError, ValueError):
+                duration = 0.0
+            return (not bool(metadata.get("recommended")), -duration, playlist_id)
+
+        kept = sorted(candidates, key=rank)[: self.max_playlists]
+        return sorted(kept), total
 
     def _native_metadata(self, root: Path) -> Mapping[str, Any]:
         if self.libbluray_provider:
@@ -969,9 +1004,11 @@ class BluRayScanner:
 
         longest = max(playlists, key=lambda item: item.duration_seconds)
         if content is ContentKind.SERIES:
+            # Disc authors number episode playlists in viewing order; ordering
+            # by runtime would label the shortest episode "1" regardless.
             episodes = sorted(
                 (item for item in playlists if item.duration_seconds >= 10 * 60),
-                key=lambda item: (item.duration_seconds, item.playlist_id),
+                key=lambda item: item.playlist_id,
             )
             episode_map = {
                 item.playlist_id: number + 1 for number, item in enumerate(episodes)

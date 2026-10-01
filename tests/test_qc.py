@@ -591,6 +591,20 @@ def test_native_yuv_metrics_crop_active_picture_and_keep_per_plane_stats() -> No
     assert values["All"] == pytest.approx(0.993)
 
 
+def test_metric_stats_keep_non_finite_values_as_text() -> None:
+    # Identical planes make FFmpeg print ``psnr_*:inf``.  A float infinity
+    # would be averaged as a number and serialised as the non-standard
+    # ``Infinity`` JSON token, so it has to stay textual like NaN does.
+    values = parse_ffmpeg_metric_stats(
+        "n:1 mse_avg:0.00 psnr_avg:inf psnr_y:inf psnr_u:inf psnr_v:nan\n"
+    )
+    assert values["psnr_avg"] == "inf"
+    assert values["psnr_y"] == "inf"
+    assert values["psnr_v"] == "nan"
+    assert values["mse_avg"] == 0.0
+    assert parse_ffmpeg_metric_stats("n:1 All:1.000000 (inf)\n")["All"] == 1.0
+
+
 def test_cropdetect_modal_result_and_native_y4m_extraction() -> None:
     crop = parse_cropdetect(
         "\n".join(
@@ -705,3 +719,19 @@ def test_streamed_vmaf_wrapper_records_hdr_mode() -> None:
     assert command[0] == "bdencode-vmaf"
     assert "--hdr10" in command
     assert command[command.index("--model") + 1] == "vmaf_4k_v0.6.1"
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        {"codec_type": "audio", "channels": 2},
+        {"codec_type": "audio", "sample_rate": "48000"},
+        {"codec_type": "audio", "sample_rate": None, "channels": 2},
+        {"codec_type": "audio", "sample_rate": "48000", "channels": "stereo"},
+    ],
+)
+def test_audio_probe_missing_stream_fields_raise_a_reviewable_value_error(
+    stream: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="sample_rate and channels"):
+        parse_audio_probe({"streams": [stream]})

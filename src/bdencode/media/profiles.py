@@ -566,6 +566,10 @@ class EncoderSettings:
             raise ValueError(f"motion estimation method {self.me} is x265-only")
         if self.aq_mode == 4:
             raise ValueError("x264 aq_mode must be between 0 and 3")
+        if self.weightp not in {0, 1, 2}:
+            # libx264 silently clips other values, which would leave the stored
+            # manifest describing a setting the bitstream never used.
+            raise ValueError("x264 weightp must be 0, 1 or 2")
 
     def _validate_x265(self) -> None:
         if self.level is not None:

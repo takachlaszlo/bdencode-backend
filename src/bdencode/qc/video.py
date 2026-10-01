@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -1156,7 +1157,11 @@ def parse_ffmpeg_metric_stats(text: str) -> dict[str, float | str]:
             except ValueError:
                 values[name] = normalized
             else:
-                values[name] = numeric if numeric == numeric else normalized
+                # FFmpeg prints ``psnr_*:inf`` for identical planes.  Keep every
+                # non-finite value as text so it can neither be averaged as a
+                # number (masking the mean-PSNR gate) nor leak into JSON as the
+                # non-standard ``Infinity`` token.
+                values[name] = numeric if math.isfinite(numeric) else normalized
         if values:
             parsed = values
     if not parsed:

@@ -88,3 +88,43 @@ def test_public_log_redacts_host_paths_job_uuid_and_internal_settings(
 def test_raw_diagnostic_sidecar_can_explicitly_keep_private_paths() -> None:
     raw = "/home/operator/jobs/source.m2ts"
     assert sanitize_text(raw, public=False) == raw
+
+
+def test_marker_words_in_paths_and_titles_do_not_hide_neighbouring_arguments() -> None:
+    argv = [
+        "ffmpeg",
+        "-i",
+        "/mnt/The Secret Life of Pets/BDMV",
+        "-map",
+        "0:v:0",
+        "/data/tokenizer.mkv",
+        "-metadata",
+        "title=Secret Garden",
+        "-c",
+        "copy",
+    ]
+    assert redact_argv(argv) == argv
+
+
+def test_option_style_credentials_still_hide_their_value() -> None:
+    assert redact_argv(["tool", "--password", "hunter2", "--out", "file"]) == [
+        "tool",
+        "--password",
+        "<redacted>",
+        "--out",
+        "file",
+    ]
+    assert redact_argv(["tool", "--api-key", "abc", "-H", "X-Api-Key: def"]) == [
+        "tool",
+        "--api-key",
+        "<redacted>",
+        "-H",
+        "X-Api-Key: <redacted>",
+    ]
+    joined = " ".join(redact_argv(["tool", "password=abc", "credential: enc"]))
+    assert "abc" not in joined and "enc" not in joined
+
+
+def test_urls_with_marker_words_keep_only_their_scheme() -> None:
+    joined = " ".join(redact_argv(["tool", "https://host.example/api/token/abc123/x"]))
+    assert "abc123" not in joined
