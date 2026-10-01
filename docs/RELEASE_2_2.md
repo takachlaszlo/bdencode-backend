@@ -1,4 +1,4 @@
-# BDEncode 2.2 – kódolás és minőség (tervezet)
+# BDEncode 2.2 kiadási jegyzet
 
 Ez a kiadás négy, egymástól független és alapértelmezetten kikapcsolt minőségi képességet ad. A 2.0/2.1 selection-, QC- és artifact-szabályai változatlanok; egyik újdonság sem érinti azokat a jobokat, amelyek nem kérik.
 
@@ -69,3 +69,11 @@ Emellett a `worker.auto-crf` esemény üzenete megmagyarázza, ha a keresés a m
 2. Futtasd a `bdencode doctor --json` parancsot. Az új `dynamic_hdr` szakasz nem blokkoló: csak azt mutatja, hogy a HDR10+/Dolby Vision megtartáshoz szükséges külső eszközök és az x265-build képességei elérhetők-e.
 3. A *Rendszer* oldalon a „Mentés most” gombbal készíts adatbázismentést, és ellenőrizd, hogy megjelenik a listában. A visszaállítás csak parancssorból lehetséges.
 4. Az új képességek alapértelmezetten ki vannak kapcsolva. Az automatikus CRF-et és a zajszűrést először egy rövid tesztjobbal próbáld ki; a dinamikus HDR megtartását csak a `hdr10plus_tool` és a `dovi_tool` telepítése után.
+
+## További dokumentáció
+
+- [Felhasználói és telepítési útmutató](../README.md)
+- [API contract](API.md)
+- [Architektúra és biztonsági határok](ARCHITECTURE.md)
+- [BDEncode 2.1 kiadási jegyzet](RELEASE_2_1.md)
+- [BDEncode 2.0 történeti kiadási jegyzet](RELEASE_2_0.md)
