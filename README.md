@@ -1025,7 +1025,9 @@ automatic_install = true   # false: csak jelzi az új kiadást, a telepítést k
 
 Az automatikus telepítés azt jelenti, hogy aki a beállított repository írási jogát megszerzi, a gépeden kódot futtathat. Ha ez nem elfogadható, állítsd `automatic_install = false` értékre, vagy tiltsd le a timert: `sudo systemctl disable --now bdencode-update.timer`. A frissítő a nem `https://` és a jelszót tartalmazó repository-címet, valamint az ismeretlen kulcsot is hibaként utasítja el, és a `release-update.toml` fájlnak root-tulajdonúnak kell lennie.
 
-A médiaeszközök (apt-csomagok, VapourSynth, natív szkenner) frissítését a timer már nem végzi. A korábbi, tranzakciós eszközfrissítő továbbra is telepítve van, és kézzel indítható: `sudo env BDENCODE_USER=<fiók> /usr/local/libexec/bdencode-daily-update`.
+A **Rendszer** oldal „Kiadáskeresés és frissítés" kártyája ugyanezt mutatja (`GET /api/v1/system/release-update`). Opcionálisan értesítést is kérhetsz: a `release-update.toml` `notify_url = "https://ntfy.sh/a-te-temad"` sora (csak `https://`, jelszó nélkül) egy JSON POST-ot küld, amikor egy frissítés települt, megbukott, leállt vagy érvénytelen kiadást talált (ugyanarról az állapotról nem ismétel). **Visszaállás vagy kézi kiadás:** `sudo /usr/local/libexec/bdencode-release-update install --tag vX.Y.Z` pontosan azt a kiadást telepíti a megszokott védelmekkel (üres sor, jelszó nélküli sudo, tag és verzió egyezése, a kiadás saját tranzakciós telepítője), régebbit is. Régebbi kiadás csak akkor telepíthető, ha az adatbázis sémaverzióját ismeri (a 2.x kiadásoké 2).
+
+A médiaeszközök (apt-csomagok, VapourSynth, natív szkenner) frissítését a timer már nem végzi, de a várakozó Debian-frissítéseket (ffmpeg, x264, x265, mkvtoolnix, mediainfo, libbluray) naponta jelzi a `status.json` `media_updates` mezőjében és a Rendszer oldalon. A korábbi, tranzakciós eszközfrissítő továbbra is telepítve van, és kézzel indítható: `sudo env BDENCODE_USER=<fiók> /usr/local/libexec/bdencode-daily-update`.
 
 ### 11.2. Kézi frissítés
 

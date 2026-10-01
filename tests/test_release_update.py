@@ -46,7 +46,9 @@ class FakeRunner:
         files: tuple[str, ...] = ("install/install.sh", "install/wsl-install.sh", "frontend/dist/index.html"),
         safe_pause_flag: bool = True,
         installer_timeout: bool = False,
+        apt_output: str = "",
     ) -> None:
+        self.apt_output = apt_output
         self.installed = installed
         self.tags = tags
         self.sudo_exit = sudo_exit
@@ -106,6 +108,8 @@ class FakeRunner:
         if head == "rm":
             shutil.rmtree(command[-1], ignore_errors=True)
             return CommandResult(0)
+        if head == "apt-get":
+            return CommandResult(0, self.apt_output)
         if head == "sudo":
             return CommandResult(self.sudo_exit)
         if head == "bash":
@@ -132,6 +136,8 @@ def make_updater(
     config: Any = None,
     windows: bool = False,
     check_only: bool = False,
+    install_tag: str | None = None,
+    posts: list | None = None,
     **runner_options: Any,
 ) -> tuple[Any, FakeRunner, Any]:
     (tmp_path / "source").mkdir(parents=True, exist_ok=True)
@@ -155,8 +161,10 @@ def make_updater(
         store,
         report,
         check_only=check_only,
+        install_tag=install_tag,
         clock=lambda: NOW,
         release_id=RELEASE_ID,
+        post=(lambda url, payload: posts.append((url, payload))) if posts is not None else None,
     )
     return updater, runner, store
 
@@ -1143,3 +1151,113 @@ def test_release_update_module_is_executable_python_with_a_help_text() -> None:
         [sys.executable, str(MODULE_PATH), "--help"], check=True, capture_output=True, text=True
     )
     assert "run" in result.stdout and "check" in result.stdout
+
+
+# -- operator-requested install (rollback), notification, media report ---------------------------------
+
+
+def test_an_operator_can_install_exactly_one_tag_even_an_older_one(tmp_path: Path) -> None:
+    updater, runner, store = make_updater(
+        tmp_path, installed="2.2.1", tags=("v2.2.0", "v2.2.1"), install_tag="v2.2.0",
+        config=release_update.ReleaseConfig(repository=REPOSITORY, automatic_install=False),
+    )
+    assert updater.run() == 0
+    document = store.load()
+    assert document["state"] == "installed" and document["installed_version"] == "2.2.0"
+    (installer,) = runner.commands("bash")
+    assert "v2.2.0" in installer["argv"][1]
+    # No listing of releases: the operator named the tag.
+    assert not any("ls-remote" in call["argv"] for call in runner.commands("git"))
+
+
+def test_an_install_request_still_waits_for_an_idle_queue_and_sudo(tmp_path: Path) -> None:
+    updater, runner, store = make_updater(tmp_path, installed="2.2.1", install_tag="v2.2.0", queue_exit=3)
+    assert updater.run() == 0 and store.load()["state"] == "deferred" and not runner.commands("bash")
+    updater, runner, store = make_updater(tmp_path / "b", installed="2.2.1", install_tag="v2.2.0", sudo_exit=1)
+    assert updater.run() == 0 and store.load()["state"] == "manual_update_required"
+
+
+def test_install_command_line_needs_a_valid_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("BDENCODE_RELEASE_UPDATE_TESTING", "1")
+    for extra in ([], ["--tag", "latest"], ["--tag", "v2.2"]):
+        assert release_update.main(["install", "--user", "x", "--state-root", str(tmp_path / "s"), *extra]) == 2
+    assert "install needs --tag vX.Y.Z" in capsys.readouterr().err
+    assert release_update.parser().parse_args(["install", "--tag", "v2.2.1"]).tag == "v2.2.1"
+
+
+def test_release_config_accepts_only_a_plain_https_notification_url(tmp_path: Path) -> None:
+    path = tmp_path / "release-update.toml"
+    path.write_text('notify_url = "https://ntfy.sh/my-bdencode"\n', encoding="utf-8")
+    assert release_update.load_release_config(path).notify_url == "https://ntfy.sh/my-bdencode"
+    for bad in ("http://ntfy.sh/x", "https://user:pw@ntfy.sh/x", "https://ntfy.sh/x?a=1", "ftp://x/y"):
+        path.write_text(f'notify_url = "{bad}"\n', encoding="utf-8")
+        with pytest.raises(release_update.ReleaseUpdateError, match="notify_url"):
+            release_update.load_release_config(path)
+
+
+def test_outcomes_that_need_attention_are_posted_once(tmp_path: Path) -> None:
+    posts: list = []
+    config = release_update.ReleaseConfig(repository=REPOSITORY, notify_url="https://ntfy.sh/x")
+    updater, _, _ = make_updater(tmp_path, config=config, posts=posts, installer_exit=1)
+    assert updater.run() == 1
+    (url, payload), = posts
+    body = json.loads(payload)
+    assert url == "https://ntfy.sh/x" and body["state"] == "install_failed"
+    assert body["event"] == "bdencode-release-update.install_failed" and "installing v2.2.0 failed" in body["text"]
+
+    # A repeated failure of the same kind (blocked every night) is not announced again.
+    updater, _, _ = make_updater(tmp_path, config=config, posts=posts, installer_exit=1)
+    updater.run()
+    updater, _, _ = make_updater(tmp_path, config=config, posts=posts, installer_exit=1)
+    updater.run()
+    states = [json.loads(item[1])["state"] for item in posts]
+    assert states == ["install_failed", "blocked"]
+
+    posts.clear()
+    updater, _, _ = make_updater(tmp_path / "ok", config=config, posts=posts)
+    assert updater.run() == 0
+    assert [json.loads(item[1])["state"] for item in posts] == ["installed"]
+
+
+def test_quiet_outcomes_and_a_missing_url_post_nothing(tmp_path: Path) -> None:
+    posts: list = []
+    config = release_update.ReleaseConfig(repository=REPOSITORY, notify_url="https://ntfy.sh/x")
+    updater, _, _ = make_updater(tmp_path, config=config, posts=posts, installed="2.2.0")
+    updater.run()
+    updater, _, _ = make_updater(tmp_path / "n", posts=posts)  # no notify_url configured
+    updater.run()
+    assert posts == []
+
+
+def test_a_failing_webhook_never_breaks_the_update(tmp_path: Path) -> None:
+    config = release_update.ReleaseConfig(repository=REPOSITORY, notify_url="https://ntfy.sh/x")
+    updater, _, store = make_updater(tmp_path, config=config)
+
+    def broken(url: str, payload: bytes) -> None:
+        raise OSError("network down")
+
+    updater.post = broken
+    assert updater.run() == 0 and store.load()["state"] == "installed"
+    assert "notification failed: network down" in (tmp_path / "state" / "release-update.log").read_text(encoding="utf-8")
+
+
+def test_pending_media_package_updates_are_reported_not_installed(tmp_path: Path) -> None:
+    apt = (
+        "Inst ffmpeg [7:7.1.5-0+deb13u1] (7:7.1.6-0+deb13u1 Debian-Security:13/stable-security [amd64])\n"
+        "Inst mkvtoolnix [92.0-1] (92.0-1+deb13u1 Debian-Security:13/stable-security [amd64])\n"
+        "Conf ffmpeg (7:7.1.6-0+deb13u1 Debian-Security:13/stable-security [amd64])\n"
+    )
+    updater, runner, store = make_updater(tmp_path, installed="2.2.0", apt_output=apt)
+    assert updater.run() == 0
+    assert store.load()["media_updates"] == [
+        "ffmpeg 7:7.1.5-0+deb13u1 -> 7:7.1.6-0+deb13u1",
+        "mkvtoolnix 92.0-1 -> 92.0-1+deb13u1",
+    ]
+    (call,) = runner.commands("apt-get")
+    assert call["argv"][:5] == ["apt-get", "-s", "-qq", "install", "--only-upgrade"] and call["user"] is None
+    # Nothing pending later: the list is cleared again.
+    updater, _, store = make_updater(tmp_path, installed="2.2.0")
+    updater.run()
+    assert store.load()["media_updates"] == []

@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { api } from "../api/client";
 import { BackupsPanel } from "../components/BackupsPanel";
+import { ReleaseUpdatePanel } from "../components/ReleaseUpdatePanel";
 import { Badge, Button, Card, LoadingPanel, Notice, PageHeader, ProgressBar } from "../components/ui";
 import { formatBytes, humanize } from "../utils";
 
@@ -164,6 +165,7 @@ export function SystemPage() {
             </div>
           </div>
 
+          <ReleaseUpdatePanel />
           <BackupsPanel />
 
           {runtime.data?.warnings && runtime.data.warnings.length > 0 && <Notice tone="warning" title="Runtime figyelmeztetések"><ul>{runtime.data.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></Notice>}

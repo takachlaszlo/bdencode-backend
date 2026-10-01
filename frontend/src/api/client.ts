@@ -5,6 +5,7 @@ import type {
   ArtifactList,
   BackupInfo,
   BackupList,
+  ReleaseUpdateResponse,
   CapabilitiesResponse,
   DatabaseStatus,
   DetailLevel,
@@ -320,6 +321,7 @@ export const api = {
     ),
   databaseStatus: () => apiFetch<DatabaseStatus>("/system/database"),
   backups: () => apiFetch<BackupList>("/system/backups"),
+  releaseUpdate: () => apiFetch<ReleaseUpdateResponse>("/system/release-update"),
   createBackup: () => apiFetch<BackupInfo>("/system/backups", { method: "POST" }),
   aiRecommendationStatus: () =>
     apiFetch<AIRecommendationStatus>("/ai-recommendation/status"),

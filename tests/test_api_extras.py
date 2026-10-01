@@ -537,3 +537,24 @@ def test_backup_endpoints_create_and_list_verified_backups(environment) -> None:
 
     with TestClient(create_app(Database(":memory:"))) as client:
         assert client.post("/api/v1/system/backups").status_code == 422
+
+
+def test_release_update_status_is_exposed_read_only(environment, tmp_path: Path, monkeypatch) -> None:
+    settings, database = environment
+    status_file = tmp_path / "status.json"
+    monkeypatch.setenv("BDENCODE_RELEASE_STATUS_PATH", str(status_file))
+    with TestClient(create_app(database, settings=settings)) as client:
+        assert client.get("/api/v1/system/release-update").json() == {"available": False, "status": None}
+        status_file.write_text("{broken", encoding="utf-8")
+        assert client.get("/api/v1/system/release-update").json()["available"] is False
+        status_file.write_text(json.dumps({
+            "schema": 1, "state": "update_available", "message": "v2.3.0 is available",
+            "installed_version": "2.2.1", "latest_version": "2.3.0", "latest_tag": "v2.3.0",
+            "media_updates": ["ffmpeg 1 -> 2"], "failed_attempts": {"v2.3.0": 1}, "secret": "x",
+        }), encoding="utf-8")
+        body = client.get("/api/v1/system/release-update").json()
+        assert body["available"] is True
+        assert body["status"]["state"] == "update_available" and body["status"]["media_updates"] == ["ffmpeg 1 -> 2"]
+        # Only the documented fields leave the server.
+        assert "secret" not in body["status"] and "failed_attempts" not in body["status"]
+        assert client.post("/api/v1/system/release-update").status_code == 405
