@@ -632,7 +632,10 @@ Az opcionális mezők: `samples` (4–48), `sample_seconds` (1–10), `max_itera
 - A minták csak pontozásra szolgálnak, a próbafájlok azonnal törlődnek. A `crf-search.json` jelentés (próbák, pontszámok, döntés) a manifestbe és a job artifactjai közé kerül.
 - Ha a célpont a megadott CRF-tartományban nem érhető el, a job **felülvizsgálatra** kerül; a rendszer nem választ csendben gyengébb minőséget. Ilyenkor csökkentsd a célt, bővítsd a tartományt, vagy add meg fix CRF-et.
 - UHD (1440 sor felett) esetén a 4K VMAF-modell, HDR10 esetén a rögzített, mindkét oldalra azonos tone-map proof átalakítás dolgozik; a HDR pontszámok ezért iránymutatók, nem abszolút mérőszámok.
-- Költség: egy próba a minták teljes hosszát kódolja (alapból kb. 36 s videó), tipikusan 4–6 próbával. Lassú x265 preset mellett ez UHD-nál akár órákat is igénybe vehet; erre való a `probe_preset`.
+- Költség: egy próba a minták teljes hosszát kódolja (alapból kb. 36 s videó), tipikusan 3–6 próbával. Lassú x265 preset mellett ez UHD-nál akár órákat is igénybe vehet; erre való a `probe_preset`.
+- A pontozás csak a VMAF-ot számolja (a QC-ben használt PSNR, SSIM és MS-SSIM nélkül), a libvmaf pedig legfeljebb 8 szálon fut. A pontszám ettől nem változik: 432 képkockás 720p mintán, azonos bemenettel, egy szálon az összes jellemzővel 114 s, nyolc szálon csak VMAF-fal 2,5 s volt, mindkét esetben azonos 89,1751-es átlagpontszámmal. A próbakódolás ideje ettől független.
+- A pontozás névvel ellátott csöveket (FIFO) használ. Ezeket a worker a `<data_root>/cache/vmaf` mappában hozza létre, nem a job fájában, mert a job tárhelyszámlálója a nem szabályos fájlt szándékosan elutasítja, és a tárhelykártya ilyenkor nem olvasható.
+- A VMAF-cél és a QC-kapuk külön mérnek. A kész kódolásnak a mintavételezett natív-YUV PSNR/SSIM-küszöböket is teljesítenie kell (mintánként PSNR ≥ 35 dB, átlag ≥ 38 dB, SSIM ≥ 0,93, átlag ≥ 0,95), ezért túl alacsony VMAF-cél olyan CRF-et választhat, amely a comparison szakaszban felülvizsgálatot okoz. Hagyd a célt az alapértelmezett 95-ön, vagy szűkítsd a `max_crf` értékét.
 
 #### 7.4.2. Zaj- és szemcseprofilok
 
@@ -649,6 +652,8 @@ Haladó és Profi módban új **`noise_reduction`** mező jelenik meg: x264-nél
 A profilok kölcsönösen kizárják egymást: egy profil mindig az ajánlott alapértékekből indul, ezért a szemcsemegtartó profil értékei nem maradnak vissza egy zajszűrő választása után.
 
 A zajszűrés szándékosan a **kódolóban** történik, nem előszűrőként. Így a referencia érintetlen marad, és az SSIM/PSNR/VMAF-kapuk továbbra is a kodek hűségét mérik, nem egy előszűrő hatását. Erős zajszűrésnél a QC-kapuk jelezhetik az eltérést; ez szándékos védelem az észrevétlen túlszűrés ellen.
+
+**Zajszűrés és automatikus CRF együtt.** A VMAF a referenciában lévő szemcsét részletnek méri, a zajszűrés pedig éppen ezt veszi el, ezért ugyanazon a CRF-en alacsonyabb pontszámot ad. Valódi eszközös mérésben (720p, mesterséges, zajos HDR10 tartalom, hat 3 s-os mintaablak, `veryfast` próba) a pontszám CRF 18-on zajszűrés nélkül 93,23, `nr-intra`/`nr-inter` 100 mellett 93,03, 500 mellett 92,90 volt; CRF 12-n 93,54, 93,49 és 93,39. A különbség ezen a tartalmon kicsi; erősen szemcsés valódi forrásnál nagyobb is lehet, ilyet nem mértünk. Ha a pontszám a CRF csökkentésével sem javul érdemben (ezen a mintán zajszűrés nélkül sem: CRF 18 és 12 között 0,3 pont), a keresés nem próbálkozik tovább: megméri az alsó határt is, és a 95-ös célnál ezen a mintán három próba után felülvizsgálatra küldi a jobot (`crf_target_unreachable`), nem választ csendben rosszabb minőséget. Ilyenkor csökkentsd a VMAF-célt, vagy adj meg fix CRF-et.
 
 #### 7.4.3. HDR10+ és Dolby Vision megtartása
 
