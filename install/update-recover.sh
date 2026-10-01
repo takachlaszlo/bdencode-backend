@@ -24,8 +24,17 @@ runtime_transaction=/usr/local/libexec/bdencode-update-runtime
 apt_transaction=/usr/local/libexec/bdencode-apt-transaction
 
 install -d -m 0750 "$data_root/state"
-touch "$deployment_lock"
-exec 9>"$deployment_lock"
+# This runs as root in a directory the sandboxed worker can write: never follow a
+# planted symlink, and never truncate (">>" only opens, it writes nothing).
+if [[ -L "$deployment_lock" ]]; then
+    echo "Refusing a symlink deployment lock: $deployment_lock" >&2
+    exit 1
+fi
+exec 9>>"$deployment_lock"
+if [[ -L "$deployment_lock" ]]; then
+    echo "Refusing a symlink deployment lock: $deployment_lock" >&2
+    exit 1
+fi
 
 if [[ "$mode" == "--gate" ]]; then
     # API/worker starts initiated by the updater itself arrive here while the

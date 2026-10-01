@@ -204,7 +204,9 @@ class Deployment:
 
     @property
     def scratch_root(self) -> Path:
-        return self.data_root / "cache" / "release-update"
+        # Outside the data root: the sandboxed worker may write there, but not below the
+        # account's home, so it cannot alter a download between verification and install.
+        return self.task_home / ".cache" / "bdencode-release-update"
 
 
 def windows_port_from_nginx(path: Path) -> int:

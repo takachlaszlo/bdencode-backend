@@ -8,7 +8,7 @@ Ez a dokumentum szándékosan részletes. Olyan felhasználónak is végigkövet
 > A BDEncode fejlesztés alatt áll. Első használatkor érdemes egy rövidebb vagy kevésbé fontos lemezzel próbát végezni, és az elkészült MKV-t lejátszással is ellenőrizni.
 
 > [!NOTE]
-> A 2.2 automatikus VMAF-alapú CRF-keresést, zaj- és szemcseprofilokat, változó képarány-kezelést, opcionális HDR10+/Dolby Vision megtartást, beépített lejátszót, statisztikát, adatbázis-mentést, valamint napi kiadáskeresést és felügyelet nélküli frissítést vezet be. Frissítés előtt olvasd el a [BDEncode 2.2 kiadási jegyzetet](docs/RELEASE_2_2.md). A [2.1](docs/RELEASE_2_1.md) és a [2.0](docs/RELEASE_2_0.md) kiadási jegyzet történeti dokumentumként továbbra is elérhető.
+> A 2.2 automatikus VMAF-alapú CRF-keresést, zaj- és szemcseprofilokat, változó képarány-kezelést, opcionális HDR10+/Dolby Vision megtartást, beépített lejátszót, statisztikát, adatbázis-mentést, valamint napi kiadáskeresést és felügyelet nélküli frissítést vezet be. Frissítés előtt olvasd el a [BDEncode 2.2 kiadási jegyzetet](docs/RELEASE_2_2.md) és a [2.2.1 biztonsági finomítás](docs/RELEASE_2_2_1.md) jegyzetét. A [2.1](docs/RELEASE_2_1.md) és a [2.0](docs/RELEASE_2_0.md) kiadási jegyzet történeti dokumentumként továbbra is elérhető.
 
 ## Tartalomjegyzék
 

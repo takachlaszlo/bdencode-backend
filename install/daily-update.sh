@@ -22,14 +22,22 @@ release_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 install -d -m 0750 -o "$task_user" -g "$(id -gn "$task_user")" \
     "$data_root/state" "$data_root/updates" "$app_root/tools/releases"
+# Root works in directories the sandboxed worker can write: refuse planted symlinks
+# before touching, chown-ing or opening anything, and never truncate the lock.
+for guarded in "$report_file" "$deployment_lock"; do
+    if [[ -L "$guarded" ]]; then
+        echo "Refusing a symlink: $guarded" >&2
+        exit 1
+    fi
+done
 touch "$report_file"
-chown "$task_user:$(id -gn "$task_user")" "$report_file"
+chown -h "$task_user:$(id -gn "$task_user")" "$report_file"
 chmod 0640 "$report_file"
 touch "$deployment_lock"
-chown "$task_user:$(id -gn "$task_user")" "$deployment_lock"
+chown -h "$task_user:$(id -gn "$task_user")" "$deployment_lock"
 chmod 0640 "$deployment_lock"
 
-exec 9>"$deployment_lock"
+exec 9>>"$deployment_lock"
 flock -x 9
 
 if [[ ! -x "$apt_transaction" || ! -x "$runtime_transaction" || \

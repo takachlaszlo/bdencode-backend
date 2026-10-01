@@ -162,7 +162,7 @@ def make_updater(
 
 
 def scratch(tmp_path: Path) -> Path:
-    return tmp_path / "data" / "cache" / "release-update"
+    return tmp_path / "home" / ".cache" / "bdencode-release-update"
 
 
 # -- pure helpers ---------------------------------------------------------------------------
@@ -278,7 +278,9 @@ def test_deployment_is_read_from_the_installed_configuration(tmp_path: Path) -> 
     assert deployment.cpu_percent == 60
     assert deployment.windows_managed is False
     assert deployment.app_root == tmp_path / "data" / "app"
-    assert deployment.scratch_root == tmp_path / "data" / "cache" / "release-update"
+    assert deployment.scratch_root == tmp_path / "home" / ".cache" / "bdencode-release-update"
+    # Not below the data root, which the sandboxed worker can write.
+    assert tmp_path / "data" not in deployment.scratch_root.parents
 
     with pytest.raises(release_update.ReleaseUpdateError, match="does not match"):
         release_update.load_deployment(
@@ -777,7 +779,7 @@ def test_a_real_git_mirror_drives_the_whole_update(tmp_path: Path) -> None:
     assert len(document["installed_commit"]) == 40
     assert (data_root / "installer-ran").read_text(encoding="utf-8") == f"1 {data_root} 70\n"
     assert "installer output line" in (tmp_path / "state" / "release-update.log").read_text(encoding="utf-8")
-    assert not (data_root / "cache" / "release-update" / f"v2.2.0-{RELEASE_ID}").exists()
+    assert not (tmp_path / "home" / ".cache" / "bdencode-release-update" / f"v2.2.0-{RELEASE_ID}").exists()
 
 
 @posix_only
@@ -1094,6 +1096,40 @@ def test_uninstaller_removes_the_release_updater_and_its_operator_config() -> No
     uninstaller = read("install/uninstall.sh")
     assert "/usr/local/libexec/bdencode-release-update" in uninstaller
     assert "/etc/bdencode/release-update.toml" in uninstaller
+
+
+def test_root_scripts_never_follow_or_truncate_the_worker_writable_lock() -> None:
+    recover = read("install/update-recover.sh")
+    assert 'exec 9>"$deployment_lock"' not in recover
+    assert 'exec 9>>"$deployment_lock"' in recover
+    assert recover.count('[[ -L "$deployment_lock" ]]') == 2  # before and after opening
+    assert 'touch "$deployment_lock"' not in recover
+
+    daily = read("install/daily-update.sh")
+    assert 'exec 9>"$deployment_lock"' not in daily
+    assert 'exec 9>>"$deployment_lock"' in daily
+    assert 'chown "$task_user' not in daily
+    assert daily.count('chown -h "$task_user') == 2
+    assert 'for guarded in "$report_file" "$deployment_lock"' in daily
+
+
+@posix_only
+def test_the_recovery_script_refuses_a_symlinked_lock(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    (data_root / "state").mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.write_text("precious\n", encoding="utf-8")
+    (data_root / "state" / "deployment.lock").symlink_to(victim)
+    user = subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+    result = subprocess.run(
+        ["bash", str(ROOT / "install" / "update-recover.sh"), "--gate"],
+        env={"PATH": "/usr/bin:/bin", "BDENCODE_USER": user, "BDENCODE_DATA_ROOT": str(data_root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1 and "Refusing a symlink deployment lock" in result.stderr
+    assert victim.read_text(encoding="utf-8") == "precious\n"
 
 
 def test_the_tool_updater_documents_that_it_is_manual_now() -> None:
