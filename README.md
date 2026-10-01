@@ -60,7 +60,7 @@ A főbb funkciók:
 - MPLS/CLPI/PMT nyelvi adatok összesítése, ismeretlen hangnál választható CPU-s beszédfelismerési segítség és bizonytalanságnál kézi ellenőrzés;
 - privát nyers és tisztított napló; a publikus MKV nem kap naplót vagy más csatolmányt, a comparison külön sidecar marad;
 - privát v1 torrent, upload kit, dupe check, qBittorrentbe leállítva felvétel és explicit jóváhagyású tracker-feltöltés;
-- napi automatikus alkalmazás- és eszközfrissítés;
+- napi kiadáskeresés, és új kiadásnál felügyelet nélküli, visszagörgethető frissítés;
 - opcionális **automatikus CRF-keresés**: rövid, VMAF-pontozott mintakódolásokból választja ki a célminőséghez tartozó CRF-et;
 - **zaj- és szemcseprofilok** (szemcse megtartása, enyhe/közepes/erős kódolóoldali zajszűrés);
 - **változó képarányú** (például IMAX-jeleneteket tartalmazó) filmek felismerése és biztonságos, veszteségmentes kezelése;
@@ -992,14 +992,40 @@ Titkos API-kulcsot, jelszót vagy teljes credential fájlt ne küldj hibajelent�
 
 ### 11.1. Automatikus frissítés
 
-A telepítő létrehoz egy napi systemd timert. Ellenőrzése:
+A telepítő létrehoz egy napi systemd timert (`bdencode-update.timer`). A timer **csak új kiadást keres**, az apt-csomagokat és a médiaeszközöket nem frissíti: a `bdencode-update.service` lekérdezi a beállított repository legmagasabb stabil `vX.Y.Z` tagjét, és összeveti a telepített verzióval. Ha nincs újabb kiadás, nem történik semmi.
+
+Újabb kiadásnál a frissítő felügyelet nélkül telepít: letölti a kiadás tagjét, majd a kiadás saját telepítőjét futtatja a telepítő felhasználóként (`install/install.sh`, Windows/WSL alatt `install/wsl-install.sh`). Ezért ugyanaz a tranzakciós mentés, egészségellenőrzés és visszagörgetés védi, mint a kézi frissítést (11.2.). A telepítés csak akkor indul el, ha
+
+- a tag `vX.Y.Z` alakú, újabb a telepítettnél, és a kiadás `pyproject.toml` verziója megegyezik vele;
+- nincs a csővezetéket foglaló, futó vagy felülvizsgálatra váró munka (a várakozó, valamint a választásra vagy feltöltés újrapróbálására váró munkák nem akadályozzák); különben másnap újra próbálkozik;
+- a telepítő felhasználónak van jelszó nélküli `sudo` joga. A Windows-telepítő ezt beállítja. Debian szerveren neked kell megadnod; addig a frissítő csak jelzi az új kiadást, a telepítést kézzel kell elvégezni (11.2.).
+
+Ha egy kiadás telepítése kétszer meghiúsul, a frissítő addig nem próbálkozik vele, amíg újabb kiadás nem jelenik meg. Az előző kiadás ilyenkor is változatlanul fut.
+
+Ellenőrzése:
 
 ```bash
 systemctl list-timers bdencode-update.timer
 systemctl status bdencode-update.timer --no-pager
+cat /var/lib/bdencode/release-update/status.json
+tail -n 30 /var/lib/bdencode/release-update/release-update.log
+sudo /usr/local/libexec/bdencode-release-update check   # csak keres, nem telepít
 ```
 
 A futási idő naponta változhat, mert a rendszer terheléselosztás céljából legfeljebb 45 perces véletlen késleltetést használ. Ha a gép a tervezett időben ki volt kapcsolva, a `Persistent=true` miatt később pótolja a futást.
+
+A `status.json` `state` mezője: `up_to_date`, `update_available`, `manual_update_required`, `deferred`, `installed`, `check_failed`, `install_failed`, `blocked` vagy `invalid_release`. A `release-update.log` tartalmazza a telepítő teljes kimenetét is; a régebbi rész a `release-update.log.1` fájlban marad. Ezek a fájlok a `/var/lib/bdencode/release-update/` mappában vannak, és bárki olvashatja őket.
+
+A beállítás a `/etc/bdencode/release-update.toml` fájlban van. A telepítő egyszer hozza létre, és utána nem írja felül:
+
+```toml
+repository = "https://github.com/takachlaszlo/bdencode-backend.git"
+automatic_install = true   # false: csak jelzi az új kiadást, a telepítést kézzel végzed
+```
+
+Az automatikus telepítés azt jelenti, hogy aki a beállított repository írási jogát megszerzi, a gépeden kódot futtathat. Ha ez nem elfogadható, állítsd `automatic_install = false` értékre, vagy tiltsd le a timert: `sudo systemctl disable --now bdencode-update.timer`. A frissítő a nem `https://` és a jelszót tartalmazó repository-címet, valamint az ismeretlen kulcsot is hibaként utasítja el, és a `release-update.toml` fájlnak root-tulajdonúnak kell lennie.
+
+A médiaeszközök (apt-csomagok, VapourSynth, natív szkenner) frissítését a timer már nem végzi. A korábbi, tranzakciós eszközfrissítő továbbra is telepítve van, és kézzel indítható: `sudo env BDENCODE_USER=<fiók> /usr/local/libexec/bdencode-daily-update`.
 
 ### 11.2. Kézi frissítés
 

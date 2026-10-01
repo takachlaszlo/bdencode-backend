@@ -19,6 +19,7 @@ Ezek mellett a kiadás a kezelőfelületet és az üzemeltetést is bővíti:
 | Statisztika | *Statisztika* oldal, `GET /statistics` | megtakarítás, VMAF/SSIM/PSNR, sebesség fájlonként és összesítve, CSV-vel; hiányzó bizonyíték `null`, nem becslés |
 | Profilkönyvtár | `/profile-library` | hordozható, ellenőrzött profilok mentése, exportja és importja |
 | Adatbázis-védelem | `bdencode db-*`, `/system/backups` | migráció előtti és ütemezett online mentés, `schema_migrations`, offline visszaállítás |
+| Kiadáskeresés és automatikus frissítés | `bdencode-update.timer`, `/etc/bdencode/release-update.toml` | a napi timer csak új `vX.Y.Z` kiadást keres; újabb tagnél felügyelet nélkül, a kiadás saját, visszagörgethető telepítőjével frissít (README 11.1.) |
 | Windows-telepítő tesztek és CI | `tests/test_windows_install_powershell.py`, `ci.yml` | a valódi argumentumutak lefutnak PowerShell 5.1-ben és 7-ben; a teljes tesztsor Windowson is fut |
 
 A használatot a [README 7.4.1–7.4.5. és 9.5–9.6. pontja](../README.md#741-automatikus-crf-vmaf-cél), a belső szerkezetet az [ARCHITECTURE „Minőségi szakaszok”](ARCHITECTURE.md#minőségi-szakaszok), az API-mezőket az [API.md](API.md#minőségi-opciók-a-video-objektumban) írja le.
@@ -34,6 +35,8 @@ A használatot a [README 7.4.1–7.4.5. és 9.5–9.6. pontja](../README.md#741-
 - Az adatbázis új `schema_migrations` táblát kap az idempotens v2 blokkban; a `schema_version` továbbra is 2, ezért az installer sémaellenőrzései és a visszagörgetés változatlanok. Egy régebbi (2.0/2.1) backend figyelmen kívül hagyja az új táblát.
 - Új worker-oldali fájl: `analysis/source-size.json` (a statisztikához). Ez privát, nem kerül a completed fába.
 - Az új mutáló útvonalak (`POST /system/backups`, a profilkönyvtár és a kivonatok `POST`/`DELETE` kérései) ugyanazt a same-origin mutációvédelmet kapják, mint a többi `/api/v1` mutáció; külön jogosultsági szint nincs bevezetve.
+- A `bdencode-update.service` a `bdencode-release-update` segédet futtatja a korábbi eszközfrissítő (`bdencode-daily-update`) helyett; az apt-csomagokat és a médiaeszközöket a napi timer már nem frissíti. A régi eszközfrissítő telepítve marad, kézzel indítható. Az eddig telepített 2.1.0 napi frissítője nem tölti le az alkalmazást, ezért az automatikus kiadásfrissítés bekapcsolásához ezt a kiadást egyszer kézzel kell telepíteni (README 11.2.); utána a timer már maga keresi és telepíti az újabb kiadásokat.
+- Új fájlok: `/etc/bdencode/release-update.toml` (a telepítő egyszer hozza létre, utána az üzemeltetőé; nem része a rollback-snapshotnak), `/usr/local/libexec/bdencode-release-update` (része a snapshotnak) és `/var/lib/bdencode/release-update/` (`status.json`, `release-update.log`). Az eltávolító mindet törli.
 
 ## Valódi eszközös próbából származó javítások
 
@@ -57,6 +60,8 @@ Emellett a `worker.auto-crf` esemény üzenete megmagyarázza, ha a keresés a m
 - A PowerShell-tesztek a GitHub Linux-legein (`pwsh`) és a Windows-legen (PowerShell 7 és 5.1) is lefutnak; a fejlesztői gépen a WSL-ben nincs `pwsh`, ott kimaradnak. A Linuxon eltérő környezeti feltételt (`LOCALAPPDATA`) a tesztek külön kezelik.
 - A Windows CI-leg Python 3.13-mal fut: Windowson 3.12-ig az `os.fchmod` hiánya és a durva `time.time()` óra miatt a csak Linuxon használt telepítő- és worker-tesztek platformokozta okból buknak (lásd a README 15.4. pontját).
 - Az új képességek valódi eszközös végigpróbája részleges. Egy mesterséges 720p HDR10 „lemezen” (Debian 13 WSL2: ffmpeg 7.1.5, x265, VapourSynth/BestSource, libvmaf, mkvmerge, és a webes felület böngészőben) a teljes csővezeték (automatikus CRF, kódolás, mux, QC, 24 képkockás comparison) `COMPLETED` állapotig lefutott; az elérhetetlen cél felülvizsgálati útja, a változó képarány valódi `cropdetect`-tel, az adatbázis-mentés és -visszaállítás másolaton, valamint a lejátszó és a pixelnézet is valódi eszközökkel működött. Ebben a próbában a lemezbeolvasást és a libbluray-remuxot a szintetikus mester váltotta ki (ugyanazt a fájlt adja, mint a remux). **Még nem próbáltuk:** valódi lemezt, UHD-felbontást (ott a próbakódolás és a comparison sokkal hosszabb), valamint a `hdr10plus_tool` és a `dovi_tool` használatát (a tesztgépen nincsenek fent, és a Debian x265 HDR10+ nélkül készül), vagyis a HDR10+/Dolby Vision megtartás valódi kinyerése és kódolása csak egységtesztekkel és hamis futtatóval lefedett. A telepített 2.1.0-s kiadást a próba nem érintette.
+- Az automatikus kiadásfrissítést egység- és integrációs tesztek fedik (valódi git tükör, valódi folyamatindítás és időtúllépés, a telepítő érintett sorai hamis `sudo`-val, hamis telepítő); a valódi telepítővel, root jogosultsággal, systemd alatt még nem próbáltuk ki. Az első éles futás előtt érdemes kézzel elindítani: `sudo /usr/local/libexec/bdencode-release-update check`.
+- Az automatikus telepítés jelszó nélküli `sudo`-t igényel a telepítő felhasználónak (a Windows-telepítő beállítja); anélkül a frissítő csak jelzi az új kiadást. Aláírt tag ellenőrzése nincs: aki a beállított repository írási jogát megszerzi, a telepítéssel kódot futtathat a gépen (README 11.1.).
 
 ## Frissítés utáni ellenőrzőlista
 

@@ -428,8 +428,12 @@ install_txn_started=1
 sudo systemctl stop bdencode-update.timer || true
 # A timer race may have queued the update preflight on our deployment lock.
 # Queue its cancellation without waiting for ExecStopPost, which deliberately
-# needs the same lock and would otherwise deadlock the installer.
-sudo systemctl --no-block stop bdencode-update.service || true
+# needs the same lock and would otherwise deadlock the installer. The unattended
+# release update runs this very installer from bdencode-update.service, and
+# stopping that unit would terminate the installer with it.
+if [[ "${BDENCODE_UNATTENDED_UPDATE:-0}" != 1 ]]; then
+    sudo systemctl --no-block stop bdencode-update.service || true
+fi
 
 # The state-restoration decision is now durable. Close the administrative API
 # before checking the queue; the worker cannot claim while fd 9 is exclusive.
@@ -653,6 +657,25 @@ fi
 sudo chown "root:$task_group" /etc/bdencode/release-profiles.json
 sudo chmod 0640 /etc/bdencode/release-profiles.json
 
+# The daily timer looks for newer releases of this repository. The file is
+# written once and then belongs to the operator; an update never overwrites it.
+# Only a plain https URL (no credentials) of the checkout's origin is carried over.
+if ! sudo test -e /etc/bdencode/release-update.toml; then
+    update_repository="$(git -C "$repo_root" remote get-url origin 2>/dev/null || true)"
+    if [[ ! "$update_repository" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?/[A-Za-z0-9._~/-]+$ ]]; then
+        update_repository="https://github.com/takachlaszlo/bdencode-backend.git"
+    fi
+    sudo tee /etc/bdencode/release-update.toml >/dev/null <<EOF
+# Daily release check (bdencode-update.timer). The newest stable vX.Y.Z tag of this
+# repository is installed unattended when it is newer than the installed version.
+repository = "$update_repository"
+# false: only record that a newer release exists and install it manually.
+automatic_install = true
+EOF
+    sudo chown root:root /etc/bdencode/release-update.toml
+    sudo chmod 0644 /etc/bdencode/release-update.toml
+fi
+
 render_unit_atomic "$repo_root/deploy/systemd/bdencode-api.service.in" \
     /etc/systemd/system/bdencode-api.service
 render_unit_atomic "$repo_root/deploy/systemd/bdencode-worker.service.in" \
@@ -661,6 +684,10 @@ render_unit_atomic "$repo_root/deploy/systemd/bdencode-update.service.in" \
     /etc/systemd/system/bdencode-update.service
 atomic_root_install "$repo_root/deploy/systemd/bdencode-update.timer" \
     /etc/systemd/system/bdencode-update.timer 0644
+atomic_root_install "$repo_root/install/release_update.py" \
+    /usr/local/libexec/bdencode-release-update 0755
+# No longer scheduled: the daily timer runs bdencode-release-update. The tool
+# runtime updater stays available for a manual, transactional refresh.
 atomic_root_install "$repo_root/install/daily-update.sh" \
     /usr/local/libexec/bdencode-daily-update 0755
 

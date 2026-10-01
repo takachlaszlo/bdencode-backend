@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily BDEncode program update
+Description=Daily check for a new BDEncode release
 
 [Timer]
 OnCalendar=daily
