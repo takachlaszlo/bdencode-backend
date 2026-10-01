@@ -7,6 +7,7 @@ import {
   Eye,
   Images,
   Maximize2,
+  ZoomIn,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type {
@@ -18,6 +19,7 @@ import type {
 } from "../api/types";
 import { artifactContentUrl, fetchArtifactJson, fetchArtifactText } from "../api/client";
 import { copyText } from "../utils";
+import { ImageInspector } from "./ImageInspector";
 import { Badge, Button, Card, EmptyState, LoadingPanel, Notice } from "./ui";
 
 type CompareMode = "slider" | "side" | "blink" | "difference";
@@ -48,6 +50,7 @@ export function ComparisonPanel({ artifacts }: { artifacts: Artifact[] }) {
     enabled: Boolean(bbcodeArtifact),
   });
   const [copied, setCopied] = useState(false);
+  const [inspect, setInspect] = useState<number | null>(null);
 
   async function copyBbcode() {
     if (!bbcode.data) return;
@@ -55,6 +58,13 @@ export function ComparisonPanel({ artifacts }: { artifacts: Artifact[] }) {
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1600);
   }
+
+  const inspectedPair = inspect !== null ? video.data?.pairs[inspect] : undefined;
+  const inspectedSource = inspectedPair ? imagesByName.get(inspectedPair.reference_sdr_png || inspectedPair.reference_png) : undefined;
+  const inspectedEncode = inspectedPair ? imagesByName.get(inspectedPair.encode_sdr_png || inspectedPair.encode_png) : undefined;
+  const inspected = inspectedPair && inspectedSource && inspectedEncode
+    ? { pair: inspectedPair, source: inspectedSource, encode: inspectedEncode }
+    : null;
 
   if (!videoManifestArtifact && !audioManifestArtifact) {
     return <EmptyState icon={<Images size={30} />} title="A comparison még nem készült el" description="Az I/P/B framek és az audióspektrumok a QC után jelennek meg ezen a lapon." />;
@@ -88,7 +98,7 @@ export function ComparisonPanel({ artifacts }: { artifacts: Artifact[] }) {
         {video.isLoading ? <LoadingPanel label="Videó comparison betöltése…" /> : video.isError ? <Notice tone="danger">A videó comparison manifestje nem olvasható.</Notice> : (
           <div className="frame-pair-grid">
             {video.data?.pairs.map((pair, index) => (
-              <FramePairCard key={`${pair.category}-${pair.presentation_index}-${index}`} pair={pair} images={imagesByName} />
+              <FramePairCard key={`${pair.category}-${pair.presentation_index}-${index}`} pair={pair} images={imagesByName} onInspect={() => setInspect(index)} />
             ))}
           </div>
         )}
@@ -104,11 +114,23 @@ export function ComparisonPanel({ artifacts }: { artifacts: Artifact[] }) {
           </div>
         ) : <EmptyState title="Nincs megtartott hangsáv" description="Ehhez a munkához nem készült audióspektrum." />}
       </section>
+
+      {inspected && (
+        <ImageInspector
+          open
+          title={`${inspected.pair.category}-frame #${inspected.pair.presentation_index} — pixelnézet`}
+          sourceUrl={artifactContentUrl(inspected.source.id)}
+          encodeUrl={artifactContentUrl(inspected.encode.id)}
+          onClose={() => setInspect(null)}
+          onPrevious={inspect !== null && inspect > 0 ? () => setInspect(inspect - 1) : undefined}
+          onNext={inspect !== null && inspect < (video.data?.pairs.length ?? 0) - 1 ? () => setInspect(inspect + 1) : undefined}
+        />
+      )}
     </div>
   );
 }
 
-function FramePairCard({ pair, images }: { pair: VideoComparisonPair; images: Map<string, Artifact> }) {
+function FramePairCard({ pair, images, onInspect }: { pair: VideoComparisonPair; images: Map<string, Artifact>; onInspect: () => void }) {
   const [mode, setMode] = useState<CompareMode>("slider");
   const [position, setPosition] = useState(50);
   const [blinkSource, setBlinkSource] = useState(true);
@@ -169,6 +191,7 @@ function FramePairCard({ pair, images }: { pair: VideoComparisonPair; images: Ma
         )}
       </div>
       <div className="frame-pair-card__footer">
+        <button type="button" className="link-button" onClick={onInspect}><ZoomIn size={15} aria-hidden="true" /> Nagyítás és pixelnézet</button>
         <a href={sourceUrl} target="_blank" rel="noreferrer"><Maximize2 size={15} aria-hidden="true" /> Source PNG</a>
         <a href={encodeUrl} target="_blank" rel="noreferrer"><Maximize2 size={15} aria-hidden="true" /> Encode PNG</a>
       </div>

@@ -115,6 +115,10 @@ const EVENT_KIND_LABELS: Record<string, string> = {
   "scan.created": "Lemezvizsgálat létrehozva",
   "scan.state": "Lemezvizsgálat állapota",
   "artifact.created": "Melléklet létrehozva",
+  "worker.auto-crf-probe": "CRF-próba",
+  "worker.auto-crf": "Automatikus CRF kiválasztva",
+  "worker.dynamic-hdr": "Dinamikus HDR",
+  "worker.variable-aspect": "Változó képarány",
 };
 
 const EVENT_MESSAGE_LABELS: Record<string, string> = {
@@ -163,6 +167,20 @@ export function formatStatusMessage(message: string | null, fallback: string): s
   }
   if (message.startsWith("source comparison sample is invalid")) {
     return "A source videóminta időzítése nem ellenőrizhető biztonságosan.";
+  }
+  const probe = /^CRF (\S+) scored VMAF (\S+)$/.exec(message);
+  if (probe) return `CRF ${probe[1]} próba: VMAF ${probe[2]}`;
+  const chosen = /^automatic CRF search selected CRF (\S+)$/.exec(message);
+  if (chosen) return `Az automatikus CRF-keresés a CRF ${chosen[1]} értéket választotta`;
+  const verified = /^(hdr10plus|dolby_vision) metadata verified for (\d+) frames$/.exec(message);
+  if (verified) {
+    return `${verified[1] === "hdr10plus" ? "HDR10+" : "Dolby Vision"} metaadat ellenőrizve ${verified[2]} képkockára`;
+  }
+  if (message.startsWith("dynamic HDR is discarded")) {
+    return "A dinamikus HDR nem marad meg (csak a statikus HDR10)";
+  }
+  if (message.startsWith("variable aspect ratio")) {
+    return "Változó képarányú film: a legszélesebb vászon marad meg, semmi sem vágódik le";
   }
   return EVENT_MESSAGE_LABELS[message] ?? formatWorkerError(message);
 }
@@ -223,4 +241,28 @@ export function copyText(text: string): Promise<void> {
   document.execCommand("copy");
   textarea.remove();
   return Promise.resolve();
+}
+
+export function downloadJson(filename: string, data: unknown): void {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename.replace(/[^A-Za-z0-9._-]+/g, "_");
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+export function formatGiB(value: number | null | undefined, digits = 1): string {
+  return value == null || !Number.isFinite(value) ? "—" : `${value.toFixed(digits)} GiB`;
+}
+
+export function formatPercent(value: number | null | undefined, digits = 1): string {
+  return value == null || !Number.isFinite(value) ? "—" : `${value.toFixed(digits)}%`;
+}
+
+export function formatNumber(value: number | null | undefined, digits = 2): string {
+  return value == null || !Number.isFinite(value) ? "—" : value.toFixed(digits);
 }

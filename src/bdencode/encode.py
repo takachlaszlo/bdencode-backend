@@ -99,6 +99,7 @@ def encode_pipeline_commands(
     settings: EncoderSettings,
     *,
     metadata: Mapping[str, Any] | None = None,
+    extra_video_params: Mapping[str, str | int | float] | None = None,
     vspipe: str = "vspipe",
     ffmpeg: str = "ffmpeg",
 ) -> list[list[str]]:
@@ -118,12 +119,16 @@ def encode_pipeline_commands(
         "info",
         "-f",
         "yuv4mpegpipe",
+        # The Y4M from vspipe has no colour properties; without describing the
+        # input here, the scaler FFmpeg inserts converts the picture to the
+        # matrix requested for the output.
+        *settings.ffmpeg_color_input_args(),
         "-i",
         "pipe:0",
         "-map",
         "0:v:0",
         "-an",
-        *settings.ffmpeg_video_args(),
+        *settings.ffmpeg_video_args(extra_video_params),
         "-map_metadata",
         "-1",
     ]

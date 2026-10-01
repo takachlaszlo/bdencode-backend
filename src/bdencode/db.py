@@ -9,6 +9,7 @@ race past either queue guard.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -36,8 +37,11 @@ from .models import (
     ScanUpdate,
     validate_transition,
 )
+from . import __version__
 from .progress import pipeline_progress_baseline
 
+
+LOG = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
 
@@ -118,6 +122,46 @@ def _execute_sql_statements(connection: sqlite3.Connection, script: str) -> None
             pending = ""
     if pending.strip():
         raise PersistenceError("incomplete database schema statement")
+
+
+def _migrate_1_to_2(connection: sqlite3.Connection) -> None:
+    """Add the durable pause/cancel control columns (schema v1 -> v2).
+
+    This is deliberately a small, atomic column migration.  The idempotent
+    schema block in ``_initialize_once`` remains the single place where new
+    tables and indexes are declared.
+    """
+
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+    }
+    if "control_state" not in columns:
+        connection.execute(
+            "ALTER TABLE jobs ADD COLUMN control_state TEXT "
+            "NOT NULL DEFAULT 'RUNNING' CHECK (control_state IN "
+            "('RUNNING','PAUSE_REQUESTED','PAUSED','CANCEL_REQUESTED'))"
+        )
+    if "control_revision" not in columns:
+        connection.execute(
+            "ALTER TABLE jobs ADD COLUMN control_revision INTEGER "
+            "NOT NULL DEFAULT 1 CHECK (control_revision >= 1)"
+        )
+    if "control_requested_at" not in columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN control_requested_at TEXT")
+    if "control_message" not in columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN control_message TEXT")
+    connection.execute(
+        "UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'"
+    )
+
+
+# Ordered upgrade steps: ``MIGRATIONS[n]`` upgrades schema ``n`` to ``n + 1``
+# inside the initialization transaction.  A future schema version only needs a
+# new entry here plus its additions in the idempotent block; startup then takes
+# a pre-migration backup, applies every missing step in order and records it in
+# ``schema_migrations``.
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migrate_1_to_2}
 
 
 class Database:
@@ -237,44 +281,25 @@ class Database:
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
                     existing_version = int(version_row["value"]) if version_row else 0
-                    if existing_version not in {1, SCHEMA_VERSION}:
+                    supported = sorted({*MIGRATIONS, SCHEMA_VERSION})
+                    if existing_version not in supported:
                         raise PersistenceError(
                             f"unsupported database schema {existing_version}; "
-                            f"expected 1 or {SCHEMA_VERSION}"
+                            f"expected {' or '.join(map(str, supported))}"
                         )
-                # v1 -> v2 is deliberately a small, atomic column migration.
-                # The idempotent schema block below remains the single place
-                # where new v2 tables and indexes are declared.
-                if existing_version == 1:
-                    columns = {
-                        str(row["name"])
-                        for row in connection.execute(
-                            "PRAGMA table_info(jobs)"
-                        ).fetchall()
-                    }
-                    if "control_state" not in columns:
-                        connection.execute(
-                            "ALTER TABLE jobs ADD COLUMN control_state TEXT "
-                            "NOT NULL DEFAULT 'RUNNING' CHECK (control_state IN "
-                            "('RUNNING','PAUSE_REQUESTED','PAUSED','CANCEL_REQUESTED'))"
-                        )
-                    if "control_revision" not in columns:
-                        connection.execute(
-                            "ALTER TABLE jobs ADD COLUMN control_revision INTEGER "
-                            "NOT NULL DEFAULT 1 CHECK (control_revision >= 1)"
-                        )
-                    if "control_requested_at" not in columns:
-                        connection.execute(
-                            "ALTER TABLE jobs ADD COLUMN control_requested_at TEXT"
-                        )
-                    if "control_message" not in columns:
-                        connection.execute(
-                            "ALTER TABLE jobs ADD COLUMN control_message TEXT"
-                        )
-                    connection.execute(
-                        "UPDATE schema_meta SET value = '2' "
-                        "WHERE key = 'schema_version'"
-                    )
+                migrated_from = (
+                    existing_version
+                    if existing_version is not None
+                    and existing_version < SCHEMA_VERSION
+                    else None
+                )
+                backup_name: str | None = None
+                if migrated_from is not None:
+                    backup_name = self._backup_before_migration(migrated_from)
+                    step = migrated_from
+                    while step < SCHEMA_VERSION:
+                        MIGRATIONS[step](connection)
+                        step += 1
                 blocking = ",".join(f"'{state.value}'" for state in BLOCKING_STATES)
                 job_states = ",".join(f"'{state.value}'" for state in JobState)
                 control_states = ",".join(
@@ -435,6 +460,15 @@ class Database:
                     );
                     CREATE INDEX IF NOT EXISTS ix_maintenance_operations_phase
                         ON maintenance_operations(phase, created_at);
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        from_version INTEGER,
+                        to_version INTEGER NOT NULL,
+                        kind TEXT NOT NULL CHECK (kind IN ('create', 'migrate')),
+                        applied_at TEXT NOT NULL,
+                        backup_name TEXT,
+                        app_version TEXT
+                    );
                     CREATE TABLE IF NOT EXISTS maintenance_target_claims (
                         original_path_key TEXT PRIMARY KEY,
                         operation_id TEXT NOT NULL
@@ -454,6 +488,20 @@ class Database:
                     raise PersistenceError(
                         f"unsupported database schema {actual_version}; expected {SCHEMA_VERSION}"
                     )
+                if existing_version is None or migrated_from is not None:
+                    connection.execute(
+                        "INSERT INTO schema_migrations "
+                        "(from_version, to_version, kind, applied_at, backup_name, "
+                        "app_version) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            migrated_from,
+                            SCHEMA_VERSION,
+                            "migrate" if migrated_from is not None else "create",
+                            utc_now(),
+                            backup_name,
+                            __version__,
+                        ),
+                    )
                 connection.commit()
                 self._initialized = True
                 if self.path == ":memory:":
@@ -467,6 +515,66 @@ class Database:
             finally:
                 if connection is not self._keeper:
                     connection.close()
+
+    @property
+    def backup_directory(self) -> Path:
+        """Default backup location: ``<state>/backups`` next to the database."""
+
+        return Path(self.path).expanduser().parent / "backups"
+
+    def _backup_before_migration(self, version: int) -> str | None:
+        """Copy the live database aside before a schema upgrade.
+
+        Called while the migration transaction already holds the write lock, so
+        the copy is a consistent pre-migration snapshot.  A failure only logs:
+        the installer independently snapshots the database before ``init-db``
+        and the migration itself is a single atomic transaction.
+        """
+
+        if self.path == ":memory:":
+            return None
+        try:
+            from .db_backup import create_backup
+
+            info = create_backup(
+                Path(self.path).expanduser(),
+                self.backup_directory,
+                label=f"pre-migration-v{version}",
+            )
+        except Exception:
+            LOG.exception(
+                "pre-migration backup failed; continuing with the atomic migration"
+            )
+            return None
+        LOG.info("pre-migration backup written: %s", info.name)
+        return info.name
+
+    def backup(self, label: str = "manual", directory: Path | None = None) -> Any:
+        """Create a verified online backup and apply the retention policy."""
+
+        from .db_backup import create_backup, prune_backups
+
+        if self.path == ":memory:":
+            raise PersistenceError("an in-memory database cannot be backed up")
+        self.initialize()
+        target = directory or self.backup_directory
+        info = create_backup(Path(self.path).expanduser(), target, label=label)
+        prune_backups(target)
+        return info
+
+    def migration_history(self) -> list[dict[str, Any]]:
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT id, from_version, to_version, kind, applied_at, "
+                "backup_name, app_version FROM schema_migrations ORDER BY id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def integrity_check(self) -> list[str]:
+        """``PRAGMA quick_check`` findings; ``['ok']`` for a healthy database."""
+
+        with self._read() as connection:
+            return [str(row[0]) for row in connection.execute("PRAGMA quick_check")]
 
     def close(self) -> None:
         keeper, self._keeper = self._keeper, None

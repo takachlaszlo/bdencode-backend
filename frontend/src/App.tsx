@@ -5,6 +5,7 @@ import { JobsPage } from "./pages/JobsPage";
 import { NewEncodePage } from "./pages/NewEncodePage";
 import { JobDetailPage } from "./pages/JobDetailPage";
 import { ComparisonsPage } from "./pages/ComparisonsPage";
+import { StatisticsPage } from "./pages/StatisticsPage";
 import { SystemPage } from "./pages/SystemPage";
 
 export function App() {
@@ -17,6 +18,7 @@ export function App() {
         <Route path="archive" element={<JobsPage mode="archive" />} />
         <Route path="jobs/:jobId" element={<JobDetailPage />} />
         <Route path="comparisons" element={<ComparisonsPage />} />
+        <Route path="statistics" element={<StatisticsPage />} />
         <Route path="settings" element={<SystemPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

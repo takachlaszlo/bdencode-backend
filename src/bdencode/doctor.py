@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .capabilities import capability_snapshot
+from .capabilities import capability_snapshot, dynamic_hdr_support
 from .config import ConfigurationError, Settings
 from .db import Database
 from .qc.video import COMPARISON_FONT_FILE
@@ -477,6 +477,9 @@ def build_report(
         "ffmpeg": ffmpeg,
         "missing_ffmpeg_capabilities": missing_ffmpeg,
         "comparison_annotation": {"font": comparison_font},
+        # Optional: retention of HDR10+ / Dolby Vision needs extra tools and an
+        # x265 build that accepts their parameters.  Never affects ``status``.
+        "dynamic_hdr": dynamic_hdr_support(),
         "vapoursynth": vs,
         "image_upload_credentials": image_upload_credentials,
         "release_credentials": release_credentials,

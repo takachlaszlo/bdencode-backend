@@ -48,6 +48,38 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--poll-interval", type=float, default=None)
 
     commands.add_parser("init-db", help="create or migrate the state database")
+    commands.add_parser(
+        "db-status",
+        help="schema version, integrity check, migration history and backups",
+    )
+    db_backup_command = commands.add_parser(
+        "db-backup", help="write a verified online backup of the state database"
+    )
+    db_backup_command.add_argument("--label", default="manual")
+    db_backup_command.add_argument(
+        "--output-dir", type=Path, default=None, help="default: <state>/backups"
+    )
+    db_backups_command = commands.add_parser(
+        "db-backups", help="list the database backups"
+    )
+    db_backups_command.add_argument(
+        "--verify",
+        action="store_true",
+        help="re-hash every backup and re-run its integrity check",
+    )
+    db_restore = commands.add_parser(
+        "db-restore",
+        help="replace the state database with a verified backup (services stopped)",
+    )
+    db_restore.add_argument("backup", type=Path, help="backup file or its name")
+    db_restore.add_argument(
+        "--yes", action="store_true", help="confirm that the services are stopped"
+    )
+    db_restore.add_argument(
+        "--force",
+        action="store_true",
+        help="restore even though a job still owns the pipeline",
+    )
     doctor = commands.add_parser(
         "doctor", help="check the database and core media tools"
     )
@@ -188,6 +220,101 @@ def _init_db(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_json(document: object) -> None:
+    print(json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _db_status(args: argparse.Namespace) -> int:
+    from .db_backup import list_backups
+
+    settings = _settings(args)
+    database = _database(args, settings)
+    database.initialize()
+    path = Path(database.display_path).expanduser()
+    backups = list_backups(database.backup_directory)
+    integrity = database.integrity_check()
+    _print_json(
+        {
+            "path": str(path),
+            "schema_version": database.schema_version(),
+            "size_bytes": path.stat().st_size if path.is_file() else None,
+            "integrity": integrity,
+            "migrations": database.migration_history(),
+            "backup_directory": str(database.backup_directory),
+            "backups": len(backups),
+            "latest_backup": backups[0].to_dict() if backups else None,
+        }
+    )
+    return 0 if integrity == ["ok"] else 1
+
+
+def _db_backup(args: argparse.Namespace) -> int:
+    from .db_backup import BackupError
+
+    database = _database(args)
+    try:
+        info = database.backup(args.label, args.output_dir)
+    except (BackupError, ValueError) as exc:
+        print(f"bdencode: {exc}", file=sys.stderr)
+        return 1
+    _print_json({**info.to_dict(), "path": str(info.path)})
+    return 0
+
+
+def _db_backups(args: argparse.Namespace) -> int:
+    from .db_backup import BackupError, list_backups, verify_backup
+
+    database = _database(args)
+    exit_code = 0
+    listing = []
+    for item in list_backups(database.backup_directory):
+        entry = item.to_dict()
+        if args.verify:
+            try:
+                entry["verified"] = verify_backup(item.path).verified
+            except BackupError as exc:
+                entry.update(verified=False, error=str(exc))
+                exit_code = 1
+        listing.append(entry)
+    _print_json({"directory": str(database.backup_directory), "backups": listing})
+    return exit_code
+
+
+def _db_restore(args: argparse.Namespace) -> int:
+    from .db_backup import BackupError, restore_backup
+
+    database = _database(args)
+    if not args.yes:
+        print(
+            "bdencode: stop bdencode-api and bdencode-worker first, then repeat "
+            "with --yes",
+            file=sys.stderr,
+        )
+        return 2
+    candidate = args.backup
+    if not candidate.is_absolute() and not candidate.exists():
+        candidate = database.backup_directory / candidate.name
+    path = Path(database.display_path).expanduser()
+    if path.is_file() and not args.force:
+        active = database.active_job()
+        if active is not None:
+            print(
+                f"bdencode: {active.id} ({active.state.value}) still owns the "
+                "pipeline; finish or stop it, or pass --force",
+                file=sys.stderr,
+            )
+            return 3
+    try:
+        outcome = restore_backup(
+            candidate, path, safety_directory=database.backup_directory
+        )
+    except BackupError as exc:
+        print(f"bdencode: {exc}", file=sys.stderr)
+        return 1
+    _print_json(outcome)
+    return 0
+
+
 def _doctor(args: argparse.Namespace) -> int:
     try:
         module = importlib.import_module("bdencode.doctor")
@@ -254,6 +381,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "api": _run_api,
         "worker": _run_worker,
         "init-db": _init_db,
+        "db-status": _db_status,
+        "db-backup": _db_backup,
+        "db-backups": _db_backups,
+        "db-restore": _db_restore,
         "doctor": _doctor,
         "queue-idle": _queue_idle,
     }

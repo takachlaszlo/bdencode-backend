@@ -97,10 +97,27 @@ class ReferenceScriptPlan:
     output_width: int | None = None
     output_height: int | None = None
     decoder_threads: int = 0
+    # Optional (start_frame, frame_count) windows on the finished timeline.  A
+    # sample script splices them after every other filter, so a CRF probe sees
+    # exactly the picture the release encode will receive.
+    sample_windows: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.track < 0:
             raise ValueError("video track cannot be negative")
+        previous_end = 0
+        for window in self.sample_windows:
+            if (
+                len(window) != 2
+                or any(type(value) is not int for value in window)
+                or window[0] < previous_end
+                or window[1] < 1
+            ):
+                raise ValueError(
+                    "sample windows must be ordered, non-overlapping "
+                    "(start, count) integer pairs"
+                )
+            previous_end = window[0] + window[1]
         if (self.output_width is None) != (self.output_height is None):
             raise ValueError("output width and height must be supplied together")
         if self.output_width is not None and (
@@ -175,12 +192,21 @@ def render_reference_script(plan: ReferenceScriptPlan) -> str:
         lines.append(
             f"src = core.resize.Spline36(src, width={plan.output_width}, height={plan.output_height})"
         )
+    if plan.sample_windows:
+        pieces = ", ".join(
+            f"src[{start}:{start + count}]" for start, count in plan.sample_windows
+        )
+        lines.append(
+            f"src = {pieces}"
+            if len(plan.sample_windows) == 1
+            else f"src = core.std.Splice([{pieces}], mismatch=False)"
+        )
     lines.extend(["", "src.set_output()", ""])
     return "\n".join(lines)
 
 
 def script_record(plan: ReferenceScriptPlan, content: str) -> dict[str, Any]:
-    return {
+    record: dict[str, Any] = {
         "schema_version": 1,
         "source": str(plan.source),
         "cache_path": str(plan.cache_path),
@@ -192,3 +218,8 @@ def script_record(plan: ReferenceScriptPlan, content: str) -> dict[str, Any]:
         "decoder_threads": plan.decoder_threads,
         "script_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
     }
+    if plan.sample_windows:
+        # Present only for sample scripts, so the digest of every ordinary
+        # reference-script checkpoint stays byte-identical across upgrades.
+        record["sample_windows"] = [list(window) for window in plan.sample_windows]
+    return record

@@ -19,6 +19,7 @@ import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
+from datetime import timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -33,8 +34,38 @@ from .audio import (
 )
 from .chapters import render_matroska_chapters
 from .config import Settings
-from .capabilities import capability_snapshot
+from .capabilities import capability_snapshot, dynamic_hdr_support
+from .crf_search import (
+    STATUS_BEST_EFFORT,
+    STATUS_MAX_CRF,
+    AutoCrfConfig,
+    CrfProbe,
+    CrfSearch,
+    CrfSearchError,
+    CrfSearchOutcome,
+    plan_sample_windows,
+    vmaf_model_for_height,
+    vmaf_score,
+)
 from .db import Database, StateConflictError
+from .hdr_dynamic import (
+    DISCARD_PLAN,
+    DOLBY_VISION_VBV_KBPS,
+    DynamicHdrError,
+    DynamicHdrMode,
+    DynamicHdrPlan,
+    allowed_forbidden_tokens,
+    dovi_extract_commands,
+    dovi_summary_command,
+    hdr10plus_extract_commands,
+    parse_dovi_summary,
+    parse_hdr10plus_json,
+    parse_mode,
+    require_dolby_vision_profile,
+    require_frame_alignment,
+    resolve_dynamic_hdr,
+    x265_dynamic_params,
+)
 from .encode import (
     PcmBlurayAudio,
     ReferenceRemuxPlan,
@@ -119,6 +150,7 @@ from .mux import (
     parse_stream_start_times_by_type,
     plan_common_zero_timeline,
     stream_start_probe_command,
+    validate_dynamic_hdr_output,
     validate_ffprobe_stream_policy,
     validate_hdr10_side_data,
     validate_mkvmerge_identification,
@@ -157,8 +189,10 @@ from .qc.crop import (
     automatic_crop,
     CropPolicyError,
     full_title_cropdetect_command,
+    parse_aspect_profile,
     parse_stable_cropdetect,
     validate_operator_crop,
+    variable_aspect_evidence,
 )
 from .qc.freeimage import FreeimageClient
 from .qc.image_upload import (
@@ -225,6 +259,7 @@ from .vapoursynth import (
     render_reference_script,
     script_record,
 )
+from .vmaf_runner import streamed_vmaf_command
 
 
 LOG = logging.getLogger(__name__)
@@ -234,6 +269,16 @@ LOG = logging.getLogger(__name__)
 # otherwise healthy hardware, while the enclosing comparison still enforces a
 # strict thirty-minute wall-clock deadline.
 COMPARISON_FRAME_PROBE_TIMEOUT_SECONDS = 300
+
+# libvmaf frame-level threads for the CRF probes.  Measured on 720p: one thread
+# 114 s, four 25 s, eight 14.5 s, sixteen 10.5 s for the same bit-identical
+# score; eight keeps the per-frame float buffers of a UHD title modest.
+VMAF_PROBE_MAX_THREADS = 8
+
+
+def _vmaf_thread_count() -> int:
+    return max(1, min(VMAF_PROBE_MAX_THREADS, os.cpu_count() or 1))
+
 
 _FFPROBE_PROFILE_NAMES = {
     "high": "High",
@@ -442,6 +487,8 @@ class ParsedSelection:
     image_upload_provider: str
     dual_type_match: bool = False
     schema_version: int = 2
+    auto_crf: AutoCrfConfig = AutoCrfConfig()
+    dynamic_hdr: DynamicHdrMode = DynamicHdrMode.DISCARD
 
 
 @dataclass(frozen=True, slots=True)
@@ -1141,6 +1188,30 @@ def _valid_stage(
         return False
 
 
+def _outcome_from_report(
+    document: Mapping[str, Any], config: AutoCrfConfig
+) -> CrfSearchOutcome:
+    """Rebuild the search outcome from a hash-pinned automatic CRF report."""
+
+    probes = tuple(
+        CrfProbe(crf=float(item["crf"]), score=float(item["score"]))
+        for item in document["probes"]
+    )
+    chosen = document["chosen_crf"]
+    return CrfSearchOutcome(
+        status=str(document["status"]),
+        chosen_crf=None if chosen is None else float(chosen),
+        chosen_score=(
+            None
+            if document.get("chosen_score") is None
+            else float(document["chosen_score"])
+        ),
+        probes=probes,
+        monotonic=bool(document.get("monotonic", True)),
+        target_vmaf=config.target_vmaf,
+    )
+
+
 def _write_stage(
     marker: Path, inputs: Mapping[str, Any], outputs: Sequence[Path]
 ) -> None:
@@ -1704,11 +1775,31 @@ def parse_selection(
         raise ReviewRequired(f"angle must be between 1 and {playlist.angle_count}")
 
     video_raw = raw["video"]
-    allowed_video = {"detail_level", "settings", "overrides", "crop", "temporal_filter"}
+    allowed_video = {
+        "detail_level",
+        "settings",
+        "overrides",
+        "crop",
+        "temporal_filter",
+        "auto_crf",
+        "dynamic_hdr",
+    }
     if not isinstance(video_raw, Mapping) or set(video_raw) - allowed_video:
         raise ReviewRequired(
-            "video may contain detail_level, settings, crop and temporal_filter"
+            "video may contain detail_level, settings, crop, temporal_filter, "
+            "auto_crf and dynamic_hdr"
         )
+    try:
+        auto_crf = AutoCrfConfig.from_mapping(video_raw.get("auto_crf"))
+    except CrfSearchError as exc:
+        raise ReviewRequired(f"invalid automatic CRF configuration: {exc}") from exc
+    try:
+        dynamic_hdr = parse_mode(video_raw.get("dynamic_hdr"))
+    except DynamicHdrError as exc:
+        raise ReviewRequired(
+            f"invalid dynamic HDR policy: {exc}",
+            details={"code": f"dynamic_hdr_{exc.code}"},
+        ) from exc
     try:
         detail_level = DetailLevel(video_raw.get("detail_level", "beginner"))
     except ValueError as exc:
@@ -1942,7 +2033,7 @@ def parse_selection(
     dual_type = raw.get("dual_type_match", True)
     if not isinstance(dual_type, bool):
         raise ReviewRequired("dual_type_match must be boolean")
-    return ParsedSelection(
+    parsed = ParsedSelection(
         playlist_id=playlist_id,
         angle=angle,
         settings=settings,
@@ -1954,7 +2045,57 @@ def parse_selection(
         image_upload_provider=image_upload_provider,
         dual_type_match=dual_type,
         schema_version=2,
+        auto_crf=auto_crf,
+        dynamic_hdr=dynamic_hdr,
     )
+    try:
+        resolve_selection_dynamic_hdr(scan, parsed)
+    except DynamicHdrError as exc:
+        raise ReviewRequired(
+            f"dynamic HDR retention is not possible: {exc}",
+            details={"code": f"dynamic_hdr_{exc.code}"},
+        ) from exc
+    return parsed
+
+
+def resolve_selection_dynamic_hdr(
+    scan: DiscScan, selection: ParsedSelection
+) -> DynamicHdrPlan:
+    """Resolve the requested retention against the scanned source (pure)."""
+
+    if selection.dynamic_hdr is DynamicHdrMode.DISCARD:
+        return DISCARD_PLAN
+    playlist = scan.playlist(selection.playlist_id)
+    video = playlist.video_streams[0].video if playlist.video_streams else None
+    if video is None:
+        raise DynamicHdrError("no_video", "the playlist has no video stream")
+    return resolve_dynamic_hdr(
+        selection.dynamic_hdr,
+        encoder=selection.settings.encoder.value,
+        hdr10_enabled=selection.settings.hdr10.enabled,
+        progressive=selection.temporal_filter is TemporalFilter.PROGRESSIVE,
+        crop_enabled=selection.crop.enabled,
+        dolby_vision=video.dolby_vision,
+        dolby_vision_profile=video.dolby_vision_profile,
+        hdr10_base_layer=video.hdr10_base_layer,
+        hdr10_plus=video.hdr10_plus,
+    )
+
+
+def _settings_for_dynamic_hdr(
+    settings: EncoderSettings, plan: DynamicHdrPlan
+) -> EncoderSettings:
+    """Dolby Vision 8.1 needs a bounded VBV that x265 does not impose itself."""
+
+    if plan.mode is DynamicHdrMode.DOLBY_VISION and settings.vbv is None:
+        return replace(
+            settings,
+            vbv=VbvSettings(
+                maxrate_kbps=DOLBY_VISION_VBV_KBPS,
+                bufsize_kbps=DOLBY_VISION_VBV_KBPS,
+            ),
+        )
+    return settings
 
 
 def _field_handling(value: TemporalFilter) -> FieldHandling:
@@ -2560,6 +2701,42 @@ class PipelineWorker:
         instead of silently falling back to the original zero margins.
         """
 
+        scan, selection = self._load_prepared_crop_selection(job, paths)
+        selection = self._apply_auto_crf(job, paths, selection)
+        if selection.dynamic_hdr is not DynamicHdrMode.DISCARD:
+            plan, _metadata, _digest = self._load_dynamic_hdr(job, paths, selection)
+            selection = replace(
+                selection, settings=_settings_for_dynamic_hdr(selection.settings, plan)
+            )
+        return scan, selection
+
+    def _apply_auto_crf(
+        self, job: Job, paths: JobPaths, selection: ParsedSelection
+    ) -> ParsedSelection:
+        """Replace the nominal CRF with the durable automatic-search result."""
+
+        if not selection.auto_crf.enabled:
+            return selection
+        report = paths.analysis / "crf-search.json"
+        try:
+            document = json.loads(report.read_text(encoding="utf-8"))
+            chosen = document["chosen_crf"]
+            if (
+                document.get("schema_version") != 1
+                or document.get("selection_sha256") != _json_hash(job.selection)
+                or type(chosen) not in {int, float}
+            ):
+                raise ValueError("report does not describe this selection")
+            return replace(selection, settings=replace(selection.settings, crf=chosen))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewRequired(
+                f"automatic CRF report is missing or stale: {exc}",
+                details={"code": "crf_search_missing", "report": report.name},
+            ) from exc
+
+    def _load_prepared_crop_selection(
+        self, job: Job, paths: JobPaths
+    ) -> tuple[DiscScan, ParsedSelection]:
         scan, selection = self._load_scan_and_selection(job, paths)
         if selection.crop.enabled:
             return scan, selection
@@ -2797,10 +2974,15 @@ class PipelineWorker:
             scan, _selection = self._load_scan_and_selection(job, paths)
         except (OSError, TypeError, ValueError, KeyError):
             return False
+        outputs = [paths.reference, paths.script, paths.plan_json]
+        if _selection.dynamic_hdr is not DynamicHdrMode.DISCARD:
+            outputs.append(paths.analysis / "dynamic-hdr.json")
+        if _selection.auto_crf.enabled:
+            outputs.append(paths.analysis / "crf-search.json")
         return _valid_stage(
             paths.stages / "pipeline-prepare.json",
             self._preparation_inputs(job, scan),
-            [paths.reference, paths.script, paths.plan_json],
+            outputs,
         )
 
     def _prepare(self, job: Job, paths: JobPaths, *, advance: bool = True) -> None:
@@ -3009,11 +3191,28 @@ class PipelineWorker:
             )
             crop_log = crop_log_path.read_text(encoding="utf-8", errors="replace")
             try:
-                crop_evidence = parse_stable_cropdetect(
-                    crop_log,
-                    source_width=source_video.width,
-                    source_height=source_video.height,
-                )
+                try:
+                    crop_evidence = parse_stable_cropdetect(
+                        crop_log,
+                        source_width=source_video.width,
+                        source_height=source_video.height,
+                    )
+                except CropPolicyError as unstable:
+                    # A title that changes aspect ratio has no dominant border;
+                    # accept it only when the log is a clean few-step envelope.
+                    explained = (
+                        variable_aspect_evidence(
+                            crop_log,
+                            source_width=source_video.width,
+                            source_height=source_video.height,
+                            duration_seconds=float(playlist.duration_seconds),
+                        )
+                        if unstable.code == "unstable_detection"
+                        else None
+                    )
+                    if explained is None:
+                        raise
+                    crop_evidence = explained
                 requested_crop = ActiveCropMargins(
                     left=selection.crop.left,
                     top=selection.crop.top,
@@ -3039,6 +3238,12 @@ class PipelineWorker:
                     f"crop policy requires review: {exc}",
                     details={"code": exc.code, "report": crop_report.name},
                 ) from exc
+            aspect_profile = parse_aspect_profile(
+                crop_log,
+                source_width=source_video.width,
+                source_height=source_video.height,
+                duration_seconds=float(playlist.duration_seconds),
+            )
             atomic_write_json(
                 crop_report,
                 {
@@ -3047,9 +3252,21 @@ class PipelineWorker:
                     "selection_mode": "automatic" if automatic else "manual",
                     "evidence": crop_evidence.to_dict(),
                     "decision": crop_decision.to_dict(),
+                    "aspect_profile": (
+                        aspect_profile.to_dict() if aspect_profile else None
+                    ),
                 },
             )
             _write_stage(crop_marker, crop_inputs, [crop_report])
+            if aspect_profile is not None and aspect_profile.variable:
+                self.database.add_event(
+                    EventCreate(
+                        job_id=job.id,
+                        kind="worker.variable-aspect",
+                        message=aspect_profile.summary(),
+                        payload=aspect_profile.to_dict(),
+                    )
+                )
 
         try:
             crop_document = json.loads(crop_report.read_text(encoding="utf-8"))
@@ -3077,6 +3294,13 @@ class PipelineWorker:
         # a language problem only after a multi-hour video encode. Manual track
         # language choices remain authoritative and skip content inference.
         selection = self._resolve_selected_languages(job, scan, selection, paths)
+        try:
+            dynamic_plan = resolve_selection_dynamic_hdr(scan, selection)
+        except DynamicHdrError as exc:
+            raise ReviewRequired(
+                f"dynamic HDR retention is not possible: {exc}",
+                details={"code": f"dynamic_hdr_{exc.code}"},
+            ) from exc
         plan_request = EncodeRequest(
             scan=scan,
             playlist_id=selection.playlist_id,
@@ -3088,6 +3312,7 @@ class PipelineWorker:
             crop=_planner_crop(selection.crop),
             angle=selection.angle,
             overwrite=True,
+            dynamic_hdr=dynamic_plan.mode.value,
         )
         try:
             encode_plan = EncodePlanner(work_root=self.settings.data_root).build(
@@ -3132,6 +3357,40 @@ class PipelineWorker:
             _write_stage(
                 script_marker, script_inputs, [paths.script, script_record_path]
             )
+        prepared_outputs = [paths.reference, paths.script, paths.plan_json]
+        final_dynamic = dynamic_plan
+        if selection.dynamic_hdr is not DynamicHdrMode.DISCARD:
+            final_dynamic = self._dynamic_hdr(job, paths, scan, selection, dynamic_plan)
+            selection = replace(
+                selection,
+                settings=_settings_for_dynamic_hdr(selection.settings, final_dynamic),
+            )
+            prepared_outputs.append(paths.analysis / "dynamic-hdr.json")
+        if selection.auto_crf.enabled:
+            outcome = self._auto_crf(job, paths, scan, selection)
+            if outcome.chosen_crf is not None:
+                selection = replace(
+                    selection,
+                    settings=replace(selection.settings, crf=outcome.chosen_crf),
+                )
+            prepared_outputs.append(paths.analysis / "crf-search.json")
+        if (
+            selection.settings != plan_request.settings
+            or final_dynamic.mode is not dynamic_plan.mode
+        ):
+            try:
+                final_plan = EncodePlanner(work_root=self.settings.data_root).build(
+                    replace(
+                        plan_request,
+                        settings=selection.settings,
+                        dynamic_hdr=final_dynamic.mode.value,
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ReviewRequired(
+                    f"the tuned encode settings cannot be planned safely: {exc}"
+                ) from exc
+            atomic_write_json(paths.plan_json, final_plan.to_dict())
         self._register_artifact(
             job.id,
             paths.plan_json,
@@ -3142,12 +3401,439 @@ class PipelineWorker:
         _write_stage(
             paths.stages / "pipeline-prepare.json",
             self._preparation_inputs(job, scan),
-            [paths.reference, paths.script, paths.plan_json],
+            prepared_outputs,
         )
         if advance:
             self.queue.advance(
                 job.id, JobState.ENCODING, message="reference timeline prepared"
             )
+
+    def _reference_info(self, paths: JobPaths) -> Any:
+        """Frame count and rate of the reviewed reference graph (checkpointed)."""
+
+        info_path = paths.work / "reference-info.txt"
+        inputs = {
+            "script_sha256": sha256_file(paths.script),
+            "reference_sha256": sha256_file(paths.reference),
+        }
+        marker = paths.stages / "reference-info.json"
+        if not _valid_stage(marker, inputs, [info_path]):
+            self._runner(paths).run(
+                vspipe_info_command(paths.script),
+                cwd=paths.work,
+                stdout_path=info_path,
+                stderr_path=paths.logs / "reference-info.log",
+            )
+            _write_stage(marker, inputs, [info_path])
+        return parse_vspipe_info(info_path.read_text(encoding="utf-8", errors="replace"))
+
+    def _dynamic_hdr(
+        self,
+        job: Job,
+        paths: JobPaths,
+        scan: DiscScan,
+        selection: ParsedSelection,
+        plan: DynamicHdrPlan,
+    ) -> DynamicHdrPlan:
+        """Extract and verify HDR10+/Dolby Vision metadata for retention.
+
+        The stage only runs when the operator asked for retention.  Extraction
+        output is proven frame-aligned with the reviewed reference timeline
+        before it may reach the encoder; anything else is a review, never a
+        silent downgrade (except for the explicit ``auto`` mode).
+        """
+
+        report = paths.analysis / "dynamic-hdr.json"
+        selection_sha256 = _json_hash(job.selection)
+        work = paths.work / "dynamic-hdr"
+        work.mkdir(mode=0o750, parents=True, exist_ok=True)
+        runner = self._runner(paths)
+
+        state: Mapping[str, Any] = {}
+        if plan.retained:
+            key = "hdr10plus" if plan.mode is DynamicHdrMode.HDR10PLUS else "dolby_vision"
+            state = dynamic_hdr_support().get(key, {})
+            if not state.get("available"):
+                problem = (
+                    f"{plan.mode.value} retention needs {plan.required_tool} "
+                    "and an x265 build that accepts its parameters "
+                    f"(tool: {state.get('tool_available')}, "
+                    f"x265: {state.get('x265_supported')})"
+                )
+                if selection.dynamic_hdr is DynamicHdrMode.AUTO:
+                    plan = DynamicHdrPlan(
+                        plan.requested, DynamicHdrMode.DISCARD, problem
+                    )
+                else:
+                    raise ReviewRequired(
+                        problem,
+                        details={
+                            "code": "dynamic_hdr_tool_missing",
+                            "support": dict(state),
+                        },
+                    )
+
+        if not plan.retained:
+            atomic_write_json(
+                report,
+                {
+                    "schema_version": 1,
+                    "status": "discarded",
+                    "selection_sha256": selection_sha256,
+                    "plan": plan.to_dict(),
+                },
+            )
+            self.database.add_event(
+                EventCreate(
+                    job_id=job.id,
+                    kind="worker.dynamic-hdr",
+                    message=f"dynamic HDR is discarded: {plan.reason}",
+                    payload=plan.to_dict(),
+                )
+            )
+            return plan
+
+        plus = plan.mode is DynamicHdrMode.HDR10PLUS
+        metadata = work / ("hdr10plus.json" if plus else "rpu.bin")
+        summary_path = work / "dovi-summary.txt"
+        outputs = [metadata] if plus else [metadata, summary_path]
+        try:
+            info = self._reference_info(paths)
+        except FrameSelectionError as exc:
+            raise ReviewRequired(
+                f"dynamic HDR cannot read the reference timeline: {exc}"
+            ) from exc
+        inputs = {
+            "policy_schema_version": 1,
+            "reference_sha256": sha256_file(paths.reference),
+            "plan": plan.to_dict(),
+            "tool_version": state.get("tool_version"),
+            "output_frames": info.frames,
+        }
+        marker = paths.stages / "dynamic-hdr.json"
+        if not _valid_stage(marker, inputs, outputs):
+            metadata.unlink(missing_ok=True)
+            commands = (
+                hdr10plus_extract_commands(paths.reference, metadata)
+                if plus
+                else dovi_extract_commands(paths.reference, metadata, plan)
+            )
+            runner.run_pipeline(
+                commands,
+                cwd=paths.work,
+                stderr_paths=[
+                    paths.logs / "dynamic-hdr-source.log",
+                    paths.logs / "dynamic-hdr-extract.log",
+                ],
+            )
+            try:
+                if plus:
+                    counted = parse_hdr10plus_json(
+                        metadata.read_text(encoding="utf-8")
+                    )
+                    require_frame_alignment(
+                        counted.frames, info.frames, what="the HDR10+ metadata"
+                    )
+                else:
+                    runner.run(
+                        dovi_summary_command(metadata),
+                        cwd=paths.work,
+                        stdout_path=summary_path,
+                        stderr_path=paths.logs / "dynamic-hdr-summary.log",
+                    )
+                    counted = parse_dovi_summary(
+                        summary_path.read_text(encoding="utf-8", errors="replace")
+                    )
+                    require_dolby_vision_profile(counted)
+                    require_frame_alignment(
+                        counted.frames, info.frames, what="the Dolby Vision RPU"
+                    )
+            except (DynamicHdrError, OSError, UnicodeError) as exc:
+                code = getattr(exc, "code", "unreadable")
+                raise ReviewRequired(
+                    f"extracted dynamic HDR metadata was rejected: {exc}",
+                    details={"code": f"dynamic_hdr_{code}"},
+                ) from exc
+            _write_stage(marker, inputs, outputs)
+
+        if plus:
+            counted = parse_hdr10plus_json(metadata.read_text(encoding="utf-8"))
+        else:
+            counted = parse_dovi_summary(
+                summary_path.read_text(encoding="utf-8", errors="replace")
+            )
+        atomic_write_json(
+            report,
+            {
+                "schema_version": 1,
+                "status": "retained",
+                "selection_sha256": selection_sha256,
+                "plan": plan.to_dict(),
+                "tool": plan.required_tool,
+                "tool_version": state.get("tool_version"),
+                "output_frames": info.frames,
+                "summary": counted.to_dict(),
+                "metadata": {
+                    "name": metadata.name,
+                    "sha256": sha256_file(metadata),
+                    "size_bytes": metadata.stat().st_size,
+                },
+            },
+        )
+        self._register_artifact(
+            job.id,
+            report,
+            DatabaseArtifactKind.MANIFEST,
+            "dynamic-hdr.json",
+            mime_type="application/json",
+        )
+        self.database.add_event(
+            EventCreate(
+                job_id=job.id,
+                kind="worker.dynamic-hdr",
+                message=f"{plan.mode.value} metadata verified for {info.frames} frames",
+                payload={**plan.to_dict(), "summary": counted.to_dict()},
+            )
+        )
+        return plan
+
+    def _load_dynamic_hdr(
+        self, job: Job, paths: JobPaths, selection: ParsedSelection
+    ) -> tuple[DynamicHdrPlan, Path | None, str | None]:
+        """Reload the verified plan and its hash-pinned metadata file."""
+
+        report = paths.analysis / "dynamic-hdr.json"
+        try:
+            document = json.loads(report.read_text(encoding="utf-8"))
+            if (
+                document.get("schema_version") != 1
+                or document.get("selection_sha256") != _json_hash(job.selection)
+            ):
+                raise ValueError("report does not describe this selection")
+            plan = DynamicHdrPlan.from_dict(document["plan"])
+            if not plan.retained:
+                return plan, None, None
+            metadata = paths.work / "dynamic-hdr" / str(document["metadata"]["name"])
+            expected = str(document["metadata"]["sha256"])
+            if sha256_file(metadata) != expected:
+                raise ValueError("extracted metadata changed after verification")
+            return plan, metadata, expected
+        except (
+            OSError,
+            KeyError,
+            TypeError,
+            ValueError,
+            DynamicHdrError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise ReviewRequired(
+                f"dynamic HDR report is missing or stale: {exc}",
+                details={"code": "dynamic_hdr_report", "report": report.name},
+            ) from exc
+
+    def _auto_crf(
+        self,
+        job: Job,
+        paths: JobPaths,
+        scan: DiscScan,
+        selection: ParsedSelection,
+    ) -> CrfSearchOutcome:
+        """Choose the release CRF from short VMAF-scored sample encodes.
+
+        Every probe is an independent checkpoint, so a pause, cancellation or
+        restart resumes after the last completed probe instead of repeating it.
+        The final report is hash-pinned by the ``pipeline-prepare`` marker.
+        """
+
+        config = selection.auto_crf
+        work = paths.work / "crf-search"
+        work.mkdir(mode=0o750, parents=True, exist_ok=True)
+        report = paths.analysis / "crf-search.json"
+        runner = self._runner(paths)
+        selection_sha256 = _json_hash(job.selection)
+
+        reference_sha256 = sha256_file(paths.reference)
+        try:
+            info = self._reference_info(paths)
+            windows = plan_sample_windows(
+                info.frames,
+                Fraction(info.fps_numerator, info.fps_denominator),
+                samples=config.samples,
+                sample_seconds=config.sample_seconds,
+            )
+        except (FrameSelectionError, CrfSearchError) as exc:
+            raise ReviewRequired(
+                f"automatic CRF search cannot sample this title: {exc}",
+                details={"code": "crf_search_unplannable"},
+            ) from exc
+
+        sample_script = work / "sample.vpy"
+        sample_plan = ReferenceScriptPlan(
+            source=paths.reference,
+            cache_path=paths.work / "cache" / "bestsource",
+            script_path=sample_script,
+            temporal_filter=selection.temporal_filter,
+            crop=selection.crop,
+            sample_windows=tuple((w.start_frame, w.frame_count) for w in windows),
+        )
+        sample_content = render_reference_script(sample_plan)
+        atomic_write_text(sample_script, sample_content)
+        base_settings = (
+            selection.settings
+            if config.probe_preset is None
+            else replace(selection.settings, preset=config.probe_preset)
+        )
+        playlist = scan.playlist(selection.playlist_id)
+        video = playlist.video_streams[0].video if playlist.video_streams else None
+        picture_height = None if video is None else video.height
+        if picture_height is not None:
+            picture_height -= selection.crop.top + selection.crop.bottom
+        model_4k = vmaf_model_for_height(picture_height)
+        hdr10 = selection.settings.hdr10.enabled
+        common_inputs: dict[str, Any] = {
+            "policy_schema_version": 1,
+            "reference_sha256": reference_sha256,
+            "sample_script_sha256": hashlib.sha256(
+                sample_content.encode("utf-8")
+            ).hexdigest(),
+            "windows": [window.to_dict() for window in windows],
+            "settings": {**base_settings.to_dict(), "crf": None},
+            "config": config.to_dict(),
+            "model_4k": model_4k,
+            "hdr10": hdr10,
+        }
+
+        report_inputs = {**common_inputs, "selection_sha256": selection_sha256}
+        report_marker = paths.stages / "crf-search.json"
+        if _valid_stage(report_marker, report_inputs, [report]):
+            document = json.loads(report.read_text(encoding="utf-8"))
+            return _outcome_from_report(document, config)
+
+        search = CrfSearch(config, selection.settings.crf)
+        while (crf := search.next_crf()) is not None:
+            token = f"{crf:.2f}".replace(".", "_")
+            vmaf_json = work / f"probe-{token}.vmaf.json"
+            probe_marker = paths.stages / f"crf-probe-{token}.json"
+            probe_inputs = {**common_inputs, "crf": crf}
+            if not _valid_stage(probe_marker, probe_inputs, [vmaf_json]):
+                probe_video = work / f"probe-{token}.mkv"
+                probe_video.unlink(missing_ok=True)
+                try:
+                    runner.run_pipeline(
+                        encode_pipeline_commands(
+                            sample_script, probe_video, replace(base_settings, crf=crf)
+                        ),
+                        cwd=paths.work,
+                        stderr_paths=[
+                            paths.logs / f"crf-probe-{token}-vapoursynth.log",
+                            paths.logs / f"crf-probe-{token}-encode.log",
+                        ],
+                    )
+                    runner.run(
+                        streamed_vmaf_command(
+                            sample_script,
+                            probe_video,
+                            vmaf_json,
+                            hdr10=hdr10,
+                            model_4k=model_4k,
+                            # Only the VMAF score steers the search: skip the
+                            # slow PSNR/SSIM features, use a thread pool (the
+                            # score is identical), and keep the named pipes
+                            # out of the job tree, where they would make the
+                            # storage accounting refuse the whole job.
+                            threads=_vmaf_thread_count(),
+                            vmaf_only=True,
+                            fifo_root=self.settings.cache_root / "vmaf",
+                        ),
+                        cwd=paths.work,
+                        stderr_path=paths.logs / f"crf-probe-{token}-vmaf.log",
+                    )
+                finally:
+                    # Sample encodes are disposable; only the score is evidence.
+                    probe_video.unlink(missing_ok=True)
+                _write_stage(probe_marker, probe_inputs, [vmaf_json])
+            try:
+                score = vmaf_score(
+                    json.loads(vmaf_json.read_text(encoding="utf-8")), config.metric
+                )
+                search.record(crf, score)
+            except (OSError, CrfSearchError, json.JSONDecodeError) as exc:
+                raise ReviewRequired(
+                    f"CRF probe {crf} produced no usable VMAF score: {exc}",
+                    details={"code": "crf_probe_invalid", "crf": crf},
+                ) from exc
+            self.database.add_event(
+                EventCreate(
+                    job_id=job.id,
+                    kind="worker.auto-crf-probe",
+                    message=f"CRF {crf:g} scored VMAF {score:.2f}",
+                    payload={
+                        "crf": crf,
+                        "vmaf": round(score, 4),
+                        "target": config.target_vmaf,
+                        "metric": config.metric,
+                    },
+                )
+            )
+
+        outcome = search.outcome()
+        atomic_write_json(
+            report,
+            {
+                "schema_version": 1,
+                "selection_sha256": selection_sha256,
+                "nominal_crf": selection.settings.crf,
+                "config": config.to_dict(),
+                "windows": [window.to_dict() for window in windows],
+                "sampled_frames": sum(window.frame_count for window in windows),
+                "model": "vmaf_4k_v0.6.1" if model_4k else "vmaf_v0.6.1",
+                "hdr10_proof_transform": hdr10,
+                **outcome.to_dict(),
+            },
+        )
+        if not outcome.usable:
+            raise ReviewRequired(
+                "automatic CRF search could not reach the VMAF target "
+                f"{config.target_vmaf:g} within CRF {config.min_crf:g}-"
+                f"{config.max_crf:g}; lower the target, widen the range or "
+                "choose a fixed CRF",
+                details={"code": "crf_target_unreachable", "report": report.name},
+            )
+        _write_stage(report_marker, report_inputs, [report])
+        self._register_artifact(
+            job.id,
+            report,
+            DatabaseArtifactKind.MANIFEST,
+            "crf-search.json",
+            mime_type="application/json",
+        )
+        message = f"automatic CRF search selected CRF {outcome.chosen_crf:g}"
+        if outcome.status == STATUS_MAX_CRF:
+            message += (
+                f"; the VMAF target {config.target_vmaf:g} is met even at the "
+                f"highest allowed CRF (VMAF {outcome.chosen_score:.2f}), so a "
+                "higher max_crf would give a smaller file"
+            )
+        elif outcome.status == STATUS_BEST_EFFORT:
+            message += (
+                f"; VMAF {outcome.chosen_score:.2f} is more than "
+                f"{config.tolerance:g} above the target {config.target_vmaf:g} "
+                "because the search ended before a closer CRF was found"
+            )
+        self.database.add_event(
+            EventCreate(
+                job_id=job.id,
+                kind="worker.auto-crf",
+                message=message,
+                payload={
+                    "status": outcome.status,
+                    "chosen_crf": outcome.chosen_crf,
+                    "vmaf": outcome.chosen_score,
+                    "target": config.target_vmaf,
+                },
+            )
+        )
+        return outcome
 
     def _encode(self, job: Job, paths: JobPaths) -> None:
         scan, selection = self._load_prepared_scan_and_selection(job, paths)
@@ -3159,10 +3845,31 @@ class PipelineWorker:
         if reference_sha256 is None:
             raise RuntimeError("reference remux checkpoint digest is missing")
         temporary_video = paths.work / "video-encoded.partial.mkv"
+        extra_video_params: dict[str, str | int] | None = None
+        dynamic_inputs: dict[str, Any] | None = None
+        if selection.dynamic_hdr is not DynamicHdrMode.DISCARD:
+            dynamic_plan, metadata_path, metadata_sha256 = self._load_dynamic_hdr(
+                job, paths, selection
+            )
+            if dynamic_plan.retained and metadata_path is not None:
+                try:
+                    extra_video_params = x265_dynamic_params(
+                        dynamic_plan, metadata_path
+                    )
+                except DynamicHdrError as exc:
+                    raise ReviewRequired(
+                        f"dynamic HDR metadata cannot be passed to x265: {exc}",
+                        details={"code": f"dynamic_hdr_{exc.code}"},
+                    ) from exc
+                dynamic_inputs = {
+                    "plan": dynamic_plan.to_dict(),
+                    "metadata_sha256": metadata_sha256,
+                }
         commands = encode_pipeline_commands(
             paths.script,
             temporary_video,
             selection.settings,
+            extra_video_params=extra_video_params,
         )
         inputs = {
             "policy_schema_version": 3,
@@ -3174,6 +3881,8 @@ class PipelineWorker:
             "settings": selection.settings.to_dict(),
             "argv": commands,
         }
+        if dynamic_inputs is not None:
+            inputs["dynamic_hdr"] = dynamic_inputs
 
         def interrupted() -> bool:
             return self._process_interrupt_requested(job.id)
@@ -4318,6 +5027,11 @@ class PipelineWorker:
         side_data_document = json.loads(
             (report_root / "ffprobe-video-side-data.json").read_text(encoding="utf-8")
         )
+        dynamic_plan = DISCARD_PLAN
+        if selection.dynamic_hdr is not DynamicHdrMode.DISCARD:
+            dynamic_plan, _metadata, _digest = self._load_dynamic_hdr(
+                job, paths, selection
+            )
         hdr_errors = validate_hdr10_side_data(
             ffprobe_document,
             side_data_document,
@@ -4325,8 +5039,12 @@ class PipelineWorker:
             mastering_display=hdr.mastering_display,
             max_cll=hdr.max_cll,
             max_fall=hdr.max_fall,
+            allowed_dynamic=allowed_forbidden_tokens(dynamic_plan),
         )
-        policy_errors = (*stream_errors, *start_errors, *hdr_errors)
+        retained_errors = validate_dynamic_hdr_output(
+            ffprobe_document, side_data_document, dynamic_plan
+        )
+        policy_errors = (*stream_errors, *start_errors, *hdr_errors, *retained_errors)
         if policy_errors:
             raise ReviewRequired(
                 "final media streams differ from the reviewed codec/color/HDR policy",
@@ -5096,6 +5814,10 @@ class PipelineWorker:
                 "pipe:0",
                 "-frames:v",
                 "1",
+                # The Y4M muxer rejects 10-bit pixel formats without this
+                # (exit code 234), which stopped every UHD HDR10 comparison.
+                "-strict",
+                "-1",
                 "-f",
                 "yuv4mpegpipe",
                 "-y",
@@ -6036,8 +6758,36 @@ class PipelineWorker:
             message=f"{len(pairs)} sampled I/P/B comparison pairs complete",
         )
 
+    @staticmethod
+    def _record_source_size(
+        scan: DiscScan, selection: ParsedSelection, paths: JobPaths
+    ) -> None:
+        """Keep the disc size of the selected playlist for the statistics view.
+
+        Best effort: statistics must never be able to fail a finished encode.
+        """
+
+        try:
+            clips = _playlist_source_snapshot(scan, selection.playlist_id)
+            atomic_write_json(
+                paths.analysis / "source-size.json",
+                {
+                    "schema_version": 1,
+                    "total_bytes": sum(int(clip["size_bytes"]) for clip in clips),
+                    "clips": [
+                        {
+                            "name": Path(str(clip["path"])).name,
+                            "size_bytes": int(clip["size_bytes"]),
+                        }
+                        for clip in clips
+                    ],
+                },
+            )
+        except (ReviewRequired, OSError, KeyError, TypeError, ValueError):
+            LOG.warning("source size could not be recorded for statistics", exc_info=True)
+
     def _upload_and_finalize(self, job: Job, paths: JobPaths) -> None:
-        _scan, selection = self._load_prepared_scan_and_selection(job, paths)
+        scan, selection = self._load_prepared_scan_and_selection(job, paths)
         recorded_mux_digest = _recorded_output_sha256(
             paths.stages / "mux.json", paths.muxed_output
         )
@@ -6605,6 +7355,7 @@ class PipelineWorker:
             final_output.name,
             mime_type="video/x-matroska",
         )
+        self._record_source_size(scan, selection, paths)
         self._write_manifest(job, selection, paths, final_output)
         completed_job = self.queue.advance(
             job.id, JobState.COMPLETED, message="encode, QC and comparison completed"
@@ -6720,8 +7471,23 @@ class PipelineWorker:
                 "mediainfo",
                 "vmaf",
                 "bdencode-libbluray-scan",
+                "hdr10plus_tool",
+                "dovi_tool",
             )
         )
+        optional_reports: dict[str, Any] = {}
+        for label, name in (
+            ("auto_crf", "crf-search.json"),
+            ("dynamic_hdr", "dynamic-hdr.json"),
+        ):
+            candidate = paths.analysis / name
+            if candidate.is_file():
+                try:
+                    optional_reports[label] = json.loads(
+                        candidate.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    optional_reports[label] = {"error": "unreadable report"}
         atomic_write_json(
             paths.manifest_json,
             {
@@ -6730,6 +7496,7 @@ class PipelineWorker:
                 "source_path": job.source_path,
                 "selection": job.selection,
                 "encoder_settings": selection.settings.to_dict(),
+                **optional_reports,
                 "output": {
                     "path": str(output),
                     "sha256": sha256_file(output),
@@ -6841,6 +7608,30 @@ def run_worker(
             pass
 
     idle_sleep = max(interval, 0.05)
+    backup_check = {"next": 0.0}
+
+    def maintain_backups() -> None:
+        """Write the scheduled database backup when it is due (best effort)."""
+
+        if settings.backup_interval_hours <= 0 or database.path == ":memory:":
+            return
+        now = time.monotonic()
+        if now < backup_check["next"]:
+            return
+        backup_check["next"] = now + 600
+        try:
+            from .db_backup import ensure_scheduled_backup
+
+            created = ensure_scheduled_backup(
+                Path(database.path).expanduser(),
+                database.backup_directory,
+                interval=timedelta(hours=settings.backup_interval_hours),
+                keep={"scheduled": settings.backup_keep_scheduled},
+            )
+            if created is not None:
+                LOG.info("scheduled database backup written: %s", created.name)
+        except Exception:
+            LOG.exception("scheduled database backup failed; will retry later")
 
     def claim_lane(
         current: Callable[[], Job | None],
@@ -6917,6 +7708,7 @@ def run_worker(
         while not should_stop():
             job = claim_lane(database.encoding_job, worker.queue.claim_next_ready)
             if job is None:
+                maintain_backups()
                 time.sleep(idle_sleep)
                 continue
             worker.process_job(job)

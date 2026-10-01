@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Transactional refresh of the media tool runtime (Debian media packages, the
+# managed Python with VapourSynth, the native scanner). The daily timer no longer
+# runs it: bdencode-update.service runs bdencode-release-update, which only looks
+# for a newer BDEncode release. Start this by hand when the tools need a refresh:
+#   sudo env BDENCODE_USER=<account> /usr/local/libexec/bdencode-daily-update
 set -Eeuo pipefail
 
 umask 027

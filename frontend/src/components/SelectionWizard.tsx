@@ -24,8 +24,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Dispatch, ReactNode, SetStateAction } from "react";
 import type {
   AIQualityPriority,
+  AutoCrfConfig,
   DetailLevel,
   DiscScanResult,
+  DynamicHdrMode,
   FieldSpec,
   ImageUploadProvider,
   Job,
@@ -50,6 +52,8 @@ import type { SourceColorField, SourceColorMetadata } from "../colorMetadata";
 import { normalizeStoredSelection } from "../selection";
 import type { StoredTrackSelection } from "../selection";
 import { basename, formatDuration, humanize, suggestedOutputName } from "../utils";
+import { ProfileLibraryPanel } from "./ProfileLibraryPanel";
+import { QualityOptions } from "./QualityOptions";
 import { Badge, Button, Card, Notice, ProgressBar } from "./ui";
 
 const GROUP_LABELS: Record<string, string> = {
@@ -278,6 +282,8 @@ export function SelectionWizard({
   );
   const [settings, setSettings] = useState<Record<string, unknown>>(initial?.settings ?? {});
   const [settingsSearch, setSettingsSearch] = useState("");
+  const [autoCrf, setAutoCrf] = useState<AutoCrfConfig | null>(initial?.autoCrf ?? null);
+  const [dynamicHdr, setDynamicHdr] = useState<DynamicHdrMode>(initial?.dynamicHdr ?? "discard");
   const [aiQualityPriority, setAiQualityPriority] = useState<AIQualityPriority>("balanced");
   const [aiTargetSize, setAiTargetSize] = useState("");
   const [aiGenre, setAiGenre] = useState("");
@@ -330,12 +336,14 @@ export function SelectionWizard({
       temporal_filter: temporalFilter,
       crop,
       settings,
+      ...(autoCrf?.enabled ? { auto_crf: autoCrf } : {}),
+      ...(dynamicHdr !== "discard" ? { dynamic_hdr: dynamicHdr } : {}),
     },
     tracks: tracksForPayload(tracks, playlist),
     upload_images: uploadImages,
     image_upload_provider: selectedImageProvider,
     dual_type_match: true,
-  }), [angle, crop, detailLevel, outputName, playlist, playlistId, selectedImageProvider, settings, temporalFilter, tracks, uploadImages]);
+  }), [angle, autoCrf, crop, detailLevel, dynamicHdr, outputName, playlist, playlistId, selectedImageProvider, settings, temporalFilter, tracks, uploadImages]);
 
   const validate = useMutation({
     mutationFn: () => api.validateSelection(job.id, payload, job.version),
@@ -444,6 +452,18 @@ export function SelectionWizard({
     if (numeric && typeof value === "number" && !Number.isFinite(value)) return;
     setSettings((current) => ({ ...current, [field.name]: value }));
     setValidation(null);
+  }
+
+  function applyNoiseProfile(patch: Record<string, unknown>) {
+    setSettings((current) => ({ ...current, ...patch }));
+    clearPlanFeedback();
+  }
+
+  function applyLibraryProfile(selection: { settings: Record<string, unknown>; auto_crf?: AutoCrfConfig; dynamic_hdr?: DynamicHdrMode }) {
+    setSettings((current) => ({ ...current, ...selection.settings }));
+    setAutoCrf(selection.auto_crf?.enabled ? selection.auto_crf : null);
+    setDynamicHdr(selection.dynamic_hdr ?? "discard");
+    clearPlanFeedback();
   }
 
   function updateSettings(next: SetStateAction<Record<string, unknown>>) {
@@ -714,6 +734,27 @@ export function SelectionWizard({
               )}
             </Card>
 
+            <QualityOptions
+              encoder={encoder}
+              contentType={job.content_type}
+              sourceVideo={videoStream?.video ?? undefined}
+              temporalFilter={temporalFilter}
+              autoCrf={autoCrf}
+              onAutoCrf={(value) => { setAutoCrf(value); clearPlanFeedback(); }}
+              dynamicHdr={dynamicHdr}
+              onDynamicHdr={(value) => { setDynamicHdr(value); clearPlanFeedback(); }}
+              onApplyNoiseProfile={applyNoiseProfile}
+            />
+
+            <ProfileLibraryPanel
+              encoder={encoder}
+              detailLevel={detailLevel}
+              settings={settings}
+              autoCrf={autoCrf}
+              dynamicHdr={dynamicHdr}
+              onApply={(selection) => applyLibraryProfile(selection)}
+            />
+
             <Card className="settings-card">
               <div className="section-heading">
                 <div><span className="section-heading__icon"><ScanLine size={19} /></span><div><h3>Képkocka-kezelés és crop</h3><p>{videoStream?.video?.width}×{videoStream?.video?.height} · {videoStream?.video?.field_order || "ismeretlen mezősorrend"}</p></div></div>
@@ -750,7 +791,7 @@ export function SelectionWizard({
                 <div><dt>Színtér</dt><dd>{videoStream?.video?.color_primaries || "—"}</dd></div>
                 <div><dt>HDR10</dt><dd>{videoStream?.video?.hdr10 ? "Megtartva" : "Nincs"}</dd></div>
               </dl>
-              {videoStream?.video?.dolby_vision && <Notice tone="warning">Dolby Vision nem kerül megtartásra; a HDR10 alpréteg lesz a kimenet.</Notice>}
+              {videoStream?.video?.dolby_vision && <Notice tone="warning">Alapértelmezetten a Dolby Vision nem kerül megtartásra (a HDR10 alréteg lesz a kimenet); a „Minőségi opciók” szakaszban kérhető a megtartás.</Notice>}
             </Card>
           </aside>
         </div>

@@ -148,6 +148,7 @@ export function Modal({
   onClose,
   busy = false,
   ariaDescribedBy,
+  size = "default",
 }: PropsWithChildren<{
   open: boolean;
   title: string;
@@ -155,6 +156,7 @@ export function Modal({
   onClose: () => void;
   busy?: boolean;
   ariaDescribedBy?: string;
+  size?: "default" | "wide";
 }>) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -234,7 +236,7 @@ export function Modal({
     <div className="modal-backdrop" role="presentation" onMouseDown={requestClose}>
       <div
         ref={dialogRef}
-        className="modal"
+        className={size === "wide" ? "modal modal--wide" : "modal"}
         role="dialog"
         tabIndex={-1}
         aria-modal="true"

@@ -13,3 +13,6 @@ log_level = "INFO"
 ai_model = "gpt-5.6-terra"
 ai_timeout_seconds = 60
 release_profiles_path = "/etc/bdencode/release-profiles.json"
+# Automatikus SQLite mentés a <data_root>/state/backups mappába (0 = kikapcsolva).
+backup_interval_hours = 24
+backup_keep_scheduled = 14

@@ -15,6 +15,8 @@ describe("normalizeStoredSelection", () => {
       uploadImages: null,
       imageUploadProvider: null,
       dualTypeMatch: null,
+      autoCrf: null,
+      dynamicHdr: null,
     });
   });
 
@@ -61,6 +63,8 @@ describe("normalizeStoredSelection", () => {
       uploadImages: false,
       imageUploadProvider: "catbox",
       dualTypeMatch: true,
+      autoCrf: null,
+      dynamicHdr: null,
     });
   });
 
@@ -80,5 +84,34 @@ describe("normalizeStoredSelection", () => {
     });
 
     expect(value?.tracks).toEqual([]);
+  });
+});
+
+describe("normalizeStoredSelection quality options", () => {
+  it("restores an enabled automatic CRF search and the dynamic HDR policy", () => {
+    const stored = normalizeStoredSelection({
+      video: {
+        auto_crf: { enabled: true, target_vmaf: 94.5, min_crf: 14, max_crf: 24, metric: "harmonic_mean", junk: 1 },
+        dynamic_hdr: "hdr10plus",
+      },
+    });
+    expect(stored?.autoCrf).toEqual({
+      enabled: true,
+      target_vmaf: 94.5,
+      min_crf: 14,
+      max_crf: 24,
+      metric: "harmonic_mean",
+    });
+    expect(stored?.dynamicHdr).toBe("hdr10plus");
+  });
+
+  it("ignores disabled, malformed or unknown values", () => {
+    expect(normalizeStoredSelection({ video: { auto_crf: { enabled: false, target_vmaf: 95 } } })?.autoCrf).toBeNull();
+    expect(normalizeStoredSelection({ video: { auto_crf: "yes" } })?.autoCrf).toBeNull();
+    expect(normalizeStoredSelection({ video: { auto_crf: { enabled: true } } })?.autoCrf).toEqual({
+      enabled: true,
+      target_vmaf: 95,
+    });
+    expect(normalizeStoredSelection({ video: { dynamic_hdr: "always" } })?.dynamicHdr).toBeNull();
   });
 });

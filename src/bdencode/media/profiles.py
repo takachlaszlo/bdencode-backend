@@ -410,6 +410,9 @@ class EncoderSettings:
     # and/or Psy-Trellis are active; private_params() compensates for that so
     # the manifest and the encoded bitstream describe the same value.
     chroma_qp_offset: int = -2
+    # Encoder-native transform-domain noise reduction: x264 ``nr`` (0-1000) or
+    # x265 ``nr-intra``/``nr-inter`` (0-2000).  Zero keeps the argv unchanged.
+    noise_reduction: int = 0
 
     # x265-specific tools.  They remain explicit in the pro schema so an
     # operator sees every material choice instead of receiving hidden defaults.
@@ -455,6 +458,7 @@ class EncoderSettings:
             "deblock_beta",
             "chroma_qp_offset",
             "rskip",
+            "noise_reduction",
         )
         real_fields = ("crf", "aq_strength", "qcomp", "psy_rd", "psy_rdoq")
         boolean_fields = (
@@ -537,6 +541,13 @@ class EncoderSettings:
             raise ValueError("chroma_qp_offset must be between -12 and 12")
         if self.rskip not in {0, 1, 2}:
             raise ValueError("rskip must be 0, 1 or 2")
+        if not 0 <= self.noise_reduction <= (
+            1000 if self.encoder is VideoEncoder.X264 else 2000
+        ):
+            raise ValueError(
+                "noise_reduction must be between 0 and "
+                f"{1000 if self.encoder is VideoEncoder.X264 else 2000}"
+            )
         if self.encoder is VideoEncoder.X264:
             self._validate_x264()
         else:
@@ -695,6 +706,8 @@ class EncoderSettings:
                     "chroma-qp-offset": self.x264_emitted_chroma_qp_offset(),
                 }
             )
+            if self.noise_reduction:
+                common["nr"] = self.noise_reduction
         else:
             common.update(
                 {
@@ -711,6 +724,9 @@ class EncoderSettings:
                     "rskip": self.rskip,
                 }
             )
+            if self.noise_reduction:
+                common["nr-intra"] = self.noise_reduction
+                common["nr-inter"] = self.noise_reduction
             if self.hdr10.enabled:
                 common.update(
                     {
@@ -722,14 +738,29 @@ class EncoderSettings:
                 )
         return common
 
-    def ffmpeg_video_args(self) -> tuple[str, ...]:
+    def ffmpeg_video_args(
+        self, extra_private: Mapping[str, str | int | float] | None = None
+    ) -> tuple[str, ...]:
+        """FFmpeg video arguments.
+
+        ``extra_private`` adds or overrides encoder-private options that are
+        only known at run time (for example the per-job path of extracted
+        dynamic HDR metadata); they are never part of the persisted settings.
+        """
+
         codec = "libx264" if self.encoder is VideoEncoder.X264 else "libx265"
         private_name = (
             "-x264-params" if self.encoder is VideoEncoder.X264 else "-x265-params"
         )
-        params = ":".join(
-            f"{key}={value}" for key, value in self.private_params().items()
-        )
+        private = self.private_params()
+        if extra_private:
+            for key, value in extra_private.items():
+                if not re.fullmatch(r"[a-z0-9-]+", key) or re.search(
+                    r"[:\s]", str(value)
+                ):
+                    raise ValueError(f"unsafe encoder-private option: {key}")
+                private[key] = value
+        params = ":".join(f"{key}={value}" for key, value in private.items())
         args = [
             "-c:v",
             codec,
@@ -758,6 +789,32 @@ class EncoderSettings:
             args.extend(("-tune", self.tune.value))
         args.extend((private_name, params))
         return tuple(args)
+
+    def ffmpeg_color_input_args(self) -> tuple[str, ...]:
+        """Tell FFmpeg's Y4M reader the colour properties the frames really have.
+
+        VapourSynth's Y4M stream carries no colour properties, while the command
+        line tells FFmpeg to write ``-colorspace``/``-color_range``/... to the
+        output.  On FFmpeg 7.1 that makes the automatically inserted scaler
+        convert the untagged input to the requested matrix through an RGB detour
+        ("YUV color matrix differs for YUV->YUV"), so every pixel of every encode
+        changed: 35 dB PSNR against the source for a BT.709 title, 26 dB for
+        BT.2020 HDR10, at any CRF, measured with FFmpeg 7.1.5.  The
+        same options given as *input* options describe the frames instead, and
+        the scaler becomes a no-op.  They are the output options verbatim, so
+        the names are valid wherever those are.
+        """
+
+        return (
+            "-color_primaries",
+            self.color.primaries,
+            "-color_trc",
+            _ffmpeg_transfer_name(self.color.transfer),
+            "-colorspace",
+            self.color.matrix,
+            "-color_range",
+            "pc" if self.color.range == "full" else "tv",
+        )
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -1095,6 +1152,20 @@ _FIELD_SPECS: tuple[FieldSpec, ...] = (
         12,
         description="Effective value reported by x264 after Psy-RD compensation.",
     ),
+    FieldSpec(
+        "noise_reduction",
+        "psychovisual",
+        DetailLevel.ADVANCED,
+        True,
+        0,
+        "integer",
+        0,
+        2000,
+        description=(
+            "Encoder-native noise reduction (x264 nr, x265 nr-intra/nr-inter); "
+            "0 keeps the source noise untouched."
+        ),
+    ),
     FieldSpec("weightp", "motion", DetailLevel.PRO, True, 2, "integer", 0, 2),
     FieldSpec("weightb", "motion", DetailLevel.PRO, True, True, "boolean"),
     FieldSpec("sao", "x265", DetailLevel.PRO, True, True, "boolean"),
@@ -1157,6 +1228,8 @@ def profile_schema(
             item["minimum"] = 0
         elif spec.name == "aq_mode" and encoder is VideoEncoder.X264:
             item["maximum"] = 3
+        elif spec.name == "noise_reduction" and encoder is VideoEncoder.X264:
+            item["maximum"] = 1000
         elif spec.name == "weightp" and encoder is VideoEncoder.X265:
             item["default"] = 1
             item["maximum"] = 1

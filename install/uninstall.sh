@@ -593,6 +593,7 @@ fi
 system_files=(
     /etc/bdencode/config.toml
     /etc/bdencode/release-profiles.json
+    /etc/bdencode/release-update.toml
     /etc/bdencode/media-apt.sources.list
     /etc/apt/preferences.d/bdencode-media
     /etc/systemd/system/bdencode-api.service
@@ -615,6 +616,7 @@ system_files=(
     /etc/systemd/system/multi-user.target.wants/bdencode-install-recovery.path
     /etc/systemd/system/timers.target.wants/bdencode-update.timer
     /usr/local/libexec/bdencode-daily-update
+    /usr/local/libexec/bdencode-release-update
     /usr/local/libexec/bdencode-install-transaction
     /usr/local/libexec/bdencode-apt-transaction
     /usr/local/libexec/bdencode-apt-guard

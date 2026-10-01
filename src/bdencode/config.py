@@ -53,6 +53,11 @@ class Settings:
     # contain a private tracker torrent and therefore remain server-side.
     release_profiles_path: Path | None = None
     config_path: Path | None = None
+    # Automatic online SQLite backups written by the worker into
+    # ``<state>/backups``.  0 disables the schedule; pre-migration and manual
+    # backups are always available.
+    backup_interval_hours: int = 24
+    backup_keep_scheduled: int = 14
 
     @property
     def state_root(self) -> Path:
@@ -99,6 +104,12 @@ class Settings:
             raise ConfigurationError("comparison_pair_count must be between 20 and 50")
         if self.comparison_frames_per_type < 1:
             raise ConfigurationError("comparison_frames_per_type must be positive")
+        if not 0 <= self.backup_interval_hours <= 24 * 30:
+            raise ConfigurationError(
+                "backup_interval_hours must be between 0 (disabled) and 720"
+            )
+        if not 1 <= self.backup_keep_scheduled <= 60:
+            raise ConfigurationError("backup_keep_scheduled must be between 1 and 60")
         if (
             not self.ai_model
             or len(self.ai_model) > 100
@@ -178,6 +189,8 @@ def _coerce(name: str, value: Any) -> Any:
         "cpu_limit_percent",
         "comparison_pair_count",
         "comparison_frames_per_type",
+        "backup_interval_hours",
+        "backup_keep_scheduled",
     }:
         return int(value)
     if name in {"worker_poll_seconds", "ai_timeout_seconds"}:

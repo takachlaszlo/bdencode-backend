@@ -35,13 +35,15 @@ import { api, ApiError, artifactContentUrl, fetchArtifactText } from "../api/cli
 import type { Artifact, DiscScanResult, EventRecord, Job, JobOperation, JobStorageReport, ReleasePreparation, ReleasePreparationList, Scan } from "../api/types";
 import { ComparisonPanel } from "../components/ComparisonPanel";
 import { PipelineSteps } from "../components/JobCard";
+import { JobStatisticsCard } from "../components/JobStatisticsCard";
+import { PlayerPanel } from "../components/PlayerPanel";
 import { ReleasePanel } from "../components/ReleasePanel";
 import { SelectionWizard } from "../components/SelectionWizard";
 import { Badge, Button, Card, EmptyState, LoadingPanel, Modal, Notice, PageHeader, ProgressBar } from "../components/ui";
 import { normalizeStoredSelection } from "../selection";
 import { CONTENT_LABELS, formatBytes, formatDate, formatEventMessage, formatStatusMessage, formatWorkerError, humanize, isFastComparisonTimeoutReview, stageProgress, STATE_LABELS, stateTone } from "../utils";
 
-type Tab = "overview" | "settings" | "comparison" | "release" | "events" | "files";
+type Tab = "overview" | "settings" | "comparison" | "player" | "release" | "events" | "files";
 type JobDetailLocationState = {
   newlyCreated?: boolean;
   retryStarted?: boolean;
@@ -62,6 +64,7 @@ const tabs: Array<{ value: Tab; label: string; icon: typeof Info }> = [
   { value: "overview", label: "Áttekintés", icon: Gauge },
   { value: "settings", label: "Beállítások", icon: Settings2 },
   { value: "comparison", label: "Comparison", icon: Images },
+  { value: "player", label: "Lejátszó", icon: Play },
   { value: "release", label: "Release", icon: PackageCheck },
   { value: "events", label: "Események", icon: ClipboardList },
   { value: "files", label: "Fájlok és logok", icon: FolderOpen },
@@ -313,6 +316,7 @@ export function JobDetailPage() {
   );
 
   const job = jobQuery.data;
+  const visibleTabs = tabs.filter((item) => item.value !== "player" || job.state === "COMPLETED");
   const scanRow = latestSuccessfulScan(scansQuery.data?.items ?? []);
   const scan = scanRow?.result && "playlists" in scanRow.result ? scanRow.result as DiscScanResult : null;
   const artifacts = artifactsQuery.data?.items ?? [];
@@ -440,7 +444,7 @@ export function JobDetailPage() {
       />
 
       <div className="tabs" role="tablist">
-        {tabs.map(({ value, label, icon: Icon }, index) => (
+        {visibleTabs.map(({ value, label, icon: Icon }, index) => (
           <button
             ref={(element) => { tabRefs.current[index] = element; }}
             id={`job-tab-${value}`}
@@ -453,13 +457,13 @@ export function JobDetailPage() {
             onClick={() => setTab(value)}
             onKeyDown={(event) => {
               let next = index;
-              if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
-              else if (event.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
+              if (event.key === "ArrowRight") next = (index + 1) % visibleTabs.length;
+              else if (event.key === "ArrowLeft") next = (index - 1 + visibleTabs.length) % visibleTabs.length;
               else if (event.key === "Home") next = 0;
-              else if (event.key === "End") next = tabs.length - 1;
+              else if (event.key === "End") next = visibleTabs.length - 1;
               else return;
               event.preventDefault();
-              setTab(tabs[next].value);
+              setTab(visibleTabs[next].value);
               tabRefs.current[next]?.focus();
             }}
           >
@@ -483,6 +487,7 @@ export function JobDetailPage() {
           )
         )}
         {tab === "comparison" && <ComparisonPanel artifacts={artifacts} />}
+        {tab === "player" && job.state === "COMPLETED" && <PlayerPanel jobId={job.id} />}
         {tab === "release" && <ReleasePanel job={job} outputArtifact={completedOutput} />}
         {tab === "events" && <EventTimeline events={events} loading={eventsQuery.isLoading} />}
         {tab === "files" && <ArtifactsPanel artifacts={artifacts} />}
@@ -641,6 +646,7 @@ function Overview({ job, scan, events, artifacts, onConfigure }: { job: Job; sca
             <div><dt>Mellékletek</dt><dd>{artifacts.length}</dd></div>
           </dl>
         </Card>
+        {job.state === "COMPLETED" && <JobStatisticsCard jobId={job.id} />}
         {scan && <Card><span className="eyebrow">Lemez scan</span><dl className="summary-list summary-list--stacked"><div><dt>Típus</dt><dd>{scan.disc_kind.toUpperCase()}</dd></div><div><dt>Playlistek</dt><dd>{scan.playlists.length}</dd></div><div><dt>Több változat</dt><dd>{scan.has_multiple_editions ? "Igen" : "Nem"}</dd></div><div><dt>3D észlelve</dt><dd>{scan.has_three_d ? "Igen — nem támogatott" : "Nem"}</dd></div></dl></Card>}
       </aside>
     </div>

@@ -609,6 +609,8 @@ export interface SelectionPayload {
     temporal_filter: string;
     crop: { left: number; top: number; right: number; bottom: number };
     settings: Record<string, unknown>;
+    auto_crf?: AutoCrfConfig;
+    dynamic_hdr?: DynamicHdrMode;
   };
   tracks: TrackSelection[];
   upload_images: boolean;
@@ -693,4 +695,197 @@ export interface AudioComparisonTrack {
 export interface AudioComparisonManifest {
   schema_version: number;
   tracks: AudioComparisonTrack[];
+}
+
+
+// -- Quality options -----------------------------------------------------------------
+
+export type DynamicHdrMode = "discard" | "auto" | "hdr10plus" | "dolby_vision";
+
+export interface AutoCrfConfig {
+  enabled: boolean;
+  target_vmaf: number;
+  min_crf?: number;
+  max_crf?: number;
+  samples?: number;
+  sample_seconds?: number;
+  max_iterations?: number;
+  tolerance?: number;
+  metric?: "mean" | "harmonic_mean" | "percentile_1";
+  probe_preset?: string | null;
+}
+
+export interface NoiseProfile {
+  id: string;
+  label: string;
+  description: string;
+  settings: Record<string, unknown>;
+}
+
+export interface NoiseProfilesResponse {
+  encoder: "x264" | "x265";
+  requires_operator_confirmation: boolean;
+  profiles: NoiseProfile[];
+}
+
+// -- Profile library -------------------------------------------------------------------
+
+export interface LibraryProfileSelection {
+  detail_level: DetailLevel;
+  settings: Record<string, unknown>;
+  auto_crf?: AutoCrfConfig;
+  dynamic_hdr?: DynamicHdrMode;
+}
+
+export interface LibraryProfileDocument {
+  format?: "bdencode-profile";
+  version?: 1;
+  name: string;
+  description?: string;
+  encoder: "x264" | "x265";
+  detail_level: DetailLevel;
+  settings: Record<string, unknown>;
+  auto_crf?: AutoCrfConfig;
+  dynamic_hdr?: DynamicHdrMode;
+}
+
+export interface LibraryProfile extends LibraryProfileDocument {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  selection: LibraryProfileSelection;
+}
+
+export interface LibraryProfileList {
+  items: LibraryProfile[];
+  count: number;
+}
+
+export interface LibraryImportResult {
+  imported: Array<{ name: string; id: string }>;
+  skipped: Array<{ name: string; id: string }>;
+  errors: Array<{ name: string; code: string; message: string }>;
+}
+
+// -- Statistics ---------------------------------------------------------------------------
+
+export interface JobStatistics {
+  job_id: string;
+  name: string;
+  state: JobState;
+  disc_type: string;
+  content_type: string;
+  finished_at: string | null;
+  encoder: string | null;
+  crf: number | null;
+  preset: string | null;
+  source_bytes: number | null;
+  output_bytes: number | null;
+  saved_bytes: number | null;
+  saved_percent: number | null;
+  media_seconds: number | null;
+  frames: number | null;
+  bitrate_kbps: number | null;
+  encode_seconds: number | null;
+  encode_fps: number | null;
+  realtime_factor: number | null;
+  total_seconds: number | null;
+  quality: {
+    vmaf_sample: number | null;
+    vmaf_target: number | null;
+    vmaf_scope: string | null;
+    ssim_mean: number | null;
+    psnr_mean_db: number | null;
+    comparison_samples: number | null;
+  };
+  auto_crf: { status: string; chosen_crf: number | null; probes: number } | null;
+}
+
+export interface StatisticsSummary {
+  jobs: number;
+  jobs_with_size_evidence: number;
+  source_gib: number;
+  output_gib: number;
+  saved_gib: number;
+  saved_percent: number | null;
+  total_output_gib: number;
+  average_vmaf_sample: number | null;
+  average_ssim: number | null;
+  average_psnr_db: number | null;
+  average_crf: number | null;
+  average_bitrate_kbps: number | null;
+  encode_hours: number;
+  average_encode_fps: number | null;
+  average_realtime_factor: number | null;
+  encoders: Record<string, number>;
+}
+
+export interface StatisticsResponse {
+  summary: StatisticsSummary;
+  jobs: JobStatistics[];
+}
+
+// -- Player ------------------------------------------------------------------------------------
+
+export interface PreviewRecord {
+  name: string;
+  start_seconds: number;
+  duration_seconds: number;
+  height: number;
+  size_bytes: number;
+  created_at: number;
+  created?: boolean;
+}
+
+export interface PlayerInfo {
+  duration_seconds: number | null;
+  video: {
+    codec: string | null;
+    width: number | null;
+    height: number | null;
+    pix_fmt: string | null;
+    hdr: boolean;
+    color_transfer: string | null;
+  } | null;
+  audio: Array<{ codec: string | null; channels: number | null; language: string | null; title: string | null }>;
+  subtitles: number;
+  chapters: Array<{ start_seconds: number; title: string }>;
+  previews: PreviewRecord[];
+  limits: { min_duration_seconds: number; max_duration_seconds: number; heights: number[] };
+}
+
+// -- Database status and backups ------------------------------------------------------------------
+
+export interface BackupInfo {
+  name: string;
+  label: string;
+  created_at: string;
+  size_bytes: number;
+  sha256: string | null;
+  schema_version: number | null;
+  jobs: number | null;
+  verified: boolean;
+}
+
+export interface DatabaseStatus {
+  path: string;
+  schema_version: number;
+  size_bytes: number | null;
+  integrity: string[];
+  migrations: Array<{
+    id: number;
+    from_version: number | null;
+    to_version: number;
+    kind: "create" | "migrate";
+    applied_at: string;
+    backup_name: string | null;
+    app_version: string | null;
+  }>;
+  backup_count: number;
+  latest_backup: BackupInfo | null;
+}
+
+export interface BackupList {
+  directory: string;
+  items: BackupInfo[];
 }

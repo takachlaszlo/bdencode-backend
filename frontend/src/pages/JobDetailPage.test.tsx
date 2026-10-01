@@ -30,6 +30,8 @@ vi.mock("../api/client", async (importOriginal) => {
       releasePreparations: vi.fn(),
       retryUpload: vi.fn(),
       resumeJob: vi.fn(),
+      playerInfo: vi.fn(),
+      jobStatistics: vi.fn(),
     },
   };
 });
@@ -321,5 +323,83 @@ describe("JobDetailPage failed-job retry", () => {
       force_if_seeded: true,
       preparation_versions: { "prep-1": 4, "prep-2": 12 },
     }));
+  });
+});
+
+describe("JobDetailPage player and statistics", () => {
+  const completed = makeJob({ state: "COMPLETED", progress: 1, finished_at: "2026-08-02T18:00:00Z", output_path: "/completed/Mintafilm.mkv" });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.scans).mockResolvedValue({ items: [], meta: { limit: 100, offset: 0, count: 0 } });
+    vi.mocked(api.artifacts).mockResolvedValue({ items: [], meta: { limit: 500, offset: 0, count: 0 } });
+    vi.mocked(api.events).mockResolvedValue({ items: [], after_id: 0 });
+    vi.mocked(api.jobStorage).mockResolvedValue({ workspace_bytes: 0, reclaimable_bytes: 0, completed_release_bytes: 0, categories: [] });
+    vi.mocked(api.releasePreparations).mockResolvedValue([]);
+    vi.mocked(api.jobStatistics).mockResolvedValue({
+      job_id: "job-1",
+      name: "Mintafilm",
+      state: "COMPLETED",
+      disc_type: "BD",
+      content_type: "FILM",
+      finished_at: "2026-08-02T18:00:00Z",
+      encoder: "x264",
+      crf: 17.75,
+      preset: "slow",
+      source_bytes: 30 * 1024 ** 3,
+      output_bytes: 9 * 1024 ** 3,
+      saved_bytes: 21 * 1024 ** 3,
+      saved_percent: 70,
+      media_seconds: 7200,
+      frames: 172627,
+      bitrate_kbps: 10200,
+      encode_seconds: 3600,
+      encode_fps: 47.95,
+      realtime_factor: 2,
+      total_seconds: 7000,
+      quality: { vmaf_sample: 95.1, vmaf_target: 95, vmaf_scope: "auto-crf sample encodes", ssim_mean: 0.9812, psnr_mean_db: 43.2, comparison_samples: 24 },
+      auto_crf: { status: "converged", chosen_crf: 17.75, probes: 3 },
+    });
+    vi.mocked(api.playerInfo).mockResolvedValue({
+      duration_seconds: 7200,
+      video: { codec: "h264", width: 1920, height: 1080, pix_fmt: "yuv420p", hdr: false, color_transfer: "bt709" },
+      audio: [],
+      subtitles: 0,
+      chapters: [],
+      previews: [],
+      limits: { min_duration_seconds: 5, max_duration_seconds: 30, heights: [360, 480, 720] },
+    });
+  });
+
+  function renderJob(job: ReturnType<typeof makeJob>) {
+    vi.mocked(api.job).mockResolvedValue(job);
+    return renderApp(
+      <Routes>
+        <Route path="/jobs/:jobId" element={<JobDetailPage />} />
+      </Routes>,
+      "/jobs/job-1",
+    );
+  }
+
+  it("offers the player tab and a statistics card for a completed job", async () => {
+    const user = userEvent.setup();
+    renderJob(completed);
+
+    expect(await screen.findByText("Statisztika")).toBeInTheDocument();
+    expect(await screen.findByText(/70,0%|70\.0%/)).toBeInTheDocument();
+    expect(screen.getByText(/47\.95 fps/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: /Lejátszó/ }));
+    expect(await screen.findByText("Beépített lejátszó")).toBeInTheDocument();
+    expect(api.playerInfo).toHaveBeenCalledWith("job-1");
+  });
+
+  it("does not show the player or request statistics for an unfinished job", async () => {
+    renderJob(makeJob({ state: "ENCODING", progress: 0.4 }));
+
+    await screen.findByRole("tab", { name: /Áttekintés/ });
+    expect(screen.queryByRole("tab", { name: /Lejátszó/ })).not.toBeInTheDocument();
+    expect(api.jobStatistics).not.toHaveBeenCalled();
+    expect(api.playerInfo).not.toHaveBeenCalled();
   });
 });

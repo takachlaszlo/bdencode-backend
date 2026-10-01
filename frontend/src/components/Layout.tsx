@@ -2,6 +2,7 @@ import {
   Activity,
   Archive,
   AudioWaveform,
+  BarChart3,
   CirclePlus,
   Gauge,
   ListOrdered,
@@ -21,6 +22,7 @@ const navigation = [
   { to: "/queue", label: "Várólista", icon: ListOrdered },
   { to: "/archive", label: "Elkészült munkák", icon: Archive },
   { to: "/comparisons", label: "Összehasonlítások", icon: AudioWaveform },
+  { to: "/statistics", label: "Statisztika", icon: BarChart3 },
   { to: "/settings", label: "Rendszer", icon: Settings },
 ];
 

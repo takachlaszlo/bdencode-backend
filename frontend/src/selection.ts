@@ -1,4 +1,4 @@
-import type { DetailLevel, ImageUploadProvider, SelectionPayload, TrackAction } from "./api/types";
+import type { AutoCrfConfig, DetailLevel, DynamicHdrMode, ImageUploadProvider, SelectionPayload, TrackAction } from "./api/types";
 
 type Crop = SelectionPayload["video"]["crop"];
 
@@ -25,6 +25,8 @@ export interface StoredSelection {
   uploadImages: boolean | null;
   imageUploadProvider: ImageUploadProvider | null;
   dualTypeMatch: boolean | null;
+  autoCrf: AutoCrfConfig | null;
+  dynamicHdr: DynamicHdrMode | null;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -39,6 +41,24 @@ function text(value: unknown): string | null {
 
 function boolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function normalizeAutoCrf(value: unknown): AutoCrfConfig | null {
+  const raw = record(value);
+  if (!raw || raw.enabled !== true) return null;
+  const target = typeof raw.target_vmaf === "number" && Number.isFinite(raw.target_vmaf) ? raw.target_vmaf : 95;
+  const result: AutoCrfConfig = { enabled: true, target_vmaf: target };
+  for (const key of ["min_crf", "max_crf", "samples", "sample_seconds", "max_iterations", "tolerance"] as const) {
+    const item = raw[key];
+    if (typeof item === "number" && Number.isFinite(item)) result[key] = item;
+  }
+  if (raw.metric === "mean" || raw.metric === "harmonic_mean" || raw.metric === "percentile_1") result.metric = raw.metric;
+  if (typeof raw.probe_preset === "string" && raw.probe_preset) result.probe_preset = raw.probe_preset;
+  return result;
+}
+
+function normalizeDynamicHdr(value: unknown): DynamicHdrMode | null {
+  return value === "discard" || value === "auto" || value === "hdr10plus" || value === "dolby_vision" ? value : null;
 }
 
 function normalizePlaylistId(value: unknown): string | null {
@@ -147,5 +167,7 @@ export function normalizeStoredSelection(value: unknown): StoredSelection | null
     uploadImages: boolean(selection.upload_images),
     imageUploadProvider: normalizeImageUploadProvider(selection.image_upload_provider),
     dualTypeMatch: boolean(selection.dual_type_match),
+    autoCrf: normalizeAutoCrf(video?.auto_crf),
+    dynamicHdr: normalizeDynamicHdr(video?.dynamic_hdr),
   };
 }
