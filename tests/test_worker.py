@@ -2254,6 +2254,7 @@ def test_mocked_pipeline_reaches_completed_with_sidecar_comparisons(context):
     assert comparison["metrics"]["backend"] == "ffmpeg-native-yuv-sampled-ssim-psnr"
     assert comparison["metrics"]["sample_count"] == 24
     assert set(comparison["metrics"]["aggregate"]) == {
+        "plane_bias_8bit_mean",
         "psnr_average_db_mean",
         "ssim_all_mean",
     }
