@@ -190,7 +190,10 @@ def test_schema_one_without_control_columns_migrates_in_place(tmp_path):
 def test_parallel_initializers_migrate_schema_one_atomically(tmp_path):
     path = tmp_path / "parallel-legacy.sqlite3"
     _create_schema_one_fixture(path)
-    initializer_count = 64
+    # Each initializer does a durable (synchronous=FULL) migration step; 64 of them
+    # exhaust the bounded retry budget on a slow CI disk. Sixteen still race for the
+    # one migration transaction, which is what the test is about.
+    initializer_count = 16
     start = threading.Barrier(initializer_count)
 
     def initialize(_: int) -> int:
