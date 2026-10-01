@@ -213,8 +213,10 @@ from .qc.video import (
     ffprobe_frame_origin_command,
     ffprobe_sampled_frame_command,
     parse_ffprobe_frame_origin,
+    MAXIMUM_MEAN_PLANE_BIAS,
     parse_ffmpeg_metric_stats,
     parse_sampled_ffprobe_frames,
+    plane_bias,
     parse_vspipe_info,
     plan_sample_intervals,
     png_filter_chain,
@@ -2212,6 +2214,23 @@ def _effective_audio_defaults(
         raise ReviewRequired(str(exc)) from exc
 
 
+def _mean_plane_bias(
+    samples: Sequence[Mapping[str, Any]],
+) -> dict[str, float] | None:
+    """Per-plane mean of the samples' signed bias, or None when none was measured."""
+
+    totals: dict[str, list[float]] = {}
+    for sample in samples:
+        bias = sample.get("plane_bias_8bit")
+        if isinstance(bias, Mapping):
+            for name, value in bias.items():
+                if isinstance(value, (int, float)):
+                    totals.setdefault(str(name), []).append(float(value))
+    if not totals:
+        return None
+    return {name: round(sum(values) / len(values), 4) for name, values in totals.items()}
+
+
 def _sampled_video_metric_errors(
     samples: Sequence[Mapping[str, Any]],
 ) -> tuple[str, ...]:
@@ -2243,6 +2262,13 @@ def _sampled_video_metric_errors(
         errors.append("mean sampled SSIM is below 0.95")
     if finite_psnr and sum(finite_psnr) / len(finite_psnr) < 38:
         errors.append("mean sampled PSNR is below 38 dB")
+    for name, value in (_mean_plane_bias(samples) or {}).items():
+        if abs(value) > MAXIMUM_MEAN_PLANE_BIAS:
+            errors.append(
+                f"mean sampled {name.upper()} plane is shifted by {value:+.2f} "
+                f"(8-bit code values, limit {MAXIMUM_MEAN_PLANE_BIAS}); "
+                "a systematic colour or levels error in the encode"
+            )
     if ssim_by_type["B"] and ssim_by_type["P"]:
         b_mean = sum(ssim_by_type["B"]) / len(ssim_by_type["B"])
         p_mean = sum(ssim_by_type["P"]) / len(ssim_by_type["P"])
@@ -6594,6 +6620,8 @@ class PipelineWorker:
                         "v": ssim_values.get("V"),
                     },
                     "psnr_average_db": psnr_values.get("psnr_avg"),
+                    # Signed mean error per plane (8-bit code values); None if unreadable.
+                    "plane_bias_8bit": plane_bias(reference_y4m, encoded_y4m),
                     "psnr_planes_db": {
                         "y": psnr_values.get("psnr_y"),
                         "u": psnr_values.get("psnr_u"),
@@ -6644,6 +6672,7 @@ class PipelineWorker:
                 "psnr_average_db_mean": (
                     sum(finite_psnr) / len(finite_psnr) if finite_psnr else None
                 ),
+                "plane_bias_8bit_mean": _mean_plane_bias(metric_samples),
             },
             "samples": metric_samples,
         }
@@ -6656,6 +6685,7 @@ class PipelineWorker:
                 "minimum_mean_ssim": 0.95,
                 "minimum_sample_psnr_db": 35,
                 "minimum_mean_psnr_db": 38,
+                "maximum_mean_plane_bias_8bit": MAXIMUM_MEAN_PLANE_BIAS,
                 "maximum_b_minus_p_ssim_deficit": 0.03,
             },
         }

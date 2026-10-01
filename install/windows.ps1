@@ -337,8 +337,42 @@ Invoke-WslScript -User "root" -Script $mountScript
 $stamp = Get-Date -Format "yyyyMMddHHmmss"
 $checkout = "/home/$LinuxUser/.cache/bdencode-windows-installer-$stamp"
 Invoke-Wsl -User $LinuxUser -Command @("/bin/mkdir", "-p", "/home/$LinuxUser/.cache")
+
+# Explicit -Branch wins. Without it the newest release (the highest vX.Y.Z tag, exactly what the
+# daily updater would install) is cloned, so a fresh install never gets unreleased code from main.
+$cloneRef = $Branch
+if (-not $PSBoundParameters.ContainsKey("Branch")) {
+    $bestVersion = $null
+    $bestTag = $null
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $tagLines = & wsl.exe --distribution $DistroName --user $LinuxUser --exec /usr/bin/git ls-remote --tags --refs $Repository 2>$null
+        $tagExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
+    }
+    if ($tagExitCode -eq 0) {
+        foreach ($line in @($tagLines)) {
+            $tagName = (($line -replace "`0", "") -replace '^.*refs/tags/', '').Trim()
+            if ($tagName -match '^v(\d+)\.(\d+)\.(\d+)$') {
+                $tagVersion = [version]("{0}.{1}.{2}" -f $Matches[1], $Matches[2], $Matches[3])
+                if ($null -eq $bestVersion -or $tagVersion -gt $bestVersion) {
+                    $bestVersion = $tagVersion
+                    $bestTag = $tagName
+                }
+            }
+        }
+    }
+    if ($bestTag) {
+        $cloneRef = $bestTag
+        Write-Host "A legfrissebb kiadás telepítése: $cloneRef" -ForegroundColor Yellow
+    } else {
+        Write-Host "Kiadási tag nem érhető el; a '$Branch' ág lesz telepítve." -ForegroundColor Yellow
+    }
+}
 Invoke-Wsl -User $LinuxUser -Command @(
-    "/usr/bin/git", "clone", "--quiet", "--single-branch", "--branch", $Branch,
+    "/usr/bin/git", "clone", "--quiet", "--single-branch", "--branch", $cloneRef,
     $Repository, $checkout
 )
 

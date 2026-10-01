@@ -6,6 +6,20 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 
 
+def test_windows_installer_installs_the_newest_release_unless_a_branch_is_given() -> None:
+    script = (ROOT / "install" / "windows.ps1").read_text(encoding="utf-8")
+
+    # An explicit -Branch is cloned as given; without it the highest vX.Y.Z tag is, like the daily updater.
+    assert '$PSBoundParameters.ContainsKey("Branch")' in script
+    assert "--exec /usr/bin/git ls-remote --tags --refs $Repository" in script
+    assert "'^v(\\d+)\\.(\\d+)\\.(\\d+)$'" in script
+    assert "[version]" in script
+    assert '"--branch", $cloneRef,' in script
+    assert '"--branch", $Branch,' not in script
+    # No release tag reachable: fall back to the branch instead of failing the installation.
+    assert "a '$Branch' ág lesz telepítve" in script
+
+
 def test_windows_bootstrap_is_wsl2_scoped_and_non_destructive() -> None:
     script = (ROOT / "install" / "windows.ps1").read_text(encoding="utf-8")
 

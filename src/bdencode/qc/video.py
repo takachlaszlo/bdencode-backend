@@ -1175,6 +1175,79 @@ def parse_ffmpeg_metric_stats(text: str) -> dict[str, float | str]:
     return parsed
 
 
+#: A systematic colour or levels shift (wrong matrix, range or transfer in the pipe) moves the
+#: plane averages although the PSNR of a normal picture stays far above the gate. Averages of
+#: the signed error over the sampled frames, in 8-bit code values, must stay below this.
+MAXIMUM_MEAN_PLANE_BIAS = 1.5
+
+_Y4M_CHROMA = {
+    "mono": (0, 0),
+    "420": (1, 1),
+    "422": (1, 0),
+    "444": (0, 0),
+}
+
+
+def y4m_plane_means(path: Path) -> tuple[float, ...] | None:
+    """Mean code value of the Y, U and V planes of a Y4M file, scaled to 8-bit units.
+
+    Returns ``None`` for anything that is not a plain 8-16 bit planar Y4M, so a malformed
+    sample can never turn into a bogus bias.
+    """
+
+    try:
+        data = path.read_bytes()
+        header_end = data.index(b"\n")
+        header = data[:header_end].decode("ascii").split()
+        if header[0] != "YUV4MPEG2":
+            return None
+        tags = {item[0]: item[1:] for item in header[1:]}
+        width, height = int(tags["W"]), int(tags["H"])
+        chroma_tag = tags.get("C", "420jpeg")
+        match = re.fullmatch(r"(mono|420|422|444)(?:p(\d+)|mono16|[a-z0-9]*)", chroma_tag)
+        if match is None:
+            return None
+        layout = match.group(1)
+        bits = 16 if chroma_tag == "mono16" else int(match.group(2) or 8)
+        if not 8 <= bits <= 16 or width < 2 or height < 2:
+            return None
+        shift_x, shift_y = _Y4M_CHROMA[layout]
+        chroma_w, chroma_h = (width + shift_x) >> shift_x, (height + shift_y) >> shift_y
+        sizes = [width * height] + ([] if layout == "mono" else [chroma_w * chroma_h] * 2)
+        width_bytes = 1 if bits == 8 else 2
+        sums = [0] * len(sizes)
+        frames = 0
+        position = header_end + 1
+        while position < len(data):
+            line_end = data.index(b"\n", position)
+            if not data[position:line_end].startswith(b"FRAME"):
+                return None
+            position = line_end + 1
+            for index, count in enumerate(sizes):
+                end = position + count * width_bytes
+                if end > len(data):
+                    return None
+                plane = memoryview(data)[position:end]
+                sums[index] += sum(plane) if bits == 8 else sum(plane.cast("H"))
+                position = end
+            frames += 1
+        if frames == 0:
+            return None
+        scale = 2 ** (bits - 8)
+        return tuple(total / (count * frames) / scale for total, count in zip(sums, sizes))
+    except (OSError, ValueError, KeyError, IndexError, UnicodeDecodeError, TypeError):
+        return None
+
+
+def plane_bias(reference: Path, encoded: Path) -> dict[str, float] | None:
+    """Signed mean error (encode minus reference) per plane in 8-bit code values."""
+
+    ref, enc = y4m_plane_means(reference), y4m_plane_means(encoded)
+    if ref is None or enc is None or len(ref) != len(enc):
+        return None
+    return {name: round(e - r, 4) for name, r, e in zip("yuv", ref, enc)}
+
+
 _CROPDETECT_PATTERN = re.compile(
     r"(?:^|\s)crop=(?P<width>\d+):(?P<height>\d+):(?P<x>\d+):(?P<y>\d+)"
 )
