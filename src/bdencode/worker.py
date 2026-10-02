@@ -48,6 +48,7 @@ from .crf_search import (
     vmaf_score,
 )
 from .db import Database, StateConflictError
+from .dolby_vision_scan import detect_dolby_vision_layers
 from .hdr_dynamic import (
     DISCARD_PLAN,
     DOLBY_VISION_VBV_KBPS,
@@ -1389,6 +1390,8 @@ def _scan_from_dict(value: Mapping[str, Any]) -> DiscScan:
                     ),
                     dolby_vision=bool(raw_video.get("dolby_vision", False)),
                     dolby_vision_profile=raw_video.get("dolby_vision_profile"),
+                    dolby_vision_el_stream_id=raw_video.get("dolby_vision_el_stream_id"),
+                    dolby_vision_el_type=raw_video.get("dolby_vision_el_type"),
                     hdr10_base_layer=bool(raw_video.get("hdr10_base_layer", False)),
                     hdr10_plus=bool(raw_video.get("hdr10_plus", False)),
                     three_d=bool(raw_video.get("three_d", False)),
@@ -2080,6 +2083,14 @@ def resolve_selection_dynamic_hdr(
     video = playlist.video_streams[0].video if playlist.video_streams else None
     if video is None:
         raise DynamicHdrError("no_video", "the playlist has no video stream")
+    el_ordinal = next(
+        (
+            ordinal
+            for ordinal, stream in enumerate(playlist.video_streams)
+            if video.dolby_vision_el_stream_id and stream.id == video.dolby_vision_el_stream_id
+        ),
+        None,
+    )
     return resolve_dynamic_hdr(
         selection.dynamic_hdr,
         encoder=selection.settings.encoder.value,
@@ -2090,6 +2101,8 @@ def resolve_selection_dynamic_hdr(
         dolby_vision_profile=video.dolby_vision_profile,
         hdr10_base_layer=video.hdr10_base_layer,
         hdr10_plus=video.hdr10_plus,
+        dolby_vision_el_ordinal=el_ordinal,
+        dolby_vision_el_type=video.dolby_vision_el_type,
     )
 
 
@@ -2654,6 +2667,7 @@ class PipelineWorker:
                     runner=self._runner(paths),
                 )
             result = scanner.scan(source, content_kind=_content_kind(job))
+            result = self._detect_dolby_vision_layers(paths, source, result)
             atomic_write_json(paths.scan_json, result.to_dict())
             _write_stage(marker, inputs, [paths.scan_json])
         result_json = json.loads(paths.scan_json.read_text(encoding="utf-8"))
@@ -2673,6 +2687,27 @@ class PipelineWorker:
                 message="scan complete; playlist, processing and tracks require confirmation",
             ),
         )
+
+    def _detect_dolby_vision_layers(
+        self, paths: JobPaths, source: Path, scan: DiscScan
+    ) -> DiscScan:
+        """Recognise a dual-layer (profile 7) Dolby Vision UHD disc, which no scanner flags."""
+
+        runner = self._runner(paths)
+        try:
+            return detect_dolby_vision_layers(
+                scan,
+                source,
+                run_pipeline=runner.run_pipeline,
+                run=runner.run,
+                read_text=lambda path: path.read_text(encoding="utf-8", errors="replace"),
+                work=paths.analysis / "dolby-vision-probe",
+                logs=paths.logs,
+                tool_available=bool(dynamic_hdr_support().get("dolby_vision", {}).get("tool_available")),
+            )
+        except Exception:  # a failed probe must never fail the scan
+            LOG.exception("job %s: the Dolby Vision layer probe failed; the scan is kept as it was", paths.root.name)
+            return scan
 
     @staticmethod
     def _crop_policy_inputs(

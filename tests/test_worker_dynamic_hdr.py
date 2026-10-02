@@ -168,6 +168,40 @@ def uhd_job(context, runner: HdrRunner, *, plus: bool = False, dolby: int | None
     return database, settings, worker, uhd, job
 
 
+def uhd_job_with_enhancement_layer(context, runner: HdrRunner, *, el_type: str = "MEL"):
+    """A profile 7 disc: the base layer plus the secondary 1080p stream that holds the RPUs."""
+
+    from bdencode.media.bluray import MediaStream, StreamKind, VideoCodec, VideoProperties
+
+    database, settings, scan, scanner, _runner, worker = context
+    static = HdrStaticMetadata(_HDR10_MASTERING, 1000, 400)
+    uhd = _uhd_hdr10_scan(scan, static)
+    base = uhd.playlists[0].video_streams[0]
+    base = replace(
+        base,
+        video=replace(
+            base.video, dolby_vision=True, dolby_vision_profile=7,
+            dolby_vision_el_stream_id="video:4117", dolby_vision_el_type=el_type,
+        ),
+    )
+    enhancement = MediaStream(
+        id="video:4117", index=1, pid=4117, kind=StreamKind.VIDEO, codec="hevc",
+        video=VideoProperties(
+            codec=VideoCodec.HEVC, width=1920, height=1080, frame_rate=base.video.frame_rate,
+            hdr10=True, hdr10_base_layer=True,
+        ),
+    )
+    uhd = replace(uhd, playlists=(replace(uhd.playlists[0], streams=(base, enhancement)),))
+    scanner.result = uhd
+    worker.runner_factory = lambda _paths: runner
+    worker._runners.clear()
+    job = _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    worker.process_one_stage(claimed)
+    return database, settings, worker, uhd, job
+
+
 def selection_with(mode: str, **updates: Any) -> dict[str, Any]:
     selection = _uhd_hdr10_selection()
     selection["video"]["dynamic_hdr"] = mode
@@ -524,3 +558,25 @@ def test_qc_rejects_dolby_vision_without_its_configuration_record(context) -> No
     assert any(
         "dovi configuration record" in item for item in error.value.details["errors"]
     )
+
+
+def test_profile_7_reads_the_rpu_from_the_enhancement_layer_and_reports_the_plan(context) -> None:
+    runner = HdrRunner()
+    database, settings, worker, _uhd, job = uhd_job_with_enhancement_layer(context, runner)
+    ready = database.set_selection(job.id, selection_with("auto"))
+
+    prepared = worker.process_one_stage(ready)
+
+    paths = JobPaths.create(settings, job.id)
+    report = json.loads((paths.analysis / "dynamic-hdr.json").read_text("utf-8"))
+    assert report["plan"]["mode"] == "dolby_vision" and report["plan"]["source_profile"] == 7
+    assert report["plan"]["el_video_ordinal"] == 1 and report["plan"]["convert_mode"] == 2
+    # (the scan stage also probed the secondary stream; the retained RPU is the one converted with -m 2)
+    position = next(
+        i for i, c in enumerate(runner.commands)
+        if c[0] == "dovi_tool" and "extract-rpu" in c and "-m" in c
+    )
+    source, extract = runner.commands[position - 1], runner.commands[position]
+    assert source[source.index("-map") + 1] == "0:v:1"  # the enhancement layer, not the base layer
+    assert extract[:3] == ("dovi_tool", "-m", "2")
+    assert prepared.state is JobState.ENCODING

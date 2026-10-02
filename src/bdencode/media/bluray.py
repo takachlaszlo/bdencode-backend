@@ -96,6 +96,9 @@ class VideoProperties:
     hdr10_static: HdrStaticMetadata = field(default_factory=HdrStaticMetadata)
     dolby_vision: bool = False
     dolby_vision_profile: int | None = None
+    # Profile 7: the secondary video stream that holds the RPUs, and its type (MEL or FEL).
+    dolby_vision_el_stream_id: str | None = None
+    dolby_vision_el_type: str | None = None
     hdr10_base_layer: bool = False
     hdr10_plus: bool = False
     three_d: bool = False

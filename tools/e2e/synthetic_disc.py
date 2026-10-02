@@ -174,6 +174,19 @@ def dolby_vision_summary(path: Path) -> dict[str, int]:
     return {"frames": int(frames[1]) if frames else 0, "profile": int(profile[1]) if profile else 0}
 
 
+def probe_master(path: Path) -> dict:
+    """Size, duration, base-layer frame count and number of video streams of a real master."""
+
+    document = json.loads(run(["ffprobe", "-v", "error", "-show_entries",
+                               "stream=index,codec_type,codec_name,width,height", "-show_entries", "format=duration",
+                               "-of", "json", str(path)]).stdout)
+    videos = [stream for stream in document["streams"] if stream.get("codec_type") == "video"]
+    frames = int(run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0", "-show_entries",
+                      "stream=nb_read_packets", "-of", "csv=p=0", str(path)]).stdout.strip().rstrip(","))
+    return {"width": int(videos[0]["width"]), "height": int(videos[0]["height"]), "videos": len(videos),
+            "frames": frames, "duration": float(document["format"]["duration"])}
+
+
 def write_config(work: Path, source_root: Path) -> Path:
     config = work / "config.toml"
     config.write_text(
@@ -200,6 +213,13 @@ def main() -> int:
     parser.add_argument("--hdr10plus", action="store_true",
                         help="make the source an HDR10+ title and require the dynamic metadata to be retained "
                         "(needs hdr10plus_tool in PATH)")
+    parser.add_argument("--real-master", type=Path,
+                        help="use this MKV instead of a synthetic master: a UHD base layer and, optionally, a Dolby "
+                        "Vision enhancement layer as its second video stream (for example a short excerpt of a real "
+                        "disc). The worker's own scan probe has to find the layer; the run is expected to produce "
+                        "Dolby Vision profile 8 with one RPU per frame")
+    parser.add_argument("--crop-bars", type=int, default=0,
+                        help="rows of letterbox to crop at the top and the bottom (the RPU active area is zeroed)")
     parser.add_argument("--scenes", type=int, default=30, help="number of two-second scenes (UHD: 12 is plenty)")
     parser.add_argument("--auto-crf", type=float, default=90.0, help="VMAF target; 0 uses a fixed CRF 18")
     args = parser.parse_args()
@@ -226,8 +246,18 @@ def main() -> int:
     (disc / "BDMV" / "PLAYLIST").mkdir(exist_ok=True)
     master = work / "synthetic-hdr10-master.mkv"
     started = time.time()
-    print(f"[{time.time() - started:6.1f}s] making the synthetic master", flush=True)
-    make_master(master, size=args.size, scenes=args.scenes)
+    real = None
+    if args.real_master:
+        master = args.real_master.resolve()
+        real = probe_master(master)
+        # The playlist length is the frame-derived length, as on a real disc (the container's own duration
+        # also counts audio and can differ by a few frames, which the completeness gate rightly questions).
+        width, height = real["width"], real["height"]
+        duration = round(real["frames"] * 1001 / 24000, 3)
+        print(f"[{time.time() - started:6.1f}s] real master: {real}", flush=True)
+    else:
+        print(f"[{time.time() - started:6.1f}s] making the synthetic master", flush=True)
+        make_master(master, size=args.size, scenes=args.scenes)
     if args.dolby_vision:
         print(f"[{time.time() - started:6.1f}s] injecting a generated Dolby Vision RPU", flush=True)
         master = make_dolby_vision_master(master, work)
@@ -236,11 +266,17 @@ def main() -> int:
         print(f"[{time.time() - started:6.1f}s] injecting generated HDR10+ metadata", flush=True)
         master = make_hdr10plus_master(master, work)
         print("source HDR10+ frames:", hdr10plus_frames(master), flush=True)
-    subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(master), "-map", "0:v", "-map", "0:a",
-         "-c", "copy", "-f", "mpegts", str(disc / "BDMV" / "STREAM" / "00000.m2ts")],
-        check=True,
-    )
+    clip = disc / "BDMV" / "STREAM" / "00000.m2ts"
+    if real is None:
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(master), "-map", "0:v", "-map", "0:a",
+             "-c", "copy", "-f", "mpegts", str(clip)],
+            check=True,
+        )
+    else:
+        # The remux is served from the real master; the disc only has to contain the clip.
+        with master.open("rb") as stream:
+            clip.write_bytes(stream.read(1 << 20))
     os.environ["BDENCODE_CONFIG"] = str(write_config(work, source_root))
 
     from bdencode.config import load_settings
@@ -269,10 +305,21 @@ def main() -> int:
         id="audio:4352", index=1, pid=4352, kind=StreamKind.AUDIO, codec="ac3", channels=2,
         channel_layout="stereo", sample_rate=48000, default=True,
     )
+    streams = (video, audio)
+    if real is not None and real["videos"] > 1:
+        enhancement = MediaStream(
+            id="video:4117", index=2, pid=4117, kind=StreamKind.VIDEO, codec="hevc",
+            video=VideoProperties(
+                codec=VideoCodec.HEVC, width=1920, height=1080, frame_rate="24000/1001", field_order="unknown",
+                bit_depth=10, pixel_format="yuv420p10le", color_primaries="bt2020", color_transfer="smpte2084",
+                color_matrix="bt2020nc", hdr10=True, hdr10_base_layer=True,
+            ),
+        )
+        streams = (video, enhancement, audio)
     playlist = PlaylistCandidate(
         playlist_id="00001", duration_seconds=duration,
         segments=(PlaylistSegment(clip_id="00000", in_time_seconds=0.0, out_time_seconds=duration),),
-        streams=(video, audio), recommended=True,
+        streams=streams, recommended=True,
     )
     scan = DiscScan(
         source=disc, disc_kind=DiscKind.UHD, content_kind=ContentKind.FILM, playlists=(playlist,),
@@ -294,6 +341,23 @@ def main() -> int:
                         "make_zero", "-max_interleave_delta", "0", "-y", text[-1]]
             return super().run(argv, **kwargs)
 
+        def run_pipeline(self, commands, **kwargs):  # type: ignore[override]
+            commands = [[os.fspath(item) for item in command] for command in commands]
+            first = commands[0]
+            if any(item.startswith("bluray:") for item in first):
+                # The layer probe reads a stream of the playlist: serve it from the master instead.
+                cleaned: list[str] = []
+                skip = False
+                for item in first:
+                    if skip:
+                        skip = False
+                    elif item == "-playlist":
+                        skip = True
+                    else:
+                        cleaned.append(str(master) if item.startswith("bluray:") else item)
+                commands[0] = cleaned
+            return super().run_pipeline(commands, **kwargs)
+
     settings = load_settings()
     settings.create_directories()
     database = Database(settings.resolved_database_path)
@@ -312,7 +376,8 @@ def main() -> int:
 
     video_selection: dict = {
         "detail_level": "advanced", "settings": {"preset": args.preset},
-        "crop": {"left": 0, "top": 0, "right": 0, "bottom": 0}, "temporal_filter": "progressive",
+        "crop": {"left": 0, "top": args.crop_bars, "right": 0, "bottom": args.crop_bars},
+        "temporal_filter": "progressive",
         "dynamic_hdr": "dolby_vision" if args.dolby_vision else "hdr10plus" if args.hdr10plus else "auto",
     }
     if args.auto_crf:
@@ -342,6 +407,13 @@ def main() -> int:
         print("output RPU:", summary, "source RPU:", source, flush=True)
         if summary["profile"] != 8 or summary["frames"] != source["frames"] or summary["frames"] == 0:
             print("the Dolby Vision RPU was not retained frame-exactly", file=sys.stderr)
+            status = 1
+    if real is not None and real["videos"] > 1 and final.state is JobState.COMPLETED:
+        output = next((settings.completed_root).rglob("*.mkv"), None)
+        summary = dolby_vision_summary(output) if output else {"frames": 0, "profile": 0}
+        print("output RPU:", summary, "base-layer frames:", real["frames"], flush=True)
+        if summary["profile"] != 8 or summary["frames"] != real["frames"]:
+            print("the Dolby Vision RPU of the dual-layer source was not retained frame-exactly", file=sys.stderr)
             status = 1
     if args.hdr10plus and final.state is JobState.COMPLETED:
         output = next((settings.completed_root).rglob("*.mkv"), None)
