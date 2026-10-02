@@ -183,11 +183,15 @@ def dynamic_hdr_support(
         ("dolby_vision", DOVI_TOOL),
     ):
         tool = discover_tool(tool_name, command_runner)
+        # HDR10+ metadata is injected into the finished stream, so only the tool is needed; Dolby
+        # Vision additionally needs an x265 that accepts its profile signalling.
+        needs_x265 = mode == "dolby_vision"
         result[mode] = {
             "tool": tool_name,
             "tool_available": tool.available,
             "tool_version": tool.version,
             "x265_supported": build[mode],
-            "available": tool.available and build[mode],
+            "method": "inject",
+            "available": tool.available and (build[mode] or not needs_x265),
         }
     return result

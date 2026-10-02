@@ -105,6 +105,8 @@ class HdrRunner(FakeRunner):
         produced: Path | None = None
         if command[0] == "dovi_tool" and "inject-rpu" in command:
             produced = Path(command[command.index("-o") + 1])
+        elif command[0] == "hdr10plus_tool" and "inject" in command:
+            produced = Path(command[command.index("-o") + 1])
         elif command[0] == "mkvextract" and command[-1].startswith("0:"):
             produced = Path(command[-1].split(":", 1)[1])
         elif command[0] == "mkvmerge" and "--timestamps" in command:
@@ -129,8 +131,11 @@ class HdrRunner(FakeRunner):
         super().run_pipeline(commands, **kwargs)
         final = tuple(os.fspath(item) for item in commands[-1])
         if final[0] == "hdr10plus_tool":
+            target = Path(final[final.index("-o") + 1])
+            readback = target.name == "encoded-hdr10plus.json"
             self._write(
-                Path(final[final.index("-o") + 1]), hdr10plus_document(self.frames)
+                target,
+                hdr10plus_document(self.rebuilt_frames if readback else self.frames),
             )
         elif final[0] == "dovi_tool":
             self._write(Path(final[final.index("-o") + 1]), b"rpu")
@@ -228,11 +233,41 @@ def test_hdr10plus_metadata_is_extracted_verified_and_handed_to_x265(context) ->
     encoded = worker.process_one_stage(prepared)
     assert encoded.state is JobState.MUXING
     params = x265_params(encode_command(runner)).split(":")
-    assert f"dhdr10-info={location(paths, 'hdr10plus.json')}" in params
-    assert "dhdr10-opt=1" in params
+    # Debian's libx265 has no HDR10+ support and would drop these; the metadata is injected instead.
+    assert not [item for item in params if item.startswith("dhdr10")]
     assert "hdr10=1" in params  # the static layer is still written
+    order = [
+        next(i for i, c in enumerate(runner.commands) if match(c))
+        for match in (
+            lambda c: c[0] == "ffmpeg" and c[-1].endswith("encoded.hevc"),
+            lambda c: c[0] == "hdr10plus_tool" and "inject" in c,
+            lambda c: c[0] == "mkvextract",
+            lambda c: c[0] == "mkvmerge" and "--timestamps" in c,
+            lambda c: c[0] == "mkvpropedit",
+            lambda c: c[0] == "hdr10plus_tool" and "extract" in c and c[-2].endswith("encoded-hdr10plus.json"),
+        )
+    ]
+    assert order == sorted(order)
+    injection = next(c for c in runner.commands if c[0] == "hdr10plus_tool" and "inject" in c)
+    assert injection[injection.index("-j") + 1].endswith("hdr10plus.json")
+    assert paths.encoded_video.is_file()
+    assert not list((paths.work / "dynamic-hdr").glob("encoded*"))
     events = [e.kind for e in database.list_events(job_id=job.id)]
     assert events.count("worker.dynamic-hdr") == 1
+
+
+def test_hdr10plus_that_misses_frames_after_injection_needs_review(context) -> None:
+    runner = HdrRunner(rebuilt_frames=FAKE_REFERENCE_FRAMES - 1)
+    database, settings, worker, _uhd, job = uhd_job(context, runner, plus=True)
+    ready = database.set_selection(job.id, selection_with("hdr10plus"))
+    prepared = worker.process_one_stage(ready)
+
+    with pytest.raises(ReviewRequired, match="HDR10\\+ metadata could not be attached"):
+        worker.process_one_stage(prepared)
+
+    paths = JobPaths.create(settings, job.id)
+    assert not paths.encoded_video.exists()
+    assert not list((paths.work / "dynamic-hdr").glob("encoded*"))
 
 
 def test_metadata_frame_count_mismatch_sends_the_job_to_review(context) -> None:

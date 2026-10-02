@@ -15,7 +15,8 @@ the encode, QC or comparison code and after updating ffmpeg, x265, VapourSynth o
 It needs ``ffmpeg`` (with libx265), ``ffprobe``, ``mkvmerge``, ``vspipe`` with BestSource and the
 standalone ``vmaf`` in PATH (the installed tool runtime provides them) and takes about 8 minutes;
 ``--size 3840x2160 --scenes 12`` exercises real UHD resolution, ``--dolby-vision`` (needs ``dovi_tool``)
-a generated Dolby Vision profile 8.1 source that must come out frame-exactly.
+a generated Dolby Vision profile 8.1 source and ``--hdr10plus`` (needs ``hdr10plus_tool``) a generated
+HDR10+ source whose dynamic metadata must come out frame-exactly.
 Exit status: 0 completed, 1 pipeline did not complete, 77 required tools missing.
 """
 
@@ -102,6 +103,60 @@ def make_dolby_vision_master(master: Path, work: Path) -> Path:
     return result
 
 
+def make_hdr10plus_master(master: Path, work: Path) -> Path:
+    """The HDR10+ source: the HDR10 master with generated per-frame dynamic metadata injected."""
+
+    frames = int(run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+                      "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(master)]).stdout.strip())
+    scene = 48
+    entries = [{
+        "BezierCurveData": {"Anchors": [102, 205, 307, 410, 512, 614, 717, 819, 921], "KneePointX": 0, "KneePointY": 0},
+        "LuminanceParameters": {
+            "AverageRGB": 400 + index % scene,
+            "LuminanceDistributions": {
+                "DistributionIndex": [1, 5, 10, 25, 50, 75, 90, 95, 99],
+                "DistributionValues": [100, 120, 150, 300, 600, 900, 1500, 2500, 4000],
+            },
+            "MaxScl": [8000, 8000, 8000],
+        },
+        "NumberOfWindows": 1, "TargetedSystemDisplayMaximumLuminance": 400,
+        "SceneFrameIndex": index % scene, "SequenceFrameIndex": index, "SceneId": index // scene,
+    } for index in range(frames)]
+    starts = list(range(0, frames, scene))
+    metadata = work / "hdr10plus-generated.json"
+    metadata.write_text(json.dumps({
+        "JSONInfo": {"HDR10plusProfile": "B", "Version": "1.0"},
+        "SceneInfo": entries,
+        "SceneInfoSummary": {"SceneFirstFrameIndex": starts,
+                             "SceneFrameNumbers": [min(scene, frames - start) for start in starts]},
+        "ToolInfo": {"Tool": "synthetic", "Version": "1"},
+    }), encoding="utf-8")
+    base, injected = work / "hdr10plus-base.hevc", work / "hdr10plus.hevc"
+    run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(master), "-map", "0:v:0",
+         "-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", str(base)])
+    run(["hdr10plus_tool", "inject", "-i", str(base), "-j", str(metadata), "-o", str(injected)])
+    video = work / "hdr10plus-video.mkv"
+    run(["mkvmerge", "-q", "-o", str(video), "--default-duration", "0:24000/1001p", str(injected)])
+    result = work / "synthetic-hdr10plus-master.mkv"
+    run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(video), "-i", str(master),
+         "-map", "0:v", "-map", "1:a", "-c", "copy", str(result)])
+    return result
+
+
+def hdr10plus_frames(path: Path) -> int:
+    """Number of frames with HDR10+ metadata inside an MKV, read the way the worker reads it."""
+
+    target = path.with_suffix(".hdr10plus.json")
+    extract = subprocess.run(
+        ["bash", "-c", 'ffmpeg -hide_banner -nostdin -v error -i "$1" -map 0:v:0 -c copy '
+         '-bsf:v hevc_mp4toannexb -f hevc - | hdr10plus_tool extract -o "$2" -', "_", str(path), str(target)],
+        capture_output=True, text=True, check=False,
+    )
+    if extract.returncode != 0 or not target.is_file():
+        return 0
+    return len(json.loads(target.read_text(encoding="utf-8")).get("SceneInfo", []))
+
+
 def dolby_vision_summary(path: Path) -> dict[str, int]:
     """Frame count and profile of the RPU stream inside an MKV, read the way the worker reads it."""
 
@@ -142,6 +197,9 @@ def main() -> int:
     parser.add_argument("--dolby-vision", action="store_true",
                         help="make the source a Dolby Vision profile 8.1 title and require it to be retained "
                         "(needs dovi_tool in PATH)")
+    parser.add_argument("--hdr10plus", action="store_true",
+                        help="make the source an HDR10+ title and require the dynamic metadata to be retained "
+                        "(needs hdr10plus_tool in PATH)")
     parser.add_argument("--scenes", type=int, default=30, help="number of two-second scenes (UHD: 12 is plenty)")
     parser.add_argument("--auto-crf", type=float, default=90.0, help="VMAF target; 0 uses a fixed CRF 18")
     args = parser.parse_args()
@@ -150,7 +208,12 @@ def main() -> int:
     width, height = (int(part) for part in args.size.split("x"))
     duration = round(args.scenes * SCENE_SECONDS, 3)
 
-    missing = missing_tools() + (["dovi_tool"] if args.dolby_vision and shutil.which("dovi_tool") is None else [])
+    if args.dolby_vision and args.hdr10plus:
+        parser.error("--dolby-vision and --hdr10plus exclude each other")
+    missing = missing_tools()
+    for flag, tool in ((args.dolby_vision, "dovi_tool"), (args.hdr10plus, "hdr10plus_tool")):
+        if flag and shutil.which(tool) is None:
+            missing.append(tool)
     if missing or not encoders_ok():
         print("missing tools:", ", ".join(missing + ([] if encoders_ok() else ["ffmpeg libx265"])), file=sys.stderr)
         return 77
@@ -169,6 +232,10 @@ def main() -> int:
         print(f"[{time.time() - started:6.1f}s] injecting a generated Dolby Vision RPU", flush=True)
         master = make_dolby_vision_master(master, work)
         print("source RPU:", dolby_vision_summary(master), flush=True)
+    if args.hdr10plus:
+        print(f"[{time.time() - started:6.1f}s] injecting generated HDR10+ metadata", flush=True)
+        master = make_hdr10plus_master(master, work)
+        print("source HDR10+ frames:", hdr10plus_frames(master), flush=True)
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(master), "-map", "0:v", "-map", "0:a",
          "-c", "copy", "-f", "mpegts", str(disc / "BDMV" / "STREAM" / "00000.m2ts")],
@@ -195,6 +262,7 @@ def main() -> int:
             color_primaries="bt2020", color_transfer="smpte2084", color_matrix="bt2020nc",
             hdr10=True, hdr10_static=HdrStaticMetadata(MASTERING, 1000, 400), hdr10_base_layer=True,
             dolby_vision=args.dolby_vision, dolby_vision_profile=8 if args.dolby_vision else None,
+            hdr10_plus=args.hdr10plus,
         ),
     )
     audio = MediaStream(
@@ -245,7 +313,7 @@ def main() -> int:
     video_selection: dict = {
         "detail_level": "advanced", "settings": {"preset": args.preset},
         "crop": {"left": 0, "top": 0, "right": 0, "bottom": 0}, "temporal_filter": "progressive",
-        "dynamic_hdr": "dolby_vision" if args.dolby_vision else "auto",
+        "dynamic_hdr": "dolby_vision" if args.dolby_vision else "hdr10plus" if args.hdr10plus else "auto",
     }
     if args.auto_crf:
         video_selection["auto_crf"] = {
@@ -274,6 +342,14 @@ def main() -> int:
         print("output RPU:", summary, "source RPU:", source, flush=True)
         if summary["profile"] != 8 or summary["frames"] != source["frames"] or summary["frames"] == 0:
             print("the Dolby Vision RPU was not retained frame-exactly", file=sys.stderr)
+            status = 1
+    if args.hdr10plus and final.state is JobState.COMPLETED:
+        output = next((settings.completed_root).rglob("*.mkv"), None)
+        retained = hdr10plus_frames(output) if output else 0
+        expected = hdr10plus_frames(master)
+        print("output HDR10+ frames:", retained, "source HDR10+ frames:", expected, flush=True)
+        if retained == 0 or retained != expected:
+            print("the HDR10+ metadata was not retained frame-exactly", file=sys.stderr)
             status = 1
     for event in database.list_events(job_id=final.id, limit=5000)[-6:]:
         print("  ", event.kind, (event.message or "")[:140])

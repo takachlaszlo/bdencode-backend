@@ -289,12 +289,13 @@ def dovi_summary_command(rpu: Path, *, tool: str = DOVI_TOOL) -> list[str]:
     return [tool, "info", "-i", str(rpu), "--summary"]
 
 
-# The encoder runs through FFmpeg's libx265, which cannot read an RPU file: ``--dolby-vision-rpu`` is
-# implemented by the x265 command-line program, not the library, so the encoded stream carries no
-# RPU at all. Retention therefore injects the verified RPU into the finished HEVC stream (dovi_tool
-# matches RPUs to frames by display order) and rebuilds the Matroska track from the elementary
-# stream with the original timestamps; mkvmerge then also writes the Dolby Vision configuration
-# record that the output validation looks for.
+# The encoder runs through FFmpeg's libx265. For Dolby Vision it cannot read an RPU file
+# (``--dolby-vision-rpu`` belongs to the x265 command-line program, not the library), and Debian's
+# libx265 is built without HDR10+ (``--dhdr10-info``), so the encoded stream carries neither. Retention
+# therefore injects the verified metadata into the finished HEVC stream (dovi_tool and hdr10plus_tool
+# match it to frames by display order) and rebuilds the Matroska track from the elementary stream with
+# the original timestamps; for Dolby Vision mkvmerge then also writes the configuration record that the
+# output validation looks for.
 
 
 def dovi_base_stream_command(video: Path, hevc: Path, *, ffmpeg: str = "ffmpeg") -> list[str]:
@@ -306,6 +307,14 @@ def dovi_base_stream_command(video: Path, hevc: Path, *, ffmpeg: str = "ffmpeg")
 
 def dovi_inject_command(hevc: Path, rpu: Path, injected: Path, *, tool: str = DOVI_TOOL) -> list[str]:
     return [tool, "inject-rpu", "-i", str(hevc), "--rpu-in", str(rpu), "-o", str(injected)]
+
+
+def hdr10plus_inject_command(
+    hevc: Path, metadata_json: Path, injected: Path, *, tool: str = HDR10PLUS_TOOL
+) -> list[str]:
+    """Interleave the HDR10+ SEI messages into the finished HEVC stream (display order)."""
+
+    return [tool, "inject", "-i", str(hevc), "-j", str(metadata_json), "-o", str(injected)]
 
 
 def video_timestamps_command(video: Path, timestamps: Path, *, mkvextract: str = "mkvextract") -> list[str]:
@@ -470,15 +479,17 @@ def checked_path(path: Path) -> str:
 
 
 def x265_dynamic_params(plan: DynamicHdrPlan, metadata: Path) -> dict[str, str | int]:
-    """x265 private parameters that attach the extracted metadata."""
+    """x265 private parameters that accompany the retained metadata.
 
-    location = checked_path(metadata)
-    if plan.mode is DynamicHdrMode.HDR10PLUS:
-        return {"dhdr10-info": location, "dhdr10-opt": 1}
+    Dolby Vision needs the profile signalling in the stream; the RPU itself is injected afterwards.
+    HDR10+ needs none: its SEI messages are injected afterwards too (a libx265 without HDR10+ support
+    would only warn about ``dhdr10-info`` and drop it, and one with support would double the SEI).
+    """
+
     if plan.mode is DynamicHdrMode.DOLBY_VISION:
         return {
             "dolby-vision-profile": "8.1",
-            "dolby-vision-rpu": location,
+            "dolby-vision-rpu": checked_path(metadata),
             "aud": 1,
             "repeat-headers": 1,
             "hrd": 1,
