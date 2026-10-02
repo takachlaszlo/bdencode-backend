@@ -57,10 +57,18 @@ def hdr10plus_document(frames: int) -> str:
 class HdrRunner(FakeRunner):
     """FakeRunner that plays the roles of hdr10plus_tool and dovi_tool."""
 
-    def __init__(self, *, frames: int = FAKE_REFERENCE_FRAMES, profile: int = 8) -> None:
+    def __init__(
+        self,
+        *,
+        frames: int = FAKE_REFERENCE_FRAMES,
+        profile: int = 8,
+        rebuilt_frames: int | None = None,
+    ) -> None:
         super().__init__()
         self.frames = frames
         self.profile = profile
+        # RPUs that a read-back of the rebuilt Dolby Vision stream reports.
+        self.rebuilt_frames = frames if rebuilt_frames is None else rebuilt_frames
 
     def run(self, argv: Any, **kwargs: Any) -> None:
         command = tuple(os.fspath(item) for item in argv)
@@ -68,10 +76,44 @@ class HdrRunner(FakeRunner):
         stdout_path = kwargs.get("stdout_path")
         if command[0] == "dovi_tool" and "info" in command:
             self.commands.append(command)
+            readback = any(item.endswith("encoded-rpu.bin") for item in command)
+            frames = self.rebuilt_frames if readback else self.frames
             self._write(
                 stdout_path,
-                f"Summary:\n  Frames: {self.frames}\n  Profile: {self.profile}\n",
+                f"Summary:\n  Frames: {frames}\n  Profile: {self.profile}\n",
             )
+            if stderr_path is not None:
+                self._write(stderr_path, "")
+            return
+        # The post-encode RPU injection: each tool leaves its (tiny) output where the worker expects it.
+        if command[0] == "mkvmerge" and "--identify" in command and command[-1].endswith(
+            "video-encoded.partial.mkv"
+        ):
+            self.commands.append(command)
+            track = {"type": "video", "properties": {
+                "default_duration": 41708333, "color_range": 1, "color_matrix_coefficients": 9,
+                "color_transfer_characteristics": 16, "color_primaries": 9}}
+            self._write(stdout_path, json.dumps({"tracks": [track]}))
+            if stderr_path is not None:
+                self._write(stderr_path, "")
+            return
+        if command[0] == "mkvpropedit":
+            self.commands.append(command)
+            if stderr_path is not None:
+                self._write(stderr_path, "")
+            return
+        produced: Path | None = None
+        if command[0] == "dovi_tool" and "inject-rpu" in command:
+            produced = Path(command[command.index("-o") + 1])
+        elif command[0] == "mkvextract" and command[-1].startswith("0:"):
+            produced = Path(command[-1].split(":", 1)[1])
+        elif command[0] == "mkvmerge" and "--timestamps" in command:
+            produced = Path(command[command.index("--output") + 1])
+        elif command[0] == "ffmpeg" and command[-1].endswith("encoded.hevc"):
+            produced = Path(command[-1])
+        if produced is not None:
+            self.commands.append(command)
+            self._write(produced, b"stream")
             if stderr_path is not None:
                 self._write(stderr_path, "")
             return
@@ -233,6 +275,42 @@ def test_dolby_vision_profile_7_is_converted_bounded_and_verified(context) -> No
     _scan, effective = worker._load_prepared_scan_and_selection(prepared, paths)
     assert effective.settings.vbv is not None
 
+    # libx265 under FFmpeg cannot read the RPU file, so it is injected afterwards, in this order,
+    # and read back from the rebuilt stream before the encode checkpoint is accepted.
+    order = [
+        next(i for i, c in enumerate(runner.commands) if match(c))
+        for match in (
+            lambda c: c[0] == "ffmpeg" and c[-1].endswith("encoded.hevc"),
+            lambda c: c[0] == "dovi_tool" and "inject-rpu" in c,
+            lambda c: c[0] == "mkvextract",
+            lambda c: c[0] == "mkvmerge" and "--timestamps" in c,
+            lambda c: c[0] == "mkvpropedit",
+            lambda c: c[0] == "dovi_tool" and "extract-rpu" in c and c[-2].endswith("encoded-rpu.bin"),
+        )
+    ]
+    assert order == sorted(order)
+    injection = next(c for c in runner.commands if c[0] == "dovi_tool" and "inject-rpu" in c)
+    assert injection[injection.index("--rpu-in") + 1].endswith("rpu.bin")
+    rebuild = next(c for c in runner.commands if c[0] == "mkvmerge" and "--timestamps" in c)
+    assert rebuild[rebuild.index("--colour-primaries") + 1] == "0:9"  # the container keeps its colour description
+    assert next(c for c in runner.commands if c[0] == "mkvpropedit")[-1] == "default-duration=41708333"
+    assert paths.encoded_video.is_file()
+    assert not list((paths.work / "dynamic-hdr").glob("encoded*"))  # scratch files are removed
+
+
+def test_an_rpu_stream_that_misses_frames_after_injection_needs_review(context) -> None:
+    runner = HdrRunner(rebuilt_frames=FAKE_REFERENCE_FRAMES - 2)
+    database, settings, worker, _uhd, job = uhd_job(context, runner, dolby=8)
+    ready = database.set_selection(job.id, selection_with("dolby_vision"))
+    prepared = worker.process_one_stage(ready)
+
+    with pytest.raises(ReviewRequired, match="could not be attached"):
+        worker.process_one_stage(prepared)
+
+    paths = JobPaths.create(settings, job.id)
+    assert not paths.encoded_video.exists()  # no checkpoint for an encode without its RPUs
+    assert not list((paths.work / "dynamic-hdr").glob("encoded*"))
+
 
 def test_explicit_retention_without_the_tool_needs_review_but_auto_falls_back(
     context, monkeypatch: pytest.MonkeyPatch
@@ -314,7 +392,10 @@ class QcRunner(HdrRunner):
         command = tuple(os.fspath(item) for item in argv)
         stdout_path = kwargs.get("stdout_path")
         stderr_path = kwargs.get("stderr_path")
-        if stdout_path is not None and command[0] == "mkvmerge" and "--identify" in command:
+        if (
+            stdout_path is not None and command[0] == "mkvmerge" and "--identify" in command
+            and not command[-1].endswith("video-encoded.partial.mkv")
+        ):
             self.commands.append(command)
             self._write(stdout_path, json.dumps({
                 "container": {"properties": {"title": "Movie.2026.2160p.UHD.BluRay.x265"}},

@@ -668,7 +668,7 @@ Az alapértelmezés (`discard`) változatlan: csak a statikus HDR10 marad meg, �
 
 Feltételek (a `selection/validate` végpont korán jelzi őket): x265 HDR10 (Main 10) kimenet; **progresszív** időzítés (a metaadat forráskockánkénti, IVTC/deinterlace után nem vihető át); a forrásnak ténylegesen hordoznia kell a metaadatot; Dolby Visionnél megerősített HDR10 alapréteg és 7-es vagy 8-as profil.
 
-Eszközigény: `hdr10plus_tool` (HDR10+), `dovi_tool` (Dolby Vision) és olyan x265, amely elfogadja a `--dhdr10-info`, illetve `--dolby-vision-rpu` paramétert. Ezek nem részei az automatikus telepítésnek; töltsd le őket a hivatalos kiadásokból (quietvoid/hdr10plus_tool, quietvoid/dovi_tool), ellenőrizd az ellenőrzőösszeget, és tedd a `PATH`-ra. A `bdencode doctor` kimenetének `dynamic_hdr` szakasza mutatja, mi érhető el; hiányzó eszköz nem befolyásolja a `status` értékét.
+Eszközigény: `hdr10plus_tool` (HDR10+), `dovi_tool` (Dolby Vision) és olyan x265, amely elfogadja a `--dhdr10-info`, illetve `--dolby-vision-rpu` paramétert. A **`dovi_tool`-t a telepítő (2.4.0-tól) maga teszi fel** a hivatalos `quietvoid/dovi_tool` rögzített 2.3.4-es kiadásából, SHA-256 ellenőrzéssel az eszközkiadásba (`tools/current/bin`); ha a letöltés nem sikerül (nincs hálózat, nem x86_64 a gép, eltér az ellenőrzőösszeg), a telepítés ettől nem hiúsul meg, csak a Dolby Vision-megőrzés marad elérhetetlen, és a `bdencode doctor` jelzi. A `hdr10plus_tool` nem része a telepítésnek, mert a Debian x265 HDR10+ támogatás nélkül készül; ha egyedi x265-öd van, töltsd le a hivatalos kiadásból (quietvoid/hdr10plus_tool), ellenőrizd az ellenőrzőösszeget, és tedd a `PATH`-ra. A `bdencode doctor` kimenetének `dynamic_hdr` szakasza mutatja, mi érhető el; hiányzó eszköz nem befolyásolja a `status` értékét.
 
 A biztonsági modell:
 
@@ -676,9 +676,10 @@ A biztonsági modell:
 2. A metaadat **képkockaszáma pontosan egyezik** a kódolt idővonaléval, különben a job felülvizsgálatra kerül.
 3. Az FFmpeg libx265 burkolója ismeretlen paraméternél csak figyelmeztet, és megtartás nélkül kódol; ezért a kész MKV-ból a QC **bizonyítja** a réteg meglétét (HDR10+: `SMPTE2094-40` side data; Dolby Vision: `DOVI configuration record`, profil 8, HDR10-kompatibilis, RPU jelen). Bármi hiányzik, a job felülvizsgálatra kerül, és nem készül félrecímkézett kiadás.
 4. Dolby Visionnél, ha nem adtál meg VBV-t, a rendszer 160000/160000 kb/s VBV-t alkalmaz.
+5. Dolby Visionnél (2.4.0-tól) a kódolás után a worker a hash-ellenőrzött RPU-t beszúrja a kész HEVC-folyamba (`dovi_tool inject-rpu`), és az MKV sávot az eredeti időbélyegekkel, képkockaidővel és színleírással újraépíti (`mkvextract`, `mkvmerge`, `mkvpropedit`). Az újraépített sávból visszaolvassa az RPU-kat, és csak akkor fogadja el, ha a számuk képkockára pontosan egyezik a referencia idővonalával. Erre azért van szükség, mert az FFmpeg libx265-e nem tudja beolvasni az RPU-fájlt (az `--dolby-vision-rpu` az x265 parancssori programé).
 
 > [!WARNING]
-> A HDR10+ út a bitfolyamba (SEI) írja a metaadatot, ezért a mux nem érinti. A Dolby Vision megtartás **kísérleti**: az MKV-be kerülő Dolby Vision konfigurációs rekord (`dvcC`/`dvvC`) létrejötte az adott mkvmerge/FFmpeg verziótól függ. Ha a rekord hiányzik, a QC kapu nem engedi tovább a jobot; ilyenkor használd a `hdr10plus`/`discard` módot. Első használat előtt próbáld ki egy rövid, valódi Dolby Vision lemezrészen.
+> A HDR10+ út a bitfolyamba (SEI) írja a metaadatot, ezért a mux nem érinti, de a Debian x265 nem tud HDR10+-t. A Dolby Vision megtartás szintetikus, generált 8.1-es forráson valódi eszközökkel végig lett próbálva (1440 RPU a forrásban, 1440 a kimeneten, 8-as profil), **valódi Dolby Vision lemezen még nem**: a 7-es profil átalakítása (`dovi_tool -m 2`), a minimális fényesség és a jelenethatárok valódi tartalomnál eltérhetnek. Első használat előtt próbáld ki egy rövid, valódi Dolby Vision lemezrészen; ha a konfigurációs rekord vagy az RPU-k száma nem egyezik, a QC kapu nem engedi tovább a jobot.
 
 #### 7.4.4. Változó képarány (IMAX-jelenetek)
 
@@ -1027,7 +1028,31 @@ Az automatikus telepítés azt jelenti, hogy aki a beállított repository írá
 
 A **Rendszer** oldal „Kiadáskeresés és frissítés" kártyája ugyanezt mutatja (`GET /api/v1/system/release-update`). Opcionálisan értesítést is kérhetsz: a `release-update.toml` `notify_url = "https://ntfy.sh/a-te-temad"` sora (csak `https://`, jelszó nélkül) egy JSON POST-ot küld, amikor egy frissítés települt, megbukott, leállt vagy érvénytelen kiadást talált (ugyanarról az állapotról nem ismétel). **Visszaállás vagy kézi kiadás:** `sudo /usr/local/libexec/bdencode-release-update install --tag vX.Y.Z` pontosan azt a kiadást telepíti a megszokott védelmekkel (üres sor, jelszó nélküli sudo, tag és verzió egyezése, a kiadás saját tranzakciós telepítője), régebbit is. Régebbi kiadás csak akkor telepíthető, ha az adatbázis sémaverzióját ismeri (a 2.x kiadásoké 2).
 
-A médiaeszközök (apt-csomagok, VapourSynth, natív szkenner) frissítését a timer már nem végzi, de a várakozó Debian-frissítéseket (ffmpeg, x264, x265, mkvtoolnix, mediainfo, libbluray) naponta jelzi a `status.json` `media_updates` mezőjében és a Rendszer oldalon. A korábbi, tranzakciós eszközfrissítő továbbra is telepítve van, és kézzel indítható: `sudo env BDENCODE_USER=<fiók> /usr/local/libexec/bdencode-daily-update`.
+#### Aláírt kiadások (opcionális)
+
+Alapértelmezésben a frissítő a repository legmagasabb `vX.Y.Z` tagjét telepíti. Ha azt akarod, hogy csak a **te kulcsoddal aláírt** tag települhessen, a GitHub-fiók vagy az átvitel megsértése esetén sem, kapcsold be az SSH-aláírás ellenőrzését. Ez nem véd a gépen már megszerzett BDEncode-fiók ellen, csak a repository és az átvitel megbízhatatlanságától.
+
+1. Készíts külön kiadási kulcsot (jelszóval védve), és állítsd be a gitet:
+
+   ```bash
+   ssh-keygen -t ed25519 -C "bdencode-release" -f ~/.ssh/bdencode-release
+   git config --global gpg.format ssh
+   git config --global user.signingkey ~/.ssh/bdencode-release.pub
+   ```
+
+2. Add hozzá a nyilvános kulcsot a frissítő bizalmi listájához (a fájlnak root-tulajdonúnak kell lennie, és nem lehet mások által írható):
+
+   ```bash
+   echo "release@bdencode namespaces=\"git\" $(cat ~/.ssh/bdencode-release.pub)" | sudo tee /etc/bdencode/release-signers
+   sudo chmod 0644 /etc/bdencode/release-signers
+   ```
+
+3. Kapcsold be a `/etc/bdencode/release-update.toml` fájlban: `require_signed_tags = true` (opcionális a `signers_file = "/etc/bdencode/release-signers"` sor; ez az alapértelmezett útvonal). Ha a bizalmi lista hiányzik vagy üres, a frissítő `check_failed` állapotba kerül, és nem telepít, tehát nem kapcsolja ki magát csendben.
+4. Új kiadás: `python tools/release.py tag vX.Y.Z` létrehozza az annotált, aláírt taget a `HEAD` commiton, és ellenőrzi a kiadás fájljait; utána `git push origin vX.Y.Z`. A GitHub API-val vagy a webes felületen létrehozott tag nincs aláírva, ezért ilyen tagek nem települnek.
+
+Aláíratlan vagy ismeretlen kulccsal aláírt tag `invalid_release` állapotot kap, azonnal blokkolt marad, és semmi nem települ. A `status.json` üzenete aláírt tagnál a „(signed tag verified)" szöveget tartalmazza. A kézi `install --tag` parancs ugyanezt követeli; olyan régebbi kiadáshoz, amely az aláírás bevezetése előtt készült, használd a `--allow-unsigned` kapcsolót (csak a kézi parancsnál működik). A telepítő `openssh-client` csomagot is feltesz, mert az ellenőrzés az `ssh-keygen`-t használja.
+
+A médiaeszközök (apt-csomagok, VapourSynth, natív szkenner) frissítését a timer már nem végzi, de a várakozó Debian-frissítéseket (ffmpeg, x264, x265, mkvtoolnix, mediainfo, libbluray) naponta jelzi a `status.json` `media_updates` mezőjében és a Rendszer oldalon. A korábbi, tranzakciós eszközfrissítő továbbra is telepítve van, és kézzel indítható: `sudo env BDENCODE_USER=<fiók> /usr/local/libexec/bdencode-daily-update`. A 2.4.0-ig ez a futás a `mkvtoolnix` biztonsági frissítésén elbukott és visszagörgetett (a rendszer ilyenkor sértetlen maradt): az `apt` az ellenőrzött helyi `.deb` fájlt eldobta, mert ugyanazt a verziót a tárolóból akarta letölteni, amit a `--no-download` tilt. Mostantól a tranzakció a hash-ellenőrzött fájlt egy privát apt-gyorsítótárba teszi, és név és verzió szerint telepíti, az apt pedig ezt is összeveti az aláírt csomagindexszel.
 
 ### 11.2. Kézi frissítés
 
@@ -1255,7 +1280,7 @@ A fix dupe/publish endpointokat és host-allowlisteket itt, a hozzájuk tartozó
 
 ### 14.4. Opcionális eszközök a dinamikus HDR-hez
 
-A `hdr10plus_tool` és a `dovi_tool` (7.4.3. pont) nem része a telepítőnek. A telepítés után a `bdencode doctor` kimenetében ellenőrizd:
+A `dovi_tool`-t a telepítő felteszi (a letöltés hibája nem akasztja meg a telepítést), a `hdr10plus_tool` nem része a telepítőnek (7.4.3. pont). A telepítés után a `bdencode doctor` kimenetében ellenőrizd:
 
 ```bash
 bdencode doctor | python3 -m json.tool | grep -A10 '"dynamic_hdr"'

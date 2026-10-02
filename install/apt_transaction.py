@@ -711,6 +711,11 @@ class AptTransaction:
             )
 
     @staticmethod
+    def apt_archive_name(package: str, version: str, architecture: str) -> str:
+        """The file name APT looks for in its archive cache (':' is quoted as %3a)."""
+        return f"{package}_{version.replace(':', '%3a')}_{architecture}.deb"
+
+    @staticmethod
     def prepare_private_cache(path: Path) -> None:
         """Create or validate an idempotently reusable root-only APT cache."""
         for directory in (path, path / "partial"):
@@ -746,12 +751,29 @@ class AptTransaction:
             )
         manifest = self.load_manifest(transaction)
         new_archives = self.validate_archives(transaction, manifest, "new")
+        # APT discards a local .deb whose version equals the repository candidate and
+        # tries to download that candidate instead, which --no-download then refuses
+        # ("Unable to fetch some archives"). Seeding a private archive cache with the
+        # hash-verified files lets APT install exactly them by name=version; it still
+        # checks each cached file against the signed package index.
+        apply_cache = transaction / "apply-cache"
+        self.prepare_private_cache(apply_cache)
+        for stale in apply_cache.glob("*.deb"):
+            stale.unlink()
+        for package, archive in zip(manifest["packages"], new_archives):
+            seeded = apply_cache / self.apt_archive_name(
+                package["package"], package["new_version"], package["architecture"]
+            )
+            shutil.copy2(archive, seeded)
+            os.chmod(seeded, 0o600)
+            fsync_path(seeded)
+        fsync_directory(apply_cache)
         self.write_state(transaction, "APPLYING")
         environment = os.environ.copy()
         environment["BDENCODE_APT_STATE_ROOT"] = str(self.state_root)
         command = [
             "apt-get",
-            *self.apt_scope(),
+            *self.apt_scope(apply_cache),
             "-y",
             "--no-download",
             "--only-upgrade",
@@ -764,7 +786,10 @@ class AptTransaction:
             "-o",
             f"DPkg::Tools::Options::{self.guard}::Version=3",
             "install",
-            *[str(path) for path in new_archives],
+            *[
+                f"{package['query_name']}={package['new_version']}"
+                for package in manifest["packages"]
+            ],
         ]
         self.run(command, capture=False, env=environment)
         self.restore_marks(manifest)
@@ -985,11 +1010,14 @@ class AptTransaction:
                     raise TransactionError(f"APT attempted package removal: {line}")
                 continue
             archive = Path(action).resolve(strict=True)
-            expected_archive = (transaction / entry["new_deb"]).resolve(strict=True)
-            if (
-                archive != expected_archive
-                or sha256_file(archive) != entry["new_sha256"]
-            ):
+            # The verified file itself, or the byte-identical copy apply() seeded into the
+            # transaction's private APT cache; either way the content hash must match.
+            allowed = {
+                (transaction / entry["new_deb"]).resolve(strict=True),
+                (transaction / "apply-cache").resolve(strict=False)
+                / self.apt_archive_name(name, entry["new_version"], new_arch),
+            }
+            if archive not in allowed or sha256_file(archive) != entry["new_sha256"]:
                 raise TransactionError(
                     f"APT attempted an unverified archive: {archive}"
                 )

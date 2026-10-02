@@ -511,8 +511,8 @@ sudo flock -x "$installer_apt_lock" apt-get \
     -o Dir::Etc::preferencesparts=/dev/null \
     install -y --no-install-recommends --no-upgrade \
     build-essential ca-certificates curl ffmpeg fonts-dejavu-core git libbluray-bin libbluray-dev \
-    dpkg-repack man-db mediainfo meson mkvtoolnix nasm ninja-build pkg-config python3-pip \
-    python3-venv sqlite3 util-linux x264 x265 xxd
+    dpkg-repack man-db mediainfo meson mkvtoolnix nasm ninja-build openssh-client pkg-config \
+    python3-pip python3-venv sqlite3 util-linux x264 x265 xxd
 
 python3 -m venv "$release_root/venv"
 "$release_root/venv/bin/python" -m pip install --disable-pip-version-check --upgrade pip wheel
@@ -587,6 +587,28 @@ ninja -C "$vmaf_source/libvmaf/build" test
 ninja -C "$vmaf_source/libvmaf/build" install
 ln -s "$tool_release/vmaf/bin/vmaf" "$tool_release/bin/vmaf"
 "$tool_release/bin/vmaf" --version
+
+# Dolby Vision metadata tool for the opt-in dynamic HDR retention. The exact upstream release and
+# its SHA-256 are pinned. The feature is optional, so an offline host, an unsupported CPU or a
+# digest mismatch leaves it unavailable (bdencode doctor says so) instead of failing the install.
+dovi_version="2.3.4"
+dovi_sha256="1844258e13c26607b32224bf1fa82b595d3b35949f5467405fda560daad32b3f"
+dovi_archive="dovi_tool-$dovi_version-x86_64-unknown-linux-musl.tar.gz"
+dovi_work="$data_root/cache/build/dovi_tool-$release_id"
+if [[ "$(uname -m)" == x86_64 ]] \
+    && install -d -m 0700 "$dovi_work" \
+    && curl -fsSL --retry 3 --max-time 300 -o "$dovi_work/$dovi_archive" \
+        "https://github.com/quietvoid/dovi_tool/releases/download/$dovi_version/$dovi_archive" \
+    && echo "$dovi_sha256  $dovi_work/$dovi_archive" | sha256sum --check --quiet - \
+    && tar -xzf "$dovi_work/$dovi_archive" -C "$dovi_work" \
+    && install -m 0755 "$dovi_work/dovi_tool" "$tool_release/bin/dovi_tool" \
+    && "$tool_release/bin/dovi_tool" --version; then
+    :
+else
+    rm -f -- "$tool_release/bin/dovi_tool"
+    echo "WARNING: dovi_tool $dovi_version was not installed; Dolby Vision retention stays unavailable." >&2
+fi
+rm -rf -- "$dovi_work"
 
 # Publish immutable, root-owned static assets outside the private encode tree.
 # The current web pointer is part of the durable installer snapshot, so a crash
@@ -673,6 +695,11 @@ repository = "$update_repository"
 # Optional: an https URL (for example an ntfy.sh topic) that receives a JSON POST when an update was
 # installed or failed.
 # notify_url = "https://ntfy.sh/your-topic"
+# Optional: install only release tags that carry a valid SSH signature of a key listed in
+# signers_file (ssh-keygen "allowed_signers" format, namespace "git"). Unsigned or untrusted
+# tags are reported as invalid_release and never installed.
+# require_signed_tags = true
+# signers_file = "/etc/bdencode/release-signers"
 automatic_install = true
 EOF
     sudo chown root:root /etc/bdencode/release-update.toml

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -77,3 +80,69 @@ def test_command_line_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert release.main(["release.py", "check", "v9.9.9"]) == 1
     assert "error:" in capsys.readouterr().err
     assert release.main(["release.py", "check", "latest"]) == 1
+
+
+# -- signed tags -----------------------------------------------------------------------------------------
+
+
+def git_in(root: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.invalid", *arguments],
+        capture_output=True, text=True, check=True,
+    )
+    return completed.stdout.strip()
+
+
+def committed_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for role in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{role}_NAME", "t")
+        monkeypatch.setenv(f"GIT_{role}_EMAIL", "t@example.invalid")
+    root = make_repo(tmp_path / "repo")
+    git_in(root, "init", "--quiet", "--initial-branch=main")
+    git_in(root, "add", "-A")
+    git_in(root, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "release")
+    return root
+
+
+needs_signing_tools = pytest.mark.skipif(
+    shutil.which("git") is None or shutil.which("ssh-keygen") is None, reason="needs git and ssh-keygen"
+)
+
+
+@needs_signing_tools
+def test_tagging_refuses_an_inconsistent_release_or_a_dirty_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = committed_repo(tmp_path, monkeypatch)
+    with pytest.raises(release.ReleaseError, match="declares"):
+        release.create_signed_tag("v2.4.0", root)
+    (root / "pyproject.toml").write_text(
+        (root / "pyproject.toml").read_text(encoding="utf-8") + "# edit\n", encoding="utf-8"
+    )
+    with pytest.raises(release.ReleaseError, match="uncommitted"):
+        release.create_signed_tag("v2.3.1", root)
+
+
+@needs_signing_tools
+def test_tagging_needs_an_ssh_signing_key_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = committed_repo(tmp_path, monkeypatch)
+    with pytest.raises(release.ReleaseError, match="signing key"):
+        release.create_signed_tag("v2.3.1", root)
+
+
+@needs_signing_tools
+def test_a_signed_annotated_tag_is_created_and_verifiable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = committed_repo(tmp_path, monkeypatch)
+    key = tmp_path / "release-key"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "release", "-f", str(key)], check=True)
+    signers = tmp_path / "signers"
+    signers.write_text(f'release namespaces="git" {(tmp_path / "release-key.pub").read_text(encoding="utf-8")}', encoding="utf-8")
+    git_in(root, "config", "gpg.format", "ssh")
+    git_in(root, "config", "user.signingkey", str(key))
+    git_in(root, "config", "gpg.ssh.allowedSignersFile", str(signers))
+
+    commit = release.create_signed_tag("v2.3.1", root)
+
+    assert commit == git_in(root, "rev-parse", "HEAD")
+    assert git_in(root, "cat-file", "-t", "v2.3.1") == "tag"
+    git_in(root, "tag", "--verify", "v2.3.1")

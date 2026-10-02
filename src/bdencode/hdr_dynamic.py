@@ -289,6 +289,90 @@ def dovi_summary_command(rpu: Path, *, tool: str = DOVI_TOOL) -> list[str]:
     return [tool, "info", "-i", str(rpu), "--summary"]
 
 
+# The encoder runs through FFmpeg's libx265, which cannot read an RPU file: ``--dolby-vision-rpu`` is
+# implemented by the x265 command-line program, not the library, so the encoded stream carries no
+# RPU at all. Retention therefore injects the verified RPU into the finished HEVC stream (dovi_tool
+# matches RPUs to frames by display order) and rebuilds the Matroska track from the elementary
+# stream with the original timestamps; mkvmerge then also writes the Dolby Vision configuration
+# record that the output validation looks for.
+
+
+def dovi_base_stream_command(video: Path, hevc: Path, *, ffmpeg: str = "ffmpeg") -> list[str]:
+    return [
+        ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(video),
+        "-map", "0:v:0", "-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", str(hevc),
+    ]
+
+
+def dovi_inject_command(hevc: Path, rpu: Path, injected: Path, *, tool: str = DOVI_TOOL) -> list[str]:
+    return [tool, "inject-rpu", "-i", str(hevc), "--rpu-in", str(rpu), "-o", str(injected)]
+
+
+def video_timestamps_command(video: Path, timestamps: Path, *, mkvextract: str = "mkvextract") -> list[str]:
+    return [mkvextract, str(video), "timestamps_v2", f"0:{timestamps}"]
+
+
+# Matroska track properties that the rebuilt track must keep (mkvmerge name -> its option).
+_TRACK_COLOUR_OPTIONS = {
+    "color_range": "--colour-range",
+    "color_matrix_coefficients": "--colour-matrix-coefficients",
+    "color_transfer_characteristics": "--colour-transfer-characteristics",
+    "color_primaries": "--colour-primaries",
+}
+
+
+def video_track_command(video: Path, *, mkvmerge: str = "mkvmerge") -> list[str]:
+    return [mkvmerge, "--identify", "--identification-format", "json", str(video)]
+
+
+def parse_video_track_properties(text: str) -> dict[str, int]:
+    """Frame duration and colour description of the first video track of an MKV."""
+
+    try:
+        tracks = json.loads(text)["tracks"]
+        properties = next(track["properties"] for track in tracks if track.get("type") == "video")
+    except (ValueError, KeyError, TypeError, StopIteration) as exc:
+        raise DynamicHdrError("invalid_track", "the encoded video track cannot be identified") from exc
+    wanted = ("default_duration", *_TRACK_COLOUR_OPTIONS)
+    found = {key: properties[key] for key in wanted if type(properties.get(key)) is int}
+    if "default_duration" not in found or found["default_duration"] < 1:
+        raise DynamicHdrError("invalid_track", "the encoded video track has no frame duration")
+    return found
+
+
+def dovi_rebuild_command(
+    injected: Path,
+    timestamps: Path,
+    output: Path,
+    properties: Mapping[str, int] | None = None,
+    *,
+    mkvmerge: str = "mkvmerge",
+) -> list[str]:
+    command = [mkvmerge, "--quiet", "--output", str(output), "--timestamps", f"0:{timestamps}"]
+    for key, option in _TRACK_COLOUR_OPTIONS.items():
+        if properties and key in properties:
+            command += [option, f"0:{properties[key]}"]
+    return [*command, str(injected)]
+
+
+def dovi_duration_command(output: Path, default_duration_ns: int, *, mkvpropedit: str = "mkvpropedit") -> list[str]:
+    """mkvmerge derives the frame duration from the millisecond timestamps (42 ms for 24000/1001
+    video), which makes FFmpeg reject the decode; restore the encode's own value."""
+
+    return [mkvpropedit, str(output), "--edit", "track:v1", "--set", f"default-duration={default_duration_ns}"]
+
+
+def dovi_verify_commands(
+    video: Path, rpu: Path, *, ffmpeg: str = "ffmpeg", tool: str = DOVI_TOOL
+) -> list[list[str]]:
+    """Read the RPUs back out of the rebuilt stream, without any conversion."""
+
+    return [
+        _base_layer_command(video, ffmpeg=ffmpeg),
+        [tool, "extract-rpu", "-o", str(rpu), "-"],
+    ]
+
+
 # -- tool output ---------------------------------------------------------------
 
 

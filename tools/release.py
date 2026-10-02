@@ -8,12 +8,14 @@ carry one version, and the release notes document must exist.
 
     python tools/release.py check v2.3.0
     python tools/release.py notes v2.3.0 > notes.md
+    python tools/release.py tag v2.3.0      # annotated, SSH-signed tag on HEAD (not pushed)
 """
 
 from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -85,12 +87,53 @@ def notes(tag: str, root: Path = ROOT) -> str:
     return LINK_RE.sub(absolute, text)
 
 
+def create_signed_tag(tag: str, root: Path = ROOT, commit: str = "HEAD") -> str:
+    """Create the annotated, SSH-signed tag the hardened updater accepts and verify it locally.
+
+    Needs ``gpg.format=ssh`` and ``user.signingkey`` in the git configuration. Returns the tagged
+    commit. Nothing is pushed: publishing the tag is the deliberate last step.
+    """
+
+    problems = check(tag, root)
+    if problems:
+        raise ReleaseError("; ".join(problems))
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments], capture_output=True, text=True, errors="replace"
+        )
+        if completed.returncode != 0:
+            raise ReleaseError(f"git {' '.join(arguments[:2])} failed: {(completed.stderr or completed.stdout).strip()}")
+        return completed.stdout.strip()
+
+    if git("status", "--porcelain", "--untracked-files=no"):
+        raise ReleaseError("the working tree has uncommitted changes")
+    def configured(name: str) -> str:
+        found = subprocess.run(
+            ["git", "-C", str(root), "config", "--get", name], capture_output=True, text=True
+        )
+        return found.stdout.strip() if found.returncode == 0 else ""
+
+    if configured("gpg.format") != "ssh" or not configured("user.signingkey"):
+        raise ReleaseError("set gpg.format=ssh and user.signingkey (your release signing key) first")
+    target = git("rev-parse", f"{commit}^{{commit}}")
+    git("tag", "--sign", "--message", f"BDEncode {tag[1:]}", tag, target)
+    # Verification needs the local trust anchor; without one the signature is still created.
+    if configured("gpg.ssh.allowedSignersFile"):
+        git("tag", "--verify", tag)
+    return target
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[1] not in {"check", "notes"}:
+    if len(argv) != 3 or argv[1] not in {"check", "notes", "tag"}:
         print(__doc__, file=sys.stderr)
         return 2
     command, tag = argv[1], argv[2]
     try:
+        if command == "tag":
+            target = create_signed_tag(tag)
+            print(f"{tag}: signed and verified locally on {target[:12]}; publish it with: git push origin {tag}")
+            return 0
         if command == "check":
             problems = check(tag)
             for problem in problems:

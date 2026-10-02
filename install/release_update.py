@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -48,6 +49,7 @@ except ModuleNotFoundError:  # pragma: no cover
 DEFAULT_STATE_ROOT = Path("/var/lib/bdencode/release-update")
 DEFAULT_RELEASE_CONFIG = Path("/etc/bdencode/release-update.toml")
 DEFAULT_SERVICE_CONFIG = Path("/etc/bdencode/config.toml")
+DEFAULT_SIGNERS_FILE = Path("/etc/bdencode/release-signers")
 WINDOWS_MARKER = Path("/etc/bdencode/windows-managed")
 WSL_NGINX_CONFIG = Path("/etc/nginx/conf.d/bdencode-wsl.conf")
 DEFAULT_REPOSITORY = "https://github.com/takachlaszlo/bdencode-backend.git"
@@ -163,6 +165,25 @@ class ReleaseConfig:
     repository: str = DEFAULT_REPOSITORY
     automatic_install: bool = True
     notify_url: str | None = None
+    #: Install only tags that carry a valid SSH signature of a trusted release key.
+    require_signed_tags: bool = False
+    signers_file: Path = DEFAULT_SIGNERS_FILE
+
+
+def validate_signers_file(path: Path, *, require_root_owner: bool) -> None:
+    """The trust anchor: a readable, root-owned ``allowed_signers`` file with at least one key."""
+
+    try:
+        details = path.stat()
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ReleaseUpdateError(
+            f"require_signed_tags is on, but the signers file {path} is not readable: {error}"
+        ) from error
+    if require_root_owner and (details.st_uid != 0 or details.st_mode & 0o022):
+        raise ReleaseUpdateError(f"{path} must be owned by root and not writable by group or others")
+    if not any(line.strip() and not line.lstrip().startswith("#") for line in text.splitlines()):
+        raise ReleaseUpdateError(f"the signers file {path} lists no trusted release key")
 
 
 def load_release_config(path: Path, *, require_root_owner: bool = False) -> ReleaseConfig:
@@ -181,7 +202,10 @@ def load_release_config(path: Path, *, require_root_owner: bool = False) -> Rele
             raw = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ReleaseUpdateError(f"unreadable release update configuration {path}: {error}") from error
-    unknown = sorted(set(raw) - {"repository", "automatic_install", "notify_url"})
+    unknown = sorted(
+        set(raw)
+        - {"repository", "automatic_install", "notify_url", "require_signed_tags", "signers_file"}
+    )
     if unknown:
         raise ReleaseUpdateError(f"unknown key(s) in {path}: {', '.join(unknown)}")
     automatic = raw.get("automatic_install", True)
@@ -192,11 +216,27 @@ def load_release_config(path: Path, *, require_root_owner: bool = False) -> Rele
         isinstance(notify_url, str) and HTTPS_REPOSITORY_RE.fullmatch(notify_url)
     ):
         raise ReleaseUpdateError("notify_url must be an https:// URL without credentials, query or fragment")
-    return ReleaseConfig(
+    signed = raw.get("require_signed_tags", False)
+    if not isinstance(signed, bool):
+        raise ReleaseUpdateError("require_signed_tags must be true or false")
+    signers = raw.get("signers_file", DEFAULT_SIGNERS_FILE.as_posix())
+    if not (
+        isinstance(signers, str)
+        and (signers.startswith("/") or Path(signers).is_absolute())
+        and "\n" not in signers
+    ):
+        raise ReleaseUpdateError("signers_file must be an absolute path")
+    config = ReleaseConfig(
         repository=validate_repository(raw.get("repository", DEFAULT_REPOSITORY)),
         automatic_install=automatic,
         notify_url=notify_url,
+        require_signed_tags=signed,
+        signers_file=Path(signers),
     )
+    if signed:
+        # Fail closed at load time: a missing trust anchor must stop installations, not disable the check.
+        validate_signers_file(config.signers_file, require_root_owner=require_root_owner)
+    return config
 
 
 @dataclass(frozen=True)
@@ -437,6 +477,7 @@ class ReleaseUpdater:
         *,
         check_only: bool = False,
         install_tag: str | None = None,
+        allow_unsigned: bool = False,
         clock: Callable[[], str] = utc_now,
         release_id: str | None = None,
         post: Callable[[str, bytes], None] | None = None,
@@ -449,6 +490,9 @@ class ReleaseUpdater:
         self.check_only = check_only
         # An explicit, operator-requested installation of one tag (also an older one: a rollback).
         self.install_tag = install_tag
+        # Only an operator's explicit install command may skip the signature check, for example to
+        # roll back to a release that was published before tags were signed.
+        self.allow_unsigned = allow_unsigned and install_tag is not None
         self.post = post or self._post_json
         self.clock = clock
         self.release_id = release_id or f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}"
@@ -574,6 +618,39 @@ class ReleaseUpdater:
             self._as_account(["git", "-C", checkout, "rev-parse", "HEAD"], self._git_env()).stdout
         )
         return commit if COMMIT_RE.match(commit) else "unknown"
+
+    def verify_signature(self, checkout: Path, tag: str, commit: str) -> str:
+        """Require a valid SSH signature of a trusted key on the annotated tag, when configured.
+
+        Returns a short phrase for the status message. The signers file is the operator's trust
+        anchor (``allowed_signers`` format, namespace ``git``); this protects against a hijacked
+        repository account or a tampered transfer, not against a compromised BDEncode account.
+        """
+
+        if not self.config.require_signed_tags:
+            return ""
+        if self.allow_unsigned:
+            self.report(f"signature check of {tag} skipped at the operator's request")
+            return " (signature check skipped)"
+        if shutil.which("ssh-keygen") is None:
+            raise ReleaseUpdateError(
+                "require_signed_tags is on, but ssh-keygen (openssh-client) is not installed"
+            )
+        git = [
+            "git", "-C", checkout, "-c", "gpg.format=ssh", "-c", "gpg.ssh.program=ssh-keygen",
+            "-c", f"gpg.ssh.allowedSignersFile={self.config.signers_file}",
+        ]
+        result = self._as_account([*git, "verify-tag", tag], self._git_env())
+        if result.returncode != 0:
+            detail = last_line(result.stdout) or "no details"
+            raise InvalidReleaseError(
+                f"tag {tag} is not signed by a trusted release key ({detail}); "
+                "it was not installed"
+            )
+        peeled = last_line(self._as_account([*git, "rev-parse", f"{tag}^{{commit}}"], self._git_env()).stdout)
+        if commit != "unknown" and peeled != commit:
+            raise InvalidReleaseError(f"the signed tag {tag} does not point at the downloaded commit")
+        return " (signed tag verified)"
 
     def remove_checkout(self, checkout: Path) -> None:
         scratch = self.deployment.scratch_root
@@ -757,6 +834,7 @@ class ReleaseUpdater:
         checkout = self.download_release(tag)
         try:
             commit = self.verify_checkout(checkout, latest)
+            signature_note = self.verify_signature(checkout, tag, commit)
             code = self.run_installer(checkout)
         finally:
             self.remove_checkout(checkout)
@@ -784,7 +862,7 @@ class ReleaseUpdater:
         self.set_failed_attempts(tag, 0)
         self.record(
             STATE_INSTALLED,
-            f"BDEncode {format_version(installed)} was updated to {tag}",
+            f"BDEncode {format_version(installed)} was updated to {tag}{signature_note}",
             installed_version=format_version(now_installed),
             installed_commit=commit,
             installed_at=self.clock(),
@@ -812,6 +890,12 @@ def parser() -> argparse.ArgumentParser:
         "install --tag vX.Y.Z: install exactly that release now, also an older one (rollback)",
     )
     result.add_argument("--tag", help="release tag for the install command, for example v2.2.1")
+    result.add_argument(
+        "--allow-unsigned",
+        action="store_true",
+        help="install command only: skip the signed-tag check (for a release published before "
+        "tags were signed)",
+    )
     result.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     result.add_argument("--release-config", type=Path, default=DEFAULT_RELEASE_CONFIG)
     result.add_argument("--service-config", type=Path, default=DEFAULT_SERVICE_CONFIG)
@@ -834,6 +918,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if args.command == "install" and not (args.tag and TAG_RE.match(args.tag)):
         print("install needs --tag vX.Y.Z", file=sys.stderr)
+        return 2
+    if args.allow_unsigned and args.command != "install":
+        print("--allow-unsigned only applies to the install command", file=sys.stderr)
         return 2
     state_root: Path = args.state_root
     state_root.mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -871,6 +958,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     updater = ReleaseUpdater(
         deployment, config, SystemRunner(), store, report, check_only=args.command == "check",
         install_tag=args.tag if args.command == "install" else None,
+        allow_unsigned=args.allow_unsigned,
     )
     return updater.run()
 

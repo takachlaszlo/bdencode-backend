@@ -421,3 +421,52 @@ def test_output_gate_accepts_and_requires_the_retained_layer() -> None:
         "dolby vision" in item or "dovi" in item
         for item in _gate(frame_rpu + [record], plus_plan())
     )
+
+
+def test_dolby_vision_injection_commands_keep_the_original_timeline(tmp_path: Path) -> None:
+    from bdencode.hdr_dynamic import (
+        dovi_base_stream_command,
+        dovi_inject_command,
+        dovi_rebuild_command,
+        dovi_verify_commands,
+        video_timestamps_command,
+    )
+
+    video, rpu = tmp_path / "video.mkv", tmp_path / "rpu.bin"
+    base, injected = tmp_path / "base.hevc", tmp_path / "dv.hevc"
+    stamps, rebuilt = tmp_path / "ts.txt", tmp_path / "dv.mkv"
+
+    base_command = dovi_base_stream_command(video, base)
+    assert base_command[0] == "ffmpeg" and "hevc_mp4toannexb" in base_command and base_command[-1] == str(base)
+    assert dovi_inject_command(base, rpu, injected) == [
+        "dovi_tool", "inject-rpu", "-i", str(base), "--rpu-in", str(rpu), "-o", str(injected),
+    ]
+    assert video_timestamps_command(video, stamps) == ["mkvextract", str(video), "timestamps_v2", f"0:{stamps}"]
+    rebuild = dovi_rebuild_command(injected, stamps, rebuilt, {"color_range": 1, "color_primaries": 9})
+    assert rebuild[0] == "mkvmerge" and rebuild[rebuild.index("--timestamps") + 1] == f"0:{stamps}"
+    assert rebuild[rebuild.index("--colour-range") + 1] == "0:1"
+    assert rebuild[rebuild.index("--colour-primaries") + 1] == "0:9" and "--colour-matrix-coefficients" not in rebuild
+    assert rebuild[-1] == str(injected) and rebuild[rebuild.index("--output") + 1] == str(rebuilt)
+    source, extract = dovi_verify_commands(rebuilt, tmp_path / "back.bin")
+    assert extract[:2] == ["dovi_tool", "extract-rpu"] and "-m" not in extract and "-c" not in extract
+    assert str(rebuilt) in source
+
+
+def test_the_original_track_properties_are_read_from_the_mkv_identification() -> None:
+    from bdencode.hdr_dynamic import dovi_duration_command, parse_video_track_properties
+
+    document = json.dumps({"tracks": [
+        {"type": "audio", "properties": {"default_duration": 1}},
+        {"type": "video", "properties": {"default_duration": 41708333, "color_range": 1, "color_primaries": 9,
+                                          "pixel_dimensions": "1280x720"}},
+    ]})
+    assert parse_video_track_properties(document) == {
+        "default_duration": 41708333, "color_range": 1, "color_primaries": 9,
+    }
+    for broken in ("not json", "{}", json.dumps({"tracks": []}),
+                   json.dumps({"tracks": [{"type": "video", "properties": {"color_range": 1}}]})):
+        with pytest.raises(DynamicHdrError):
+            parse_video_track_properties(broken)
+    assert dovi_duration_command(Path("dv.mkv"), 41708333) == [
+        "mkvpropedit", "dv.mkv", "--edit", "track:v1", "--set", "default-duration=41708333",
+    ]
