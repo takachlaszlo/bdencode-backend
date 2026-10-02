@@ -181,8 +181,8 @@ def probe_master(path: Path) -> dict:
                                "stream=index,codec_type,codec_name,width,height", "-show_entries", "format=duration",
                                "-of", "json", str(path)]).stdout)
     videos = [stream for stream in document["streams"] if stream.get("codec_type") == "video"]
-    frames = int(run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
-                      "stream=nb_read_frames", "-of", "csv=p=0", str(path)]).stdout.strip().rstrip(","))
+    frames = int(run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0", "-show_entries",
+                      "stream=nb_read_packets", "-of", "csv=p=0", str(path)]).stdout.strip().rstrip(","))
     return {"width": int(videos[0]["width"]), "height": int(videos[0]["height"]), "videos": len(videos),
             "frames": frames, "duration": float(document["format"]["duration"])}
 
@@ -263,12 +263,17 @@ def main() -> int:
         print(f"[{time.time() - started:6.1f}s] injecting generated HDR10+ metadata", flush=True)
         master = make_hdr10plus_master(master, work)
         print("source HDR10+ frames:", hdr10plus_frames(master), flush=True)
+    clip = disc / "BDMV" / "STREAM" / "00000.m2ts"
     if real is None:
         subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(master), "-map", "0:v", "-map", "0:a",
-             "-c", "copy", "-f", "mpegts", str(disc / "BDMV" / "STREAM" / "00000.m2ts")],
+             "-c", "copy", "-f", "mpegts", str(clip)],
             check=True,
         )
+    else:
+        # The remux is served from the real master; the disc only has to contain the clip.
+        with master.open("rb") as stream:
+            clip.write_bytes(stream.read(1 << 20))
     os.environ["BDENCODE_CONFIG"] = str(write_config(work, source_root))
 
     from bdencode.config import load_settings
