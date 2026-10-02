@@ -52,7 +52,7 @@ jobs:
       - name: Media tools and build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg mkvtoolnix mediainfo build-essential meson ninja-build nasm git
+          sudo apt-get install -y --no-install-recommends ffmpeg x265 mkvtoolnix mediainfo build-essential meson ninja-build nasm git
           ffmpeg -hide_banner -version | head -1
       - name: The project (before the tool runtime is put first in PATH)
         run: python -m pip install '.[test]'
