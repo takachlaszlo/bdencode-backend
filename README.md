@@ -676,9 +676,10 @@ A biztonsági modell:
 2. A metaadat **képkockaszáma pontosan egyezik** a kódolt idővonaléval, különben a job felülvizsgálatra kerül.
 3. Az FFmpeg libx265 burkolója ismeretlen paraméternél csak figyelmeztet, és megtartás nélkül kódol; ezért a kész MKV-ból a QC **bizonyítja** a réteg meglétét (HDR10+: `SMPTE2094-40` side data; Dolby Vision: `DOVI configuration record`, profil 8, HDR10-kompatibilis, RPU jelen). Bármi hiányzik, a job felülvizsgálatra kerül, és nem készül félrecímkézett kiadás.
 4. Dolby Visionnél, ha nem adtál meg VBV-t, a rendszer 160000/160000 kb/s VBV-t alkalmaz.
+5. Dolby Visionnél (2.4.0-tól) a kódolás után a worker a hash-ellenőrzött RPU-t beszúrja a kész HEVC-folyamba (`dovi_tool inject-rpu`), és az MKV sávot az eredeti időbélyegekkel, képkockaidővel és színleírással újraépíti (`mkvextract`, `mkvmerge`, `mkvpropedit`). Az újraépített sávból visszaolvassa az RPU-kat, és csak akkor fogadja el, ha a számuk képkockára pontosan egyezik a referencia idővonalával. Erre azért van szükség, mert az FFmpeg libx265-e nem tudja beolvasni az RPU-fájlt (az `--dolby-vision-rpu` az x265 parancssori programé).
 
 > [!WARNING]
-> A HDR10+ út a bitfolyamba (SEI) írja a metaadatot, ezért a mux nem érinti. A Dolby Vision megtartás **kísérleti**: az MKV-be kerülő Dolby Vision konfigurációs rekord (`dvcC`/`dvvC`) létrejötte az adott mkvmerge/FFmpeg verziótól függ. Ha a rekord hiányzik, a QC kapu nem engedi tovább a jobot; ilyenkor használd a `hdr10plus`/`discard` módot. Első használat előtt próbáld ki egy rövid, valódi Dolby Vision lemezrészen.
+> A HDR10+ út a bitfolyamba (SEI) írja a metaadatot, ezért a mux nem érinti, de a Debian x265 nem tud HDR10+-t. A Dolby Vision megtartás szintetikus, generált 8.1-es forráson valódi eszközökkel végig lett próbálva (1440 RPU a forrásban, 1440 a kimeneten, 8-as profil), **valódi Dolby Vision lemezen még nem**: a 7-es profil átalakítása (`dovi_tool -m 2`), a minimális fényesség és a jelenethatárok valódi tartalomnál eltérhetnek. Első használat előtt próbáld ki egy rövid, valódi Dolby Vision lemezrészen; ha a konfigurációs rekord vagy az RPU-k száma nem egyezik, a QC kapu nem engedi tovább a jobot.
 
 #### 7.4.4. Változó képarány (IMAX-jelenetek)
 
