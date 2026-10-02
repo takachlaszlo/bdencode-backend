@@ -63,6 +63,7 @@ from .hdr_dynamic import (
     dovi_summary_command,
     dovi_verify_commands,
     hdr10plus_extract_commands,
+    hdr10plus_inject_command,
     parse_dovi_summary,
     parse_hdr10plus_json,
     parse_mode,
@@ -3489,9 +3490,13 @@ class PipelineWorker:
             state = dynamic_hdr_support().get(key, {})
             if not state.get("available"):
                 problem = (
-                    f"{plan.mode.value} retention needs {plan.required_tool} "
-                    "and an x265 build that accepts its parameters "
-                    f"(tool: {state.get('tool_available')}, "
+                    f"{plan.mode.value} retention needs {plan.required_tool}"
+                    + (
+                        " and an x265 build that accepts the Dolby Vision parameters"
+                        if plan.mode is DynamicHdrMode.DOLBY_VISION
+                        else ""
+                    )
+                    + f" (tool: {state.get('tool_available')}, "
                     f"x265: {state.get('x265_supported')})"
                 )
                 if selection.dynamic_hdr is DynamicHdrMode.AUTO:
@@ -3881,17 +3886,15 @@ class PipelineWorker:
         temporary_video = paths.work / "video-encoded.partial.mkv"
         extra_video_params: dict[str, str | int] | None = None
         dynamic_inputs: dict[str, Any] | None = None
-        rpu_to_inject: Path | None = None
+        to_inject: tuple[DynamicHdrPlan, Path] | None = None
         if selection.dynamic_hdr is not DynamicHdrMode.DISCARD:
             dynamic_plan, metadata_path, metadata_sha256 = self._load_dynamic_hdr(
                 job, paths, selection
             )
-            if dynamic_plan.mode is DynamicHdrMode.DOLBY_VISION:
-                rpu_to_inject = metadata_path
             if dynamic_plan.retained and metadata_path is not None:
                 try:
-                    extra_video_params = x265_dynamic_params(
-                        dynamic_plan, metadata_path
+                    extra_video_params = (
+                        x265_dynamic_params(dynamic_plan, metadata_path) or None
                     )
                 except DynamicHdrError as exc:
                     raise ReviewRequired(
@@ -3901,10 +3904,11 @@ class PipelineWorker:
                 dynamic_inputs = {
                     "plan": dynamic_plan.to_dict(),
                     "metadata_sha256": metadata_sha256,
+                    # The metadata is injected into the finished stream: an encode checkpoint made
+                    # before that step carries none.
+                    "injection": 2,
                 }
-                if rpu_to_inject is not None:
-                    # An encode checkpoint made before the RPU was injected afterwards carries none.
-                    dynamic_inputs["rpu_injection"] = 1
+                to_inject = (dynamic_plan, metadata_path)
         commands = encode_pipeline_commands(
             paths.script,
             temporary_video,
@@ -3976,9 +3980,9 @@ class PipelineWorker:
                 # promoted to the durable checkpoint path.
                 if interrupted():
                     raise ProcessInterrupted()
-                if rpu_to_inject is not None:
-                    self._inject_dolby_vision_rpu(
-                        paths, rpu_to_inject, temporary_video, interrupted
+                if to_inject is not None:
+                    self._inject_dynamic_hdr(
+                        paths, *to_inject, temporary_video, interrupted
                     )
                 os.replace(temporary_video, paths.encoded_video)
                 if reporter is not None:
@@ -3994,30 +3998,32 @@ class PipelineWorker:
             raise ProcessInterrupted()
         self.queue.advance(job.id, JobState.MUXING, message="video encode complete")
 
-    def _inject_dolby_vision_rpu(
+    def _inject_dynamic_hdr(
         self,
         paths: JobPaths,
-        rpu: Path,
+        plan: DynamicHdrPlan,
+        metadata: Path,
         video: Path,
         interrupted: Callable[[], bool],
     ) -> None:
-        """Attach the verified RPU to the finished encode and prove it reached every frame.
+        """Attach the verified HDR10+ / Dolby Vision metadata to the finished encode.
 
-        FFmpeg's libx265 cannot read an RPU file, so the encode itself carries none. The RPU is
-        injected into the HEVC stream and the Matroska track is rebuilt from it with the original
-        timestamps; the result is replaced in place only after the RPUs read back from it match the
-        reference timeline frame for frame.
+        FFmpeg's libx265 cannot do it itself (no RPU files; Debian's build has no HDR10+). The
+        metadata is injected into the HEVC stream and the Matroska track is rebuilt from it with the
+        original timestamps, frame duration and colour description; the result replaces the encode
+        only after the metadata read back from it matches the reference timeline frame for frame.
         """
 
+        dolby = plan.mode is DynamicHdrMode.DOLBY_VISION
+        label = "Dolby Vision RPU" if dolby else "HDR10+ metadata"
         work = paths.work / "dynamic-hdr"
         work.mkdir(mode=0o750, parents=True, exist_ok=True)
-        base, injected = work / "encoded.hevc", work / "encoded-dv.hevc"
-        timestamps, rebuilt = work / "encoded-timestamps.txt", work / "encoded-dv.mkv"
-        check, summary_path = work / "encoded-rpu.bin", work / "encoded-rpu-summary.txt"
-        scratch = (base, injected, timestamps, rebuilt, check, summary_path)
+        base, injected = work / "encoded.hevc", work / "encoded-injected.hevc"
+        timestamps, rebuilt = work / "encoded-timestamps.txt", work / "encoded-injected.mkv"
+        check = work / ("encoded-rpu.bin" if dolby else "encoded-hdr10plus.json")
+        summary_path, track_report = work / "encoded-rpu-summary.txt", work / "encoded-track.json"
+        scratch = (base, injected, timestamps, rebuilt, check, summary_path, track_report)
         runner = self._runner(paths)
-        track_report = work / "encoded-track.json"
-        scratch = (*scratch, track_report)
         try:
             for item in scratch:
                 item.unlink(missing_ok=True)
@@ -4025,7 +4031,7 @@ class PipelineWorker:
                 video_track_command(video),
                 cwd=paths.work,
                 stdout_path=track_report,
-                stderr_path=paths.logs / "dolby-vision-track.log",
+                stderr_path=paths.logs / "dynamic-hdr-track.log",
             )
             try:
                 properties = parse_video_track_properties(
@@ -4033,12 +4039,17 @@ class PipelineWorker:
                 )
             except (DynamicHdrError, OSError, UnicodeError) as exc:
                 raise ReviewRequired(
-                    f"the Dolby Vision RPU could not be attached to the encode: {exc}",
+                    f"the {label} could not be attached to the encode: {exc}",
                     details={"code": "dynamic_hdr_invalid_track"},
                 ) from exc
+            inject = (
+                dovi_inject_command(base, metadata, injected)
+                if dolby
+                else hdr10plus_inject_command(base, metadata, injected)
+            )
             steps = (
                 ("base", dovi_base_stream_command(video, base)),
-                ("inject", dovi_inject_command(base, rpu, injected)),
+                ("inject", inject),
                 ("timestamps", video_timestamps_command(video, timestamps)),
                 ("rebuild", dovi_rebuild_command(injected, timestamps, rebuilt, properties)),
                 ("duration", dovi_duration_command(rebuilt, properties["default_duration"])),
@@ -4049,37 +4060,43 @@ class PipelineWorker:
                 runner.run(
                     command,
                     cwd=paths.work,
-                    stderr_path=paths.logs / f"dolby-vision-{name}.log",
+                    stderr_path=paths.logs / f"dynamic-hdr-{name}.log",
                 )
             runner.run_pipeline(
-                dovi_verify_commands(rebuilt, check),
+                dovi_verify_commands(rebuilt, check)
+                if dolby
+                else hdr10plus_extract_commands(rebuilt, check),
                 cwd=paths.work,
                 stderr_paths=[
-                    paths.logs / "dolby-vision-verify-source.log",
-                    paths.logs / "dolby-vision-verify.log",
+                    paths.logs / "dynamic-hdr-verify-source.log",
+                    paths.logs / "dynamic-hdr-verify.log",
                 ],
                 interrupt_requested=interrupted,
             )
-            runner.run(
-                dovi_summary_command(check),
-                cwd=paths.work,
-                stdout_path=summary_path,
-                stderr_path=paths.logs / "dolby-vision-verify-summary.log",
-            )
-            try:
-                counted = parse_dovi_summary(
-                    summary_path.read_text(encoding="utf-8", errors="replace")
+            if dolby:
+                runner.run(
+                    dovi_summary_command(check),
+                    cwd=paths.work,
+                    stdout_path=summary_path,
+                    stderr_path=paths.logs / "dynamic-hdr-verify-summary.log",
                 )
-                require_dolby_vision_profile(counted)
+            try:
+                if dolby:
+                    counted = parse_dovi_summary(
+                        summary_path.read_text(encoding="utf-8", errors="replace")
+                    )
+                    require_dolby_vision_profile(counted)
+                else:
+                    counted = parse_hdr10plus_json(check.read_text(encoding="utf-8"))
                 require_frame_alignment(
                     counted.frames,
                     self._reference_info(paths).frames,
-                    what="the Dolby Vision RPU stream of the encode",
+                    what=f"the {label} stream of the encode",
                 )
             except (DynamicHdrError, FrameSelectionError, OSError, UnicodeError) as exc:
                 code = getattr(exc, "code", "unreadable")
                 raise ReviewRequired(
-                    f"the Dolby Vision RPU could not be attached to the encode: {exc}",
+                    f"the {label} could not be attached to the encode: {exc}",
                     details={"code": f"dynamic_hdr_{code}"},
                 ) from exc
             os.replace(rebuilt, video)

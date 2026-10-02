@@ -668,15 +668,15 @@ Az alapértelmezés (`discard`) változatlan: csak a statikus HDR10 marad meg, �
 
 Feltételek (a `selection/validate` végpont korán jelzi őket): x265 HDR10 (Main 10) kimenet; **progresszív** időzítés (a metaadat forráskockánkénti, IVTC/deinterlace után nem vihető át); a forrásnak ténylegesen hordoznia kell a metaadatot; Dolby Visionnél megerősített HDR10 alapréteg és 7-es vagy 8-as profil.
 
-Eszközigény: `hdr10plus_tool` (HDR10+), `dovi_tool` (Dolby Vision) és olyan x265, amely elfogadja a `--dhdr10-info`, illetve `--dolby-vision-rpu` paramétert. A **`dovi_tool`-t a telepítő (2.4.0-tól) maga teszi fel** a hivatalos `quietvoid/dovi_tool` rögzített 2.3.4-es kiadásából, SHA-256 ellenőrzéssel az eszközkiadásba (`tools/current/bin`); ha a letöltés nem sikerül (nincs hálózat, nem x86_64 a gép, eltér az ellenőrzőösszeg), a telepítés ettől nem hiúsul meg, csak a Dolby Vision-megőrzés marad elérhetetlen, és a `bdencode doctor` jelzi. A `hdr10plus_tool` nem része a telepítésnek, mert a Debian x265 HDR10+ támogatás nélkül készül; ha egyedi x265-öd van, töltsd le a hivatalos kiadásból (quietvoid/hdr10plus_tool), ellenőrizd az ellenőrzőösszeget, és tedd a `PATH`-ra. A `bdencode doctor` kimenetének `dynamic_hdr` szakasza mutatja, mi érhető el; hiányzó eszköz nem befolyásolja a `status` értékét.
+Eszközigény: `hdr10plus_tool` (HDR10+) és `dovi_tool` (Dolby Vision). **Mindkettőt a telepítő teszi fel** (2.4.0-tól a `dovi_tool`, 2.5.0-tól a `hdr10plus_tool` is) a hivatalos `quietvoid/*` rögzített kiadásaiból (`dovi_tool` 2.3.4, `hdr10plus_tool` 1.7.2), SHA-256 ellenőrzéssel az eszközkiadásba (`tools/current/bin`); ha a letöltés nem sikerül (nincs hálózat, nem x86_64 a gép, eltér az ellenőrzőösszeg), a telepítés ettől nem hiúsul meg, csak a megtartás marad elérhetetlen, és a `bdencode doctor` jelzi. Egyedi x265 nem kell: a metaadatot a worker a kész kódolásba utólag szúrja be (lásd lent), a Debian x265 HDR10+ támogatás nélkül is megfelel. A `bdencode doctor` kimenetének `dynamic_hdr` szakasza mutatja, mi érhető el; hiányzó eszköz nem befolyásolja a `status` értékét.
 
 A biztonsági modell:
 
 1. A worker a referencia HEVC-folyamát kinyeri, és az eszközzel metaadatot készít. Dolby Visionnél a `dovi_tool info --summary` megerősíti a 8-as profilt, cropolt kimenetnél a `-c` kapcsoló nullázza az active area értékeket.
 2. A metaadat **képkockaszáma pontosan egyezik** a kódolt idővonaléval, különben a job felülvizsgálatra kerül.
-3. Az FFmpeg libx265 burkolója ismeretlen paraméternél csak figyelmeztet, és megtartás nélkül kódol; ezért a kész MKV-ból a QC **bizonyítja** a réteg meglétét (HDR10+: `SMPTE2094-40` side data; Dolby Vision: `DOVI configuration record`, profil 8, HDR10-kompatibilis, RPU jelen). Bármi hiányzik, a job felülvizsgálatra kerül, és nem készül félrecímkézett kiadás.
+3. Az FFmpeg libx265 burkolója ismeretlen paraméternél csak figyelmeztet, és megtartás nélkül kódol (a Debian x265 nem tud HDR10+-t, az RPU-fájlt pedig csak az x265 parancssori program olvassa); ezért a kész MKV-ból a QC **bizonyítja** a réteg meglétét (HDR10+: `SMPTE2094-40` side data; Dolby Vision: `DOVI configuration record`, profil 8, HDR10-kompatibilis, RPU jelen). Bármi hiányzik, a job felülvizsgálatra kerül, és nem készül félrecímkézett kiadás.
 4. Dolby Visionnél, ha nem adtál meg VBV-t, a rendszer 160000/160000 kb/s VBV-t alkalmaz.
-5. Dolby Visionnél (2.4.0-tól) a kódolás után a worker a hash-ellenőrzött RPU-t beszúrja a kész HEVC-folyamba (`dovi_tool inject-rpu`), és az MKV sávot az eredeti időbélyegekkel, képkockaidővel és színleírással újraépíti (`mkvextract`, `mkvmerge`, `mkvpropedit`). Az újraépített sávból visszaolvassa az RPU-kat, és csak akkor fogadja el, ha a számuk képkockára pontosan egyezik a referencia idővonalával. Erre azért van szükség, mert az FFmpeg libx265-e nem tudja beolvasni az RPU-fájlt (az `--dolby-vision-rpu` az x265 parancssori programé).
+5. A megtartott metaadatot a worker a kódolás **után** szúrja be a kész HEVC-folyamba (Dolby Vision: `dovi_tool inject-rpu`, 2.4.0-tól; HDR10+: `hdr10plus_tool inject`, 2.5.0-tól), és az MKV sávot az eredeti időbélyegekkel, képkockaidővel és színleírással újraépíti (`mkvextract`, `mkvmerge`, `mkvpropedit`). Az újraépített sávból visszaolvassa a metaadatot, és csak akkor fogadja el, ha a képkockák száma pontosan egyezik a referencia idővonalával (és Dolby Visionnél a profil 8). Erre azért van szükség, mert az FFmpeg libx265-e nem tudja beolvasni az RPU-fájlt (az `--dolby-vision-rpu` az x265 parancssori programé), a Debian x265 pedig nincs HDR10+ támogatással fordítva. Az x265 `dhdr10-opt` blokkszintű optimalizálása HDR10+-nál így nem érvényesül; ez csekély minőségi finomítás.
 
 > [!WARNING]
 > A HDR10+ út a bitfolyamba (SEI) írja a metaadatot, ezért a mux nem érinti, de a Debian x265 nem tud HDR10+-t. A Dolby Vision megtartás szintetikus, generált 8.1-es forráson valódi eszközökkel végig lett próbálva (1440 RPU a forrásban, 1440 a kimeneten, 8-as profil), **valódi Dolby Vision lemezen még nem**: a 7-es profil átalakítása (`dovi_tool -m 2`), a minimális fényesség és a jelenethatárok valódi tartalomnál eltérhetnek. Első használat előtt próbáld ki egy rövid, valódi Dolby Vision lemezrészen; ha a konfigurációs rekord vagy az RPU-k száma nem egyezik, a QC kapu nem engedi tovább a jobot.
@@ -1280,13 +1280,13 @@ A fix dupe/publish endpointokat és host-allowlisteket itt, a hozzájuk tartozó
 
 ### 14.4. Opcionális eszközök a dinamikus HDR-hez
 
-A `dovi_tool`-t a telepítő felteszi (a letöltés hibája nem akasztja meg a telepítést), a `hdr10plus_tool` nem része a telepítőnek (7.4.3. pont). A telepítés után a `bdencode doctor` kimenetében ellenőrizd:
+A `dovi_tool`-t és a `hdr10plus_tool`-t a telepítő felteszi (a letöltés hibája nem akasztja meg a telepítést; 7.4.3. pont). A telepítés után a `bdencode doctor` kimenetében ellenőrizd:
 
 ```bash
 bdencode doctor | python3 -m json.tool | grep -A10 '"dynamic_hdr"'
 ```
 
-Minden módnál négy érték látszik: az eszköz neve, elérhetősége, verziója és az, hogy az x265 támogatja-e a szükséges paramétert. Csak akkor `available: true`, ha mindkettő teljesül. Hiányzó eszköz mellett az `auto` mód csendben eldob, az explicit `hdr10plus`/`dolby_vision` mód felülvizsgálatot kér.
+Minden módnál négy érték látszik: az eszköz neve, elérhetősége, verziója és az, hogy az x265 támogatja-e a szükséges paramétert. `available: true` HDR10+-nál, ha az eszköz megvan (az x265 támogatása nem kell, a metaadatot utólag szúrjuk be), Dolby Visionnél az eszköz és az x265 profiljelzése is kell. Hiányzó eszköz mellett az `auto` mód csendben eldob, az explicit `hdr10plus`/`dolby_vision` mód felülvizsgálatot kér.
 
 ### 14.5. Adatbázis: migráció, mentés és visszaállítás
 

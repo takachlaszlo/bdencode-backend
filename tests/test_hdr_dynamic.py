@@ -264,10 +264,8 @@ def test_frame_alignment_is_exact() -> None:
 def test_x265_parameters_per_mode() -> None:
     tmp_path = Path("/data/jobs/0001/work")
     location = tmp_path / "dhdr10.json"
-    assert x265_dynamic_params(plus_plan(), location) == {
-        "dhdr10-info": location.as_posix(),
-        "dhdr10-opt": 1,
-    }
+    # HDR10+ is injected into the finished stream, so the encoder gets nothing for it.
+    assert x265_dynamic_params(plus_plan(), location) == {}
     dolby = DynamicHdrPlan(
         DynamicHdrMode.DOLBY_VISION, DynamicHdrMode.DOLBY_VISION, "test", source_profile=8
     )
@@ -470,3 +468,43 @@ def test_the_original_track_properties_are_read_from_the_mkv_identification() ->
     assert dovi_duration_command(Path("dv.mkv"), 41708333) == [
         "mkvpropedit", "dv.mkv", "--edit", "track:v1", "--set", "default-duration=41708333",
     ]
+
+
+def test_hdr10plus_injection_command_and_readback(tmp_path: Path) -> None:
+    from bdencode.hdr_dynamic import hdr10plus_extract_commands, hdr10plus_inject_command
+
+    assert hdr10plus_inject_command(tmp_path / "e.hevc", tmp_path / "m.json", tmp_path / "o.hevc") == [
+        "hdr10plus_tool", "inject", "-i", str(tmp_path / "e.hevc"), "-j", str(tmp_path / "m.json"),
+        "-o", str(tmp_path / "o.hevc"),
+    ]
+    source, extract = hdr10plus_extract_commands(tmp_path / "rebuilt.mkv", tmp_path / "back.json")
+    assert extract[:2] == ["hdr10plus_tool", "extract"] and str(tmp_path / "rebuilt.mkv") in source
+
+
+def test_hdr10plus_needs_only_its_tool_but_dolby_vision_also_needs_x265(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    import bdencode.capabilities as capabilities
+
+    monkeypatch.setattr(
+        capabilities, "discover_tool",
+        lambda name, runner: SimpleNamespace(available=True, version=f"{name} 1"),
+    )
+    # Debian's x265: Dolby Vision signalling yes, HDR10+ no.
+    monkeypatch.setattr(
+        capabilities, "x265_build_support", lambda runner=None: {"hdr10plus": False, "dolby_vision": True}
+    )
+    support = capabilities.dynamic_hdr_support(runner=SimpleNamespace())
+    assert support["hdr10plus"]["available"] is True and support["hdr10plus"]["x265_supported"] is False
+    assert support["hdr10plus"]["method"] == "inject" and support["dolby_vision"]["available"] is True
+
+    monkeypatch.setattr(
+        capabilities, "x265_build_support", lambda runner=None: {"hdr10plus": False, "dolby_vision": False}
+    )
+    support = capabilities.dynamic_hdr_support(runner=SimpleNamespace())
+    assert support["hdr10plus"]["available"] is True and support["dolby_vision"]["available"] is False
+
+    monkeypatch.setattr(
+        capabilities, "discover_tool", lambda name, runner: SimpleNamespace(available=False, version=None)
+    )
+    assert capabilities.dynamic_hdr_support(runner=SimpleNamespace())["hdr10plus"]["available"] is False
