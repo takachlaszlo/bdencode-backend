@@ -1475,39 +1475,50 @@ def test_real_ssh_signatures_separate_trusted_tags_from_everything_else(tmp_path
     assert outcome["v1.0.2"].startswith("refused: tag v1.0.2 is not signed by a trusted release key")
 
 
-# -- the pinned Dolby Vision tool ------------------------------------------------------------------------
+# -- the pinned metadata tools (Dolby Vision, HDR10+) --------------------------------------------------
+
+TOOLS = {
+    "dovi_tool": ("2.3.4", "1844258e13c26607b32224bf1fa82b595d3b35949f5467405fda560daad32b3f"),
+    "hdr10plus_tool": ("1.7.2", "06385f37a639d61ba21d4be3150c863846933bc3b58110e094d8fc8f1c2249f2"),
+}
 
 
-def dovi_block() -> str:
-    return installer_block('dovi_version="2.3.4"', 'rm -rf -- "$dovi_work"\n')
+def _tool_block() -> str:
+    installer = read("install/install.sh")
+    begin = installer.index("install_optional_release_tool() {")
+    return installer[begin : installer.index("# Publish immutable", begin)]
 
 
-def test_the_dolby_vision_tool_is_pinned_and_checked_before_it_is_installed() -> None:
-    block = dovi_block()
-    assert 'dovi_version="2.3.4"' in block
-    assert 'dovi_sha256="1844258e13c26607b32224bf1fa82b595d3b35949f5467405fda560daad32b3f"' in block
-    assert "https://github.com/quietvoid/dovi_tool/releases/download/$dovi_version/$dovi_archive" in block
-    assert block.index("sha256sum --check") < block.index('install -m 0755 "$dovi_work/dovi_tool"')
+@pytest.mark.parametrize("name", sorted(TOOLS))
+def test_the_metadata_tools_are_pinned_and_checked_before_they_are_installed(name: str) -> None:
+    block = _tool_block()
+    version, digest = TOOLS[name]
+    assert f"install_optional_release_tool {name} {version} \\\n    {digest} \\\n" in block
+    assert f"https://github.com/quietvoid/{name}/releases/download/{version}/{name}-{version}-x86_64-unknown-linux-musl.tar.gz" in block
+    function = block[: block.index("}\n")]
+    assert function.index("sha256sum --check") < function.index('install -m 0755 "$work/$name"')
     # Part of an `if` condition list, so `set -e` cannot turn a failed optional download into a failed install.
-    assert "then\n    :\nelse\n" in block
+    assert "then\n        :\n    else\n" in function
 
 
-def test_the_tool_updater_carries_the_dolby_vision_tool_into_a_new_tool_release() -> None:
+def test_the_tool_updater_carries_the_metadata_tools_into_a_new_tool_release() -> None:
     updater = read("install/daily-update.sh")
-    assert 'install -m 0755 "$current_tools/bin/dovi_tool" "$tool_release/bin/dovi_tool"' in updater
+    assert "for metadata_tool in dovi_tool hdr10plus_tool; do" in updater
+    assert 'install -m 0755 "$current_tools/bin/$metadata_tool" "$tool_release/bin/$metadata_tool"' in updater
 
 
-def run_dovi_block(tmp_path: Path, *, archive_matches: bool) -> tuple[subprocess.CompletedProcess[str], Path]:
+def run_tool_installer(tmp_path: Path, name: str, *, archive_matches: bool) -> tuple[subprocess.CompletedProcess[str], Path]:
     import hashlib
     import io
     import tarfile
 
+    version, _ = TOOLS[name]
     staging = tmp_path / "staging"
     staging.mkdir()
-    content = b"#!/bin/sh\necho 'dovi_tool 2.3.4'\n"
-    archive = staging / "dovi_tool.tar.gz"
+    content = f"#!/bin/sh\necho '{name} {version}'\n".encode()
+    archive = staging / f"{name}.tar.gz"
     with tarfile.open(archive, "w:gz") as bundle:
-        member = tarfile.TarInfo("./dovi_tool")
+        member = tarfile.TarInfo(f"./{name}")
         member.size, member.mode = len(content), 0o755
         bundle.addfile(member, io.BytesIO(content))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest() if archive_matches else "0" * 64
@@ -1524,28 +1535,32 @@ def run_dovi_block(tmp_path: Path, *, archive_matches: bool) -> tuple[subprocess
 
     tool_release = tmp_path / "tools"
     (tool_release / "bin").mkdir(parents=True)
-    snippet = dovi_block().replace(
-        "1844258e13c26607b32224bf1fa82b595d3b35949f5467405fda560daad32b3f", digest
+    function = _tool_block().split("install_optional_release_tool dovi_tool", 1)[0]
+    script = (
+        f'set -Eeuo pipefail\ndata_root="{tmp_path}/data"\nrelease_id=test\ntool_release="{tool_release}"\n'
+        f"{function}\ninstall_optional_release_tool {name} {version} {digest} {name}.tar.gz https://example.invalid/{name}.tar.gz\n"
+        "echo finished\n"
     )
-    script = f'set -Eeuo pipefail\ndata_root="{tmp_path}/data"\nrelease_id=test\ntool_release="{tool_release}"\n{snippet}\necho finished\n'
     environment = {"PATH": f"{fake_bin}:/usr/bin:/bin", "FAKE_ARCHIVE": str(archive)}
     result = subprocess.run(["bash", "-c", script], env=environment, capture_output=True, text=True)
-    return result, tool_release / "bin" / "dovi_tool"
+    return result, tool_release / "bin" / name
 
 
 @posix_only
-def test_a_matching_download_installs_the_dolby_vision_tool(tmp_path: Path) -> None:
-    result, binary = run_dovi_block(tmp_path, archive_matches=True)
+@pytest.mark.parametrize("name", sorted(TOOLS))
+def test_a_matching_download_installs_the_metadata_tool(tmp_path: Path, name: str) -> None:
+    result, binary = run_tool_installer(tmp_path, name, archive_matches=True)
     assert result.returncode == 0 and "finished" in result.stdout, result.stderr
     assert binary.is_file() and os.access(binary, os.X_OK)
-    assert "dovi_tool 2.3.4" in result.stdout
-    assert not (tmp_path / "data" / "cache" / "build" / "dovi_tool-test").exists()
+    assert f"{name} {TOOLS[name][0]}" in result.stdout
+    assert not (tmp_path / "data" / "cache" / "build" / f"{name}-test").exists()
 
 
 @posix_only
-def test_a_digest_mismatch_leaves_the_tool_out_without_failing_the_install(tmp_path: Path) -> None:
-    result, binary = run_dovi_block(tmp_path, archive_matches=False)
+@pytest.mark.parametrize("name", sorted(TOOLS))
+def test_a_digest_mismatch_leaves_the_tool_out_without_failing_the_install(tmp_path: Path, name: str) -> None:
+    result, binary = run_tool_installer(tmp_path, name, archive_matches=False)
     assert result.returncode == 0 and "finished" in result.stdout, result.stderr
     assert not binary.exists()
-    assert "dovi_tool 2.3.4 was not installed" in result.stderr
-    assert not (tmp_path / "data" / "cache" / "build" / "dovi_tool-test").exists()
+    assert f"{name} {TOOLS[name][0]} was not installed" in result.stderr
+    assert not (tmp_path / "data" / "cache" / "build" / f"{name}-test").exists()

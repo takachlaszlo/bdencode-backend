@@ -311,10 +311,12 @@ if [[ -x "$current_tools/vmaf/bin/vmaf" ]]; then
     ln -s "$tool_release/vmaf/bin/vmaf" "$tool_release/bin/vmaf"
 fi
 
-# The pinned, checksum-verified Dolby Vision tool (install.sh) belongs to the tool release too.
-if [[ -x "$current_tools/bin/dovi_tool" && ! -L "$current_tools/bin/dovi_tool" ]]; then
-    install -m 0755 "$current_tools/bin/dovi_tool" "$tool_release/bin/dovi_tool"
-fi
+# The pinned, checksum-verified metadata tools (install.sh) belong to the tool release too.
+for metadata_tool in dovi_tool hdr10plus_tool; do
+    if [[ -x "$current_tools/bin/$metadata_tool" && ! -L "$current_tools/bin/$metadata_tool" ]]; then
+        install -m 0755 "$current_tools/bin/$metadata_tool" "$tool_release/bin/$metadata_tool"
+    fi
+done
 
 candidate_path="$tool_release/bin:$current_backend/venv/bin:/usr/local/bin:/usr/bin:/bin"
 runuser -u "$task_user" -- env XDG_CONFIG_HOME="$candidate_config" \
