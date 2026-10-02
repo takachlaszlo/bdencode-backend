@@ -55,8 +55,12 @@ from .hdr_dynamic import (
     DynamicHdrMode,
     DynamicHdrPlan,
     allowed_forbidden_tokens,
+    dovi_base_stream_command,
     dovi_extract_commands,
+    dovi_inject_command,
+    dovi_rebuild_command,
     dovi_summary_command,
+    dovi_verify_commands,
     hdr10plus_extract_commands,
     parse_dovi_summary,
     parse_hdr10plus_json,
@@ -64,6 +68,7 @@ from .hdr_dynamic import (
     require_dolby_vision_profile,
     require_frame_alignment,
     resolve_dynamic_hdr,
+    video_timestamps_command,
     x265_dynamic_params,
 )
 from .encode import (
@@ -3873,10 +3878,13 @@ class PipelineWorker:
         temporary_video = paths.work / "video-encoded.partial.mkv"
         extra_video_params: dict[str, str | int] | None = None
         dynamic_inputs: dict[str, Any] | None = None
+        rpu_to_inject: Path | None = None
         if selection.dynamic_hdr is not DynamicHdrMode.DISCARD:
             dynamic_plan, metadata_path, metadata_sha256 = self._load_dynamic_hdr(
                 job, paths, selection
             )
+            if dynamic_plan.mode is DynamicHdrMode.DOLBY_VISION:
+                rpu_to_inject = metadata_path
             if dynamic_plan.retained and metadata_path is not None:
                 try:
                     extra_video_params = x265_dynamic_params(
@@ -3891,6 +3899,9 @@ class PipelineWorker:
                     "plan": dynamic_plan.to_dict(),
                     "metadata_sha256": metadata_sha256,
                 }
+                if rpu_to_inject is not None:
+                    # An encode checkpoint made before the RPU was injected afterwards carries none.
+                    dynamic_inputs["rpu_injection"] = 1
         commands = encode_pipeline_commands(
             paths.script,
             temporary_video,
@@ -3962,6 +3973,10 @@ class PipelineWorker:
                 # promoted to the durable checkpoint path.
                 if interrupted():
                     raise ProcessInterrupted()
+                if rpu_to_inject is not None:
+                    self._inject_dolby_vision_rpu(
+                        paths, rpu_to_inject, temporary_video, interrupted
+                    )
                 os.replace(temporary_video, paths.encoded_video)
                 if reporter is not None:
                     reporter.complete()
@@ -3975,6 +3990,81 @@ class PipelineWorker:
         if interrupted():
             raise ProcessInterrupted()
         self.queue.advance(job.id, JobState.MUXING, message="video encode complete")
+
+    def _inject_dolby_vision_rpu(
+        self,
+        paths: JobPaths,
+        rpu: Path,
+        video: Path,
+        interrupted: Callable[[], bool],
+    ) -> None:
+        """Attach the verified RPU to the finished encode and prove it reached every frame.
+
+        FFmpeg's libx265 cannot read an RPU file, so the encode itself carries none. The RPU is
+        injected into the HEVC stream and the Matroska track is rebuilt from it with the original
+        timestamps; the result is replaced in place only after the RPUs read back from it match the
+        reference timeline frame for frame.
+        """
+
+        work = paths.work / "dynamic-hdr"
+        work.mkdir(mode=0o750, parents=True, exist_ok=True)
+        base, injected = work / "encoded.hevc", work / "encoded-dv.hevc"
+        timestamps, rebuilt = work / "encoded-timestamps.txt", work / "encoded-dv.mkv"
+        check, summary_path = work / "encoded-rpu.bin", work / "encoded-rpu-summary.txt"
+        scratch = (base, injected, timestamps, rebuilt, check, summary_path)
+        runner = self._runner(paths)
+        steps = (
+            ("base", dovi_base_stream_command(video, base)),
+            ("inject", dovi_inject_command(base, rpu, injected)),
+            ("timestamps", video_timestamps_command(video, timestamps)),
+            ("rebuild", dovi_rebuild_command(injected, timestamps, rebuilt)),
+        )
+        try:
+            for item in scratch:
+                item.unlink(missing_ok=True)
+            for name, command in steps:
+                if interrupted():
+                    raise ProcessInterrupted()
+                runner.run(
+                    command,
+                    cwd=paths.work,
+                    stderr_path=paths.logs / f"dolby-vision-{name}.log",
+                )
+            runner.run_pipeline(
+                dovi_verify_commands(rebuilt, check),
+                cwd=paths.work,
+                stderr_paths=[
+                    paths.logs / "dolby-vision-verify-source.log",
+                    paths.logs / "dolby-vision-verify.log",
+                ],
+                interrupt_requested=interrupted,
+            )
+            runner.run(
+                dovi_summary_command(check),
+                cwd=paths.work,
+                stdout_path=summary_path,
+                stderr_path=paths.logs / "dolby-vision-verify-summary.log",
+            )
+            try:
+                counted = parse_dovi_summary(
+                    summary_path.read_text(encoding="utf-8", errors="replace")
+                )
+                require_dolby_vision_profile(counted)
+                require_frame_alignment(
+                    counted.frames,
+                    self._reference_info(paths).frames,
+                    what="the Dolby Vision RPU stream of the encode",
+                )
+            except (DynamicHdrError, FrameSelectionError, OSError, UnicodeError) as exc:
+                code = getattr(exc, "code", "unreadable")
+                raise ReviewRequired(
+                    f"the Dolby Vision RPU could not be attached to the encode: {exc}",
+                    details={"code": f"dynamic_hdr_{code}"},
+                ) from exc
+            os.replace(rebuilt, video)
+        finally:
+            for item in scratch:
+                item.unlink(missing_ok=True)
 
     @staticmethod
     def _selected_streams(

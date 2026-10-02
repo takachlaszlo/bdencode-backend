@@ -588,6 +588,28 @@ ninja -C "$vmaf_source/libvmaf/build" install
 ln -s "$tool_release/vmaf/bin/vmaf" "$tool_release/bin/vmaf"
 "$tool_release/bin/vmaf" --version
 
+# Dolby Vision metadata tool for the opt-in dynamic HDR retention. The exact upstream release and
+# its SHA-256 are pinned. The feature is optional, so an offline host, an unsupported CPU or a
+# digest mismatch leaves it unavailable (bdencode doctor says so) instead of failing the install.
+dovi_version="2.3.4"
+dovi_sha256="1844258e13c26607b32224bf1fa82b595d3b35949f5467405fda560daad32b3f"
+dovi_archive="dovi_tool-$dovi_version-x86_64-unknown-linux-musl.tar.gz"
+dovi_work="$data_root/cache/build/dovi_tool-$release_id"
+if [[ "$(uname -m)" == x86_64 ]] \
+    && install -d -m 0700 "$dovi_work" \
+    && curl -fsSL --retry 3 --max-time 300 -o "$dovi_work/$dovi_archive" \
+        "https://github.com/quietvoid/dovi_tool/releases/download/$dovi_version/$dovi_archive" \
+    && echo "$dovi_sha256  $dovi_work/$dovi_archive" | sha256sum --check --quiet - \
+    && tar -xzf "$dovi_work/$dovi_archive" -C "$dovi_work" \
+    && install -m 0755 "$dovi_work/dovi_tool" "$tool_release/bin/dovi_tool" \
+    && "$tool_release/bin/dovi_tool" --version; then
+    :
+else
+    rm -f -- "$tool_release/bin/dovi_tool"
+    echo "WARNING: dovi_tool $dovi_version was not installed; Dolby Vision retention stays unavailable." >&2
+fi
+rm -rf -- "$dovi_work"
+
 # Publish immutable, root-owned static assets outside the private encode tree.
 # The current web pointer is part of the durable installer snapshot, so a crash
 # after activation restores the frontend together with backend/tool pointers.

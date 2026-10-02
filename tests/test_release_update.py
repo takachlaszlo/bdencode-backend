@@ -1473,3 +1473,79 @@ def test_real_ssh_signatures_separate_trusted_tags_from_everything_else(tmp_path
     assert outcome["v1.0.0"] == " (signed tag verified)"
     assert outcome["v1.0.1"].startswith("refused: tag v1.0.1 is not signed by a trusted release key")
     assert outcome["v1.0.2"].startswith("refused: tag v1.0.2 is not signed by a trusted release key")
+
+
+# -- the pinned Dolby Vision tool ------------------------------------------------------------------------
+
+
+def dovi_block() -> str:
+    return installer_block('dovi_version="2.3.4"', 'rm -rf -- "$dovi_work"\n')
+
+
+def test_the_dolby_vision_tool_is_pinned_and_checked_before_it_is_installed() -> None:
+    block = dovi_block()
+    assert 'dovi_version="2.3.4"' in block
+    assert 'dovi_sha256="1844258e13c26607b32224bf1fa82b595d3b35949f5467405fda560daad32b3f"' in block
+    assert "https://github.com/quietvoid/dovi_tool/releases/download/$dovi_version/$dovi_archive" in block
+    assert block.index("sha256sum --check") < block.index('install -m 0755 "$dovi_work/dovi_tool"')
+    # Part of an `if` condition list, so `set -e` cannot turn a failed optional download into a failed install.
+    assert "then\n    :\nelse\n" in block
+
+
+def test_the_tool_updater_carries_the_dolby_vision_tool_into_a_new_tool_release() -> None:
+    updater = read("install/daily-update.sh")
+    assert 'install -m 0755 "$current_tools/bin/dovi_tool" "$tool_release/bin/dovi_tool"' in updater
+
+
+def run_dovi_block(tmp_path: Path, *, archive_matches: bool) -> tuple[subprocess.CompletedProcess[str], Path]:
+    import hashlib
+    import io
+    import tarfile
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    content = b"#!/bin/sh\necho 'dovi_tool 2.3.4'\n"
+    archive = staging / "dovi_tool.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        member = tarfile.TarInfo("./dovi_tool")
+        member.size, member.mode = len(content), 0o755
+        bundle.addfile(member, io.BytesIO(content))
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest() if archive_matches else "0" * 64
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # The stub "downloads" the local archive to the path after -o.
+    (fake_bin / "curl").write_text(
+        '#!/bin/sh\nwhile [ "$1" != "-o" ]; do shift; done\ncp "$FAKE_ARCHIVE" "$2"\n', encoding="utf-8"
+    )
+    (fake_bin / "curl").chmod(0o755)
+    (fake_bin / "uname").write_text("#!/bin/sh\necho x86_64\n", encoding="utf-8")
+    (fake_bin / "uname").chmod(0o755)
+
+    tool_release = tmp_path / "tools"
+    (tool_release / "bin").mkdir(parents=True)
+    snippet = dovi_block().replace(
+        "1844258e13c26607b32224bf1fa82b595d3b35949f5467405fda560daad32b3f", digest
+    )
+    script = f'set -Eeuo pipefail\ndata_root="{tmp_path}/data"\nrelease_id=test\ntool_release="{tool_release}"\n{snippet}\necho finished\n'
+    environment = {"PATH": f"{fake_bin}:/usr/bin:/bin", "FAKE_ARCHIVE": str(archive)}
+    result = subprocess.run(["bash", "-c", script], env=environment, capture_output=True, text=True)
+    return result, tool_release / "bin" / "dovi_tool"
+
+
+@posix_only
+def test_a_matching_download_installs_the_dolby_vision_tool(tmp_path: Path) -> None:
+    result, binary = run_dovi_block(tmp_path, archive_matches=True)
+    assert result.returncode == 0 and "finished" in result.stdout, result.stderr
+    assert binary.is_file() and os.access(binary, os.X_OK)
+    assert "dovi_tool 2.3.4" in result.stdout
+    assert not (tmp_path / "data" / "cache" / "build" / "dovi_tool-test").exists()
+
+
+@posix_only
+def test_a_digest_mismatch_leaves_the_tool_out_without_failing_the_install(tmp_path: Path) -> None:
+    result, binary = run_dovi_block(tmp_path, archive_matches=False)
+    assert result.returncode == 0 and "finished" in result.stdout, result.stderr
+    assert not binary.exists()
+    assert "dovi_tool 2.3.4 was not installed" in result.stderr
+    assert not (tmp_path / "data" / "cache" / "build" / "dovi_tool-test").exists()

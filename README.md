@@ -668,7 +668,7 @@ Az alapértelmezés (`discard`) változatlan: csak a statikus HDR10 marad meg, �
 
 Feltételek (a `selection/validate` végpont korán jelzi őket): x265 HDR10 (Main 10) kimenet; **progresszív** időzítés (a metaadat forráskockánkénti, IVTC/deinterlace után nem vihető át); a forrásnak ténylegesen hordoznia kell a metaadatot; Dolby Visionnél megerősített HDR10 alapréteg és 7-es vagy 8-as profil.
 
-Eszközigény: `hdr10plus_tool` (HDR10+), `dovi_tool` (Dolby Vision) és olyan x265, amely elfogadja a `--dhdr10-info`, illetve `--dolby-vision-rpu` paramétert. Ezek nem részei az automatikus telepítésnek; töltsd le őket a hivatalos kiadásokból (quietvoid/hdr10plus_tool, quietvoid/dovi_tool), ellenőrizd az ellenőrzőösszeget, és tedd a `PATH`-ra. A `bdencode doctor` kimenetének `dynamic_hdr` szakasza mutatja, mi érhető el; hiányzó eszköz nem befolyásolja a `status` értékét.
+Eszközigény: `hdr10plus_tool` (HDR10+), `dovi_tool` (Dolby Vision) és olyan x265, amely elfogadja a `--dhdr10-info`, illetve `--dolby-vision-rpu` paramétert. A **`dovi_tool`-t a telepítő (2.4.0-tól) maga teszi fel** a hivatalos `quietvoid/dovi_tool` rögzített 2.3.4-es kiadásából, SHA-256 ellenőrzéssel az eszközkiadásba (`tools/current/bin`); ha a letöltés nem sikerül (nincs hálózat, nem x86_64 a gép, eltér az ellenőrzőösszeg), a telepítés ettől nem hiúsul meg, csak a Dolby Vision-megőrzés marad elérhetetlen, és a `bdencode doctor` jelzi. A `hdr10plus_tool` nem része a telepítésnek, mert a Debian x265 HDR10+ támogatás nélkül készül; ha egyedi x265-öd van, töltsd le a hivatalos kiadásból (quietvoid/hdr10plus_tool), ellenőrizd az ellenőrzőösszeget, és tedd a `PATH`-ra. A `bdencode doctor` kimenetének `dynamic_hdr` szakasza mutatja, mi érhető el; hiányzó eszköz nem befolyásolja a `status` értékét.
 
 A biztonsági modell:
 
@@ -1279,7 +1279,7 @@ A fix dupe/publish endpointokat és host-allowlisteket itt, a hozzájuk tartozó
 
 ### 14.4. Opcionális eszközök a dinamikus HDR-hez
 
-A `hdr10plus_tool` és a `dovi_tool` (7.4.3. pont) nem része a telepítőnek. A telepítés után a `bdencode doctor` kimenetében ellenőrizd:
+A `dovi_tool`-t a telepítő felteszi (a letöltés hibája nem akasztja meg a telepítést), a `hdr10plus_tool` nem része a telepítőnek (7.4.3. pont). A telepítés után a `bdencode doctor` kimenetében ellenőrizd:
 
 ```bash
 bdencode doctor | python3 -m json.tool | grep -A10 '"dynamic_hdr"'

@@ -14,7 +14,8 @@ the encode, QC or comparison code and after updating ffmpeg, x265, VapourSynth o
 
 It needs ``ffmpeg`` (with libx265), ``ffprobe``, ``mkvmerge``, ``vspipe`` with BestSource and the
 standalone ``vmaf`` in PATH (the installed tool runtime provides them) and takes about 8 minutes;
-``--size 3840x2160 --scenes 12`` exercises real UHD resolution.
+``--size 3840x2160 --scenes 12`` exercises real UHD resolution, ``--dolby-vision`` (needs ``dovi_tool``)
+a generated Dolby Vision profile 8.1 source that must come out frame-exactly.
 Exit status: 0 completed, 1 pipeline did not complete, 77 required tools missing.
 """
 
@@ -72,6 +73,52 @@ def make_master(path: Path, *, size: str = "1280x720", scenes: int = 30, noise: 
     )
 
 
+def run(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, check=True, capture_output=True, text=True, **options)  # type: ignore[call-overload]
+
+
+def make_dolby_vision_master(master: Path, work: Path) -> Path:
+    """A profile 8.1 source: the HDR10 master with a generated per-frame RPU injected into its HEVC stream."""
+
+    frames = int(run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+                      "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(master)]).stdout.strip())
+    config = work / "dovi-generate.json"
+    config.write_text(json.dumps({
+        "cm_version": "V29", "length": frames,
+        "level6": {"max_display_mastering_luminance": 1000, "min_display_mastering_luminance": 1,
+                   "max_content_light_level": 1000, "max_frame_average_light_level": 400},
+        "default_metadata_blocks": [{"Level1": {"min_pq": 0, "max_pq": 3079, "avg_pq": 819}}],
+    }), encoding="utf-8")
+    rpu, base, injected = work / "generated-rpu.bin", work / "base.hevc", work / "dv.hevc"
+    run(["dovi_tool", "generate", "-j", str(config), "-o", str(rpu)])
+    run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(master), "-map", "0:v:0",
+         "-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", str(base)])
+    run(["dovi_tool", "inject-rpu", "-i", str(base), "--rpu-in", str(rpu), "-o", str(injected)])
+    video = work / "dv-video.mkv"
+    run(["mkvmerge", "-q", "-o", str(video), "--default-duration", "0:24000/1001p", str(injected)])
+    result = work / "synthetic-dolby-vision-master.mkv"
+    run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(video), "-i", str(master),
+         "-map", "0:v", "-map", "1:a", "-c", "copy", str(result)])
+    return result
+
+
+def dolby_vision_summary(path: Path) -> dict[str, int]:
+    """Frame count and profile of the RPU stream inside an MKV, read the way the worker reads it."""
+
+    extract = subprocess.run(
+        ["bash", "-c", 'ffmpeg -hide_banner -nostdin -v error -i "$1" -map 0:v:0 -c copy '
+         '-bsf:v hevc_mp4toannexb -f hevc - | dovi_tool extract-rpu -o "$2" -', "_", str(path),
+         str(path.with_suffix(".rpu.bin"))],
+        capture_output=True, text=True, check=False,
+    )
+    if extract.returncode != 0:
+        return {"frames": 0, "profile": 0}
+    text = run(["dovi_tool", "info", "-i", str(path.with_suffix(".rpu.bin")), "--summary"]).stdout
+    frames = re.search(r"Frames:\s*(\d+)", text)
+    profile = re.search(r"Profile:\s*(\d+)", text)
+    return {"frames": int(frames[1]) if frames else 0, "profile": int(profile[1]) if profile else 0}
+
+
 def write_config(work: Path, source_root: Path) -> Path:
     config = work / "config.toml"
     config.write_text(
@@ -92,6 +139,9 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true", help="keep the scratch directory")
     parser.add_argument("--preset", default="fast")
     parser.add_argument("--size", default="1280x720", help="picture size, for example 3840x2160 for UHD")
+    parser.add_argument("--dolby-vision", action="store_true",
+                        help="make the source a Dolby Vision profile 8.1 title and require it to be retained "
+                        "(needs dovi_tool in PATH)")
     parser.add_argument("--scenes", type=int, default=30, help="number of two-second scenes (UHD: 12 is plenty)")
     parser.add_argument("--auto-crf", type=float, default=90.0, help="VMAF target; 0 uses a fixed CRF 18")
     args = parser.parse_args()
@@ -100,7 +150,7 @@ def main() -> int:
     width, height = (int(part) for part in args.size.split("x"))
     duration = round(args.scenes * SCENE_SECONDS, 3)
 
-    missing = missing_tools()
+    missing = missing_tools() + (["dovi_tool"] if args.dolby_vision and shutil.which("dovi_tool") is None else [])
     if missing or not encoders_ok():
         print("missing tools:", ", ".join(missing + ([] if encoders_ok() else ["ffmpeg libx265"])), file=sys.stderr)
         return 77
@@ -115,6 +165,10 @@ def main() -> int:
     started = time.time()
     print(f"[{time.time() - started:6.1f}s] making the synthetic master", flush=True)
     make_master(master, size=args.size, scenes=args.scenes)
+    if args.dolby_vision:
+        print(f"[{time.time() - started:6.1f}s] injecting a generated Dolby Vision RPU", flush=True)
+        master = make_dolby_vision_master(master, work)
+        print("source RPU:", dolby_vision_summary(master), flush=True)
     subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(master), "-map", "0:v", "-map", "0:a",
          "-c", "copy", "-f", "mpegts", str(disc / "BDMV" / "STREAM" / "00000.m2ts")],
@@ -140,6 +194,7 @@ def main() -> int:
             field_order="progressive", bit_depth=10, pixel_format="yuv420p10le",
             color_primaries="bt2020", color_transfer="smpte2084", color_matrix="bt2020nc",
             hdr10=True, hdr10_static=HdrStaticMetadata(MASTERING, 1000, 400), hdr10_base_layer=True,
+            dolby_vision=args.dolby_vision, dolby_vision_profile=8 if args.dolby_vision else None,
         ),
     )
     audio = MediaStream(
@@ -190,7 +245,7 @@ def main() -> int:
     video_selection: dict = {
         "detail_level": "advanced", "settings": {"preset": args.preset},
         "crop": {"left": 0, "top": 0, "right": 0, "bottom": 0}, "temporal_filter": "progressive",
-        "dynamic_hdr": "auto",
+        "dynamic_hdr": "dolby_vision" if args.dolby_vision else "auto",
     }
     if args.auto_crf:
         video_selection["auto_crf"] = {
@@ -202,7 +257,7 @@ def main() -> int:
     selection = {
         "playlist_id": "00001", "angle": 1, "video": video_selection,
         "tracks": [{"stream_id": "audio:4352", "action": "omit"}],
-        "output_name": f"Synthetic.Finish.2026.{height}p.UHD.BluRay.x265-TEST", "upload_images": False,
+        "output_name": "Synthetic.Finish.2026.2160p.UHD.BluRay.x265-TEST", "upload_images": False,
     }
     job = database.set_selection(job.id, selection)
     final = worker.process_job(job)
@@ -211,11 +266,20 @@ def main() -> int:
     report = settings.job_root(final.id) / "analysis" / "crf-search.json"
     if report.is_file():
         print(json.dumps(json.loads(report.read_text(encoding="utf-8")).get("probes"), indent=None))
+    status = 0 if final.state is JobState.COMPLETED else 1
+    if args.dolby_vision and final.state is JobState.COMPLETED:
+        output = next((settings.completed_root).rglob("*.mkv"), None)
+        summary = dolby_vision_summary(output) if output else {"frames": 0, "profile": 0}
+        source = dolby_vision_summary(master)
+        print("output RPU:", summary, "source RPU:", source, flush=True)
+        if summary["profile"] != 8 or summary["frames"] != source["frames"] or summary["frames"] == 0:
+            print("the Dolby Vision RPU was not retained frame-exactly", file=sys.stderr)
+            status = 1
     for event in database.list_events(job_id=final.id, limit=5000)[-6:]:
         print("  ", event.kind, (event.message or "")[:140])
     if not args.keep and args.work is None:
         shutil.rmtree(work, ignore_errors=True)
-    return 0 if final.state is JobState.COMPLETED else 1
+    return status
 
 
 if __name__ == "__main__":

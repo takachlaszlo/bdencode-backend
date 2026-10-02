@@ -421,3 +421,30 @@ def test_output_gate_accepts_and_requires_the_retained_layer() -> None:
         "dolby vision" in item or "dovi" in item
         for item in _gate(frame_rpu + [record], plus_plan())
     )
+
+
+def test_dolby_vision_injection_commands_keep_the_original_timeline(tmp_path: Path) -> None:
+    from bdencode.hdr_dynamic import (
+        dovi_base_stream_command,
+        dovi_inject_command,
+        dovi_rebuild_command,
+        dovi_verify_commands,
+        video_timestamps_command,
+    )
+
+    video, rpu = tmp_path / "video.mkv", tmp_path / "rpu.bin"
+    base, injected = tmp_path / "base.hevc", tmp_path / "dv.hevc"
+    stamps, rebuilt = tmp_path / "ts.txt", tmp_path / "dv.mkv"
+
+    base_command = dovi_base_stream_command(video, base)
+    assert base_command[0] == "ffmpeg" and "hevc_mp4toannexb" in base_command and base_command[-1] == str(base)
+    assert dovi_inject_command(base, rpu, injected) == [
+        "dovi_tool", "inject-rpu", "-i", str(base), "--rpu-in", str(rpu), "-o", str(injected),
+    ]
+    assert video_timestamps_command(video, stamps) == ["mkvextract", str(video), "timestamps_v2", f"0:{stamps}"]
+    rebuild = dovi_rebuild_command(injected, stamps, rebuilt)
+    assert rebuild[0] == "mkvmerge" and rebuild[rebuild.index("--timestamps") + 1] == f"0:{stamps}"
+    assert rebuild[-1] == str(injected) and rebuild[rebuild.index("--output") + 1] == str(rebuilt)
+    source, extract = dovi_verify_commands(rebuilt, tmp_path / "back.bin")
+    assert extract[:2] == ["dovi_tool", "extract-rpu"] and "-m" not in extract and "-c" not in extract
+    assert str(rebuilt) in source
