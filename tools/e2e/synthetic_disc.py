@@ -250,7 +250,10 @@ def main() -> int:
     if args.real_master:
         master = args.real_master.resolve()
         real = probe_master(master)
-        width, height, duration = real["width"], real["height"], round(real["duration"], 3)
+        # The playlist length is the frame-derived length, as on a real disc (the container's own duration
+        # also counts audio and can differ by a few frames, which the completeness gate rightly questions).
+        width, height = real["width"], real["height"]
+        duration = round(real["frames"] * 1001 / 24000, 3)
         print(f"[{time.time() - started:6.1f}s] real master: {real}", flush=True)
     else:
         print(f"[{time.time() - started:6.1f}s] making the synthetic master", flush=True)
