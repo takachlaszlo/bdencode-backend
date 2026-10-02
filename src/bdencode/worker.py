@@ -281,6 +281,22 @@ LOG = logging.getLogger(__name__)
 # otherwise healthy hardware, while the enclosing comparison still enforces a
 # strict thirty-minute wall-clock deadline.
 COMPARISON_FRAME_PROBE_TIMEOUT_SECONDS = 300
+COMPARISON_DEADLINE_SECONDS = 1800
+_REFERENCE_PIXELS = 1920 * 1080
+MAX_COMPARISON_BUDGET_SCALE = 4
+
+
+def comparison_budget_scale(width: int | None, height: int | None) -> int:
+    """How many times the 1080p comparison budgets a picture of this size needs.
+
+    The sampled frame probes decode twenty-four overlapping windows, each with a whole GOP of
+    preroll. The 300 s / 30 min budgets were set for 1080p; a UHD title has four times the pixels
+    to decode, and a measured UHD run hit the per-probe limit while the same work at 1080p fits.
+    """
+
+    if not width or not height or width <= 0 or height <= 0:
+        return 1
+    return max(1, min(MAX_COMPARISON_BUDGET_SCALE, round(width * height / _REFERENCE_PIXELS)))
 
 # libvmaf frame-level threads for the CRF probes.  Measured on 720p: one thread
 # 114 s, four 25 s, eight 14.5 s, sixteen 10.5 s for the same bit-identical
@@ -6044,13 +6060,25 @@ class PipelineWorker:
         # Twenty-four distributed native-YUV pairs are still bounded, but their
         # open-GOP-safe extraction is materially stronger than the former five
         # RGB screenshots and needs a realistic worker budget.
-        comparison_deadline = time.monotonic() + 1800
+        comparison_playlist = scan.playlist(selection.playlist_id)
+        comparison_base = (
+            comparison_playlist.video_streams[0].video
+            if comparison_playlist.video_streams
+            else None
+        )
+        budget_scale = comparison_budget_scale(
+            comparison_base.width if comparison_base else None,
+            comparison_base.height if comparison_base else None,
+        )
+        comparison_deadline = time.monotonic() + COMPARISON_DEADLINE_SECONDS * budget_scale
+        probe_limit = COMPARISON_FRAME_PROBE_TIMEOUT_SECONDS * budget_scale
 
         def remaining_timeout(per_command_limit: float) -> float:
             remaining = comparison_deadline - time.monotonic()
             if remaining <= 1:
                 raise ReviewRequired(
-                    "comparison exceeded its thirty-minute time budget"
+                    "comparison exceeded its time budget "
+                    f"({COMPARISON_DEADLINE_SECONDS * budget_scale // 60} minutes)"
                 )
             return max(1.0, min(per_command_limit, remaining))
 
@@ -6280,7 +6308,7 @@ class PipelineWorker:
                 cwd=paths.work,
                 stdout_path=encoded_probe,
                 stderr_path=paths.logs / "comparison-sampled-encoded-probe.stderr",
-                timeout=remaining_timeout(COMPARISON_FRAME_PROBE_TIMEOUT_SECONDS),
+                timeout=remaining_timeout(probe_limit),
             )
             _write_stage(encoded_probe_marker, encoded_probe_inputs, [encoded_probe])
         try:
@@ -6349,7 +6377,7 @@ class PipelineWorker:
                     cwd=paths.work,
                     stdout_path=source_probe,
                     stderr_path=paths.logs / "comparison-sampled-source-probe.stderr",
-                    timeout=remaining_timeout(COMPARISON_FRAME_PROBE_TIMEOUT_SECONDS),
+                    timeout=remaining_timeout(probe_limit),
                 )
                 _write_stage(source_probe_marker, source_probe_inputs, [source_probe])
             try:
