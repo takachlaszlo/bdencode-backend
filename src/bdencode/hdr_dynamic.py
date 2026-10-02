@@ -77,6 +77,9 @@ class DynamicHdrPlan:
     convert_mode: int | None = None
     # Zero the RPU active-area offsets when the encode removes the letterbox.
     crop_active_area: bool = False
+    # Profile 7 discs keep the RPUs in a secondary video stream: its ordinal among the video streams of
+    # the reference (None: the base layer, ordinal 0).
+    el_video_ordinal: int | None = None
 
     @property
     def retained(self) -> bool:
@@ -97,6 +100,7 @@ class DynamicHdrPlan:
             "source_profile": self.source_profile,
             "convert_mode": self.convert_mode,
             "crop_active_area": self.crop_active_area,
+            "el_video_ordinal": self.el_video_ordinal,
         }
 
     @classmethod
@@ -107,11 +111,14 @@ class DynamicHdrPlan:
             profile = raw.get("source_profile")
             convert = raw.get("convert_mode")
             crop = raw.get("crop_active_area", False)
+            ordinal = raw.get("el_video_ordinal")
             if (
                 profile is not None
                 and type(profile) is not int
                 or convert is not None
                 and type(convert) is not int
+                or ordinal is not None
+                and type(ordinal) is not int
                 or type(crop) is not bool
             ):
                 raise ValueError("wrong field type")
@@ -122,6 +129,7 @@ class DynamicHdrPlan:
                 source_profile=profile,
                 convert_mode=convert,
                 crop_active_area=crop,
+                el_video_ordinal=ordinal,
             )
         except (KeyError, ValueError) as exc:
             raise DynamicHdrError(
@@ -145,6 +153,8 @@ def resolve_dynamic_hdr(
     dolby_vision_profile: int | None,
     hdr10_base_layer: bool,
     hdr10_plus: bool,
+    dolby_vision_el_ordinal: int | None = None,
+    dolby_vision_el_type: str | None = None,
 ) -> DynamicHdrPlan:
     """Decide what to retain, or refuse with a coded :class:`DynamicHdrError`.
 
@@ -196,13 +206,17 @@ def resolve_dynamic_hdr(
                 f"Dolby Vision profile {dolby_vision_profile} cannot be converted "
                 "to profile 8.1 (only profiles 7 and 8 can)",
             )
+        reason = "source carries a Dolby Vision RPU convertible to profile 8.1"
+        if dolby_vision_profile == 7 and dolby_vision_el_type == "FEL":
+            reason += "; the full enhancement layer (FEL) is not part of profile 8.1 and is dropped"
         return DynamicHdrPlan(
             requested,
             DynamicHdrMode.DOLBY_VISION,
-            "source carries a Dolby Vision RPU convertible to profile 8.1",
+            reason,
             source_profile=dolby_vision_profile,
             convert_mode=2 if dolby_vision_profile == 7 else None,
             crop_active_area=crop_enabled,
+            el_video_ordinal=dolby_vision_el_ordinal if dolby_vision_profile == 7 else None,
         )
 
     if requested is DynamicHdrMode.HDR10PLUS:
@@ -228,7 +242,7 @@ def resolve_dynamic_hdr(
 # -- external tool commands ----------------------------------------------------
 
 
-def _base_layer_command(reference: Path, *, ffmpeg: str) -> list[str]:
+def _base_layer_command(reference: Path, *, ffmpeg: str, video_ordinal: int = 0) -> list[str]:
     return [
         ffmpeg,
         "-hide_banner",
@@ -238,7 +252,7 @@ def _base_layer_command(reference: Path, *, ffmpeg: str) -> list[str]:
         "-i",
         str(reference),
         "-map",
-        "0:v:0",
+        f"0:v:{video_ordinal}",
         "-c",
         "copy",
         "-bsf:v",
@@ -282,7 +296,11 @@ def dovi_extract_commands(
     if plan.crop_active_area:
         command.append("-c")
     command.extend(("extract-rpu", "-o", str(rpu), "-"))
-    return [_base_layer_command(reference, ffmpeg=ffmpeg), command]
+    # On a profile 7 disc the RPUs are in the secondary (enhancement layer) video stream.
+    return [
+        _base_layer_command(reference, ffmpeg=ffmpeg, video_ordinal=plan.el_video_ordinal or 0),
+        command,
+    ]
 
 
 def dovi_summary_command(rpu: Path, *, tool: str = DOVI_TOOL) -> list[str]:
