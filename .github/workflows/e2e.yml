@@ -7,6 +7,13 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      size:
+        description: "Picture size of the synthetic master (3840x2160 exercises real UHD resolution)"
+        default: "1280x720"
+      scenes:
+        description: "Two-second scenes (12 is plenty for UHD)"
+        default: "30"
   pull_request:
     paths:
       - ".github/workflows/e2e.yml"
@@ -66,4 +73,10 @@ jobs:
           vspipe --version
       - name: Synthetic disc, end to end
         # The tool runtime's own python is first in PATH; the project lives in the setup-python one.
-        run: ${{ env.pythonLocation }}/bin/python tools/e2e/synthetic_disc.py --work "$RUNNER_TEMP/e2e"
+        # The inputs reach the script through the environment (never interpolated into the shell).
+        env:
+          E2E_SIZE: ${{ inputs.size || '1280x720' }}
+          E2E_SCENES: ${{ inputs.scenes || '30' }}
+        run: |
+          ${{ env.pythonLocation }}/bin/python tools/e2e/synthetic_disc.py --work "$RUNNER_TEMP/e2e" \
+            --size "$E2E_SIZE" --scenes "$E2E_SCENES"

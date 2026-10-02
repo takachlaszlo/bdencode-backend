@@ -175,6 +175,45 @@ def test_v3_guard_accepts_exact_manifest_archive(
     invoke_guard(helper, archive, monkeypatch)
 
 
+def test_apt_archive_name_quotes_the_epoch() -> None:
+    name = apt_transaction.AptTransaction.apt_archive_name
+    assert name("mkvtoolnix", "92.0-1+deb13u1", "amd64") == "mkvtoolnix_92.0-1+deb13u1_amd64.deb"
+    assert name("ffmpeg", "7:7.1.5-0+deb13u1", "amd64") == "ffmpeg_7%3a7.1.5-0+deb13u1_amd64.deb"
+
+
+def test_v3_guard_accepts_the_seeded_cache_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper, archive = guard_fixture(tmp_path)
+    cache = archive.parents[1] / "apply-cache"
+    cache.mkdir()
+    seeded = cache / "ffmpeg_2.0_amd64.deb"
+    seeded.write_bytes(archive.read_bytes())
+    invoke_guard(helper, seeded, monkeypatch)
+
+
+def test_v3_guard_rejects_a_modified_cache_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper, archive = guard_fixture(tmp_path)
+    cache = archive.parents[1] / "apply-cache"
+    cache.mkdir()
+    seeded = cache / "ffmpeg_2.0_amd64.deb"
+    seeded.write_bytes(b"tampered")
+    with pytest.raises(apt_transaction.TransactionError, match="unverified archive"):
+        invoke_guard(helper, seeded, monkeypatch)
+
+
+def test_v3_guard_rejects_an_archive_outside_the_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper, archive = guard_fixture(tmp_path)
+    elsewhere = tmp_path / "ffmpeg_2.0_amd64.deb"
+    elsewhere.write_bytes(archive.read_bytes())
+    with pytest.raises(apt_transaction.TransactionError, match="unverified archive"):
+        invoke_guard(helper, elsewhere, monkeypatch)
+
+
 def test_v3_guard_rejects_unplanned_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

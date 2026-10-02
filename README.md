@@ -1027,7 +1027,31 @@ Az automatikus telepítés azt jelenti, hogy aki a beállított repository írá
 
 A **Rendszer** oldal „Kiadáskeresés és frissítés" kártyája ugyanezt mutatja (`GET /api/v1/system/release-update`). Opcionálisan értesítést is kérhetsz: a `release-update.toml` `notify_url = "https://ntfy.sh/a-te-temad"` sora (csak `https://`, jelszó nélkül) egy JSON POST-ot küld, amikor egy frissítés települt, megbukott, leállt vagy érvénytelen kiadást talált (ugyanarról az állapotról nem ismétel). **Visszaállás vagy kézi kiadás:** `sudo /usr/local/libexec/bdencode-release-update install --tag vX.Y.Z` pontosan azt a kiadást telepíti a megszokott védelmekkel (üres sor, jelszó nélküli sudo, tag és verzió egyezése, a kiadás saját tranzakciós telepítője), régebbit is. Régebbi kiadás csak akkor telepíthető, ha az adatbázis sémaverzióját ismeri (a 2.x kiadásoké 2).
 
-A médiaeszközök (apt-csomagok, VapourSynth, natív szkenner) frissítését a timer már nem végzi, de a várakozó Debian-frissítéseket (ffmpeg, x264, x265, mkvtoolnix, mediainfo, libbluray) naponta jelzi a `status.json` `media_updates` mezőjében és a Rendszer oldalon. A korábbi, tranzakciós eszközfrissítő továbbra is telepítve van, és kézzel indítható: `sudo env BDENCODE_USER=<fiók> /usr/local/libexec/bdencode-daily-update`.
+#### Aláírt kiadások (opcionális)
+
+Alapértelmezésben a frissítő a repository legmagasabb `vX.Y.Z` tagjét telepíti. Ha azt akarod, hogy csak a **te kulcsoddal aláírt** tag települhessen, a GitHub-fiók vagy az átvitel megsértése esetén sem, kapcsold be az SSH-aláírás ellenőrzését. Ez nem véd a gépen már megszerzett BDEncode-fiók ellen, csak a repository és az átvitel megbízhatatlanságától.
+
+1. Készíts külön kiadási kulcsot (jelszóval védve), és állítsd be a gitet:
+
+   ```bash
+   ssh-keygen -t ed25519 -C "bdencode-release" -f ~/.ssh/bdencode-release
+   git config --global gpg.format ssh
+   git config --global user.signingkey ~/.ssh/bdencode-release.pub
+   ```
+
+2. Add hozzá a nyilvános kulcsot a frissítő bizalmi listájához (a fájlnak root-tulajdonúnak kell lennie, és nem lehet mások által írható):
+
+   ```bash
+   echo "release@bdencode namespaces=\"git\" $(cat ~/.ssh/bdencode-release.pub)" | sudo tee /etc/bdencode/release-signers
+   sudo chmod 0644 /etc/bdencode/release-signers
+   ```
+
+3. Kapcsold be a `/etc/bdencode/release-update.toml` fájlban: `require_signed_tags = true` (opcionális a `signers_file = "/etc/bdencode/release-signers"` sor; ez az alapértelmezett útvonal). Ha a bizalmi lista hiányzik vagy üres, a frissítő `check_failed` állapotba kerül, és nem telepít, tehát nem kapcsolja ki magát csendben.
+4. Új kiadás: `python tools/release.py tag vX.Y.Z` létrehozza az annotált, aláírt taget a `HEAD` commiton, és ellenőrzi a kiadás fájljait; utána `git push origin vX.Y.Z`. A GitHub API-val vagy a webes felületen létrehozott tag nincs aláírva, ezért ilyen tagek nem települnek.
+
+Aláíratlan vagy ismeretlen kulccsal aláírt tag `invalid_release` állapotot kap, azonnal blokkolt marad, és semmi nem települ. A `status.json` üzenete aláírt tagnál a „(signed tag verified)" szöveget tartalmazza. A kézi `install --tag` parancs ugyanezt követeli; olyan régebbi kiadáshoz, amely az aláírás bevezetése előtt készült, használd a `--allow-unsigned` kapcsolót (csak a kézi parancsnál működik). A telepítő `openssh-client` csomagot is feltesz, mert az ellenőrzés az `ssh-keygen`-t használja.
+
+A médiaeszközök (apt-csomagok, VapourSynth, natív szkenner) frissítését a timer már nem végzi, de a várakozó Debian-frissítéseket (ffmpeg, x264, x265, mkvtoolnix, mediainfo, libbluray) naponta jelzi a `status.json` `media_updates` mezőjében és a Rendszer oldalon. A korábbi, tranzakciós eszközfrissítő továbbra is telepítve van, és kézzel indítható: `sudo env BDENCODE_USER=<fiók> /usr/local/libexec/bdencode-daily-update`. A 2.4.0-ig ez a futás a `mkvtoolnix` biztonsági frissítésén elbukott és visszagörgetett (a rendszer ilyenkor sértetlen maradt): az `apt` az ellenőrzött helyi `.deb` fájlt eldobta, mert ugyanazt a verziót a tárolóból akarta letölteni, amit a `--no-download` tilt. Mostantól a tranzakció a hash-ellenőrzött fájlt egy privát apt-gyorsítótárba teszi, és név és verzió szerint telepíti, az apt pedig ezt is összeveti az aláírt csomagindexszel.
 
 ### 11.2. Kézi frissítés
 

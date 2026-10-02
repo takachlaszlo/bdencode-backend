@@ -511,8 +511,8 @@ sudo flock -x "$installer_apt_lock" apt-get \
     -o Dir::Etc::preferencesparts=/dev/null \
     install -y --no-install-recommends --no-upgrade \
     build-essential ca-certificates curl ffmpeg fonts-dejavu-core git libbluray-bin libbluray-dev \
-    dpkg-repack man-db mediainfo meson mkvtoolnix nasm ninja-build pkg-config python3-pip \
-    python3-venv sqlite3 util-linux x264 x265 xxd
+    dpkg-repack man-db mediainfo meson mkvtoolnix nasm ninja-build openssh-client pkg-config \
+    python3-pip python3-venv sqlite3 util-linux x264 x265 xxd
 
 python3 -m venv "$release_root/venv"
 "$release_root/venv/bin/python" -m pip install --disable-pip-version-check --upgrade pip wheel
@@ -673,6 +673,11 @@ repository = "$update_repository"
 # Optional: an https URL (for example an ntfy.sh topic) that receives a JSON POST when an update was
 # installed or failed.
 # notify_url = "https://ntfy.sh/your-topic"
+# Optional: install only release tags that carry a valid SSH signature of a key listed in
+# signers_file (ssh-keygen "allowed_signers" format, namespace "git"). Unsigned or untrusted
+# tags are reported as invalid_release and never installed.
+# require_signed_tags = true
+# signers_file = "/etc/bdencode/release-signers"
 automatic_install = true
 EOF
     sudo chown root:root /etc/bdencode/release-update.toml
