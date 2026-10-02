@@ -56,6 +56,7 @@ from .hdr_dynamic import (
     DynamicHdrPlan,
     allowed_forbidden_tokens,
     dovi_base_stream_command,
+    dovi_duration_command,
     dovi_extract_commands,
     dovi_inject_command,
     dovi_rebuild_command,
@@ -65,10 +66,12 @@ from .hdr_dynamic import (
     parse_dovi_summary,
     parse_hdr10plus_json,
     parse_mode,
+    parse_video_track_properties,
     require_dolby_vision_profile,
     require_frame_alignment,
     resolve_dynamic_hdr,
     video_timestamps_command,
+    video_track_command,
     x265_dynamic_params,
 )
 from .encode import (
@@ -4013,15 +4016,33 @@ class PipelineWorker:
         check, summary_path = work / "encoded-rpu.bin", work / "encoded-rpu-summary.txt"
         scratch = (base, injected, timestamps, rebuilt, check, summary_path)
         runner = self._runner(paths)
-        steps = (
-            ("base", dovi_base_stream_command(video, base)),
-            ("inject", dovi_inject_command(base, rpu, injected)),
-            ("timestamps", video_timestamps_command(video, timestamps)),
-            ("rebuild", dovi_rebuild_command(injected, timestamps, rebuilt)),
-        )
+        track_report = work / "encoded-track.json"
+        scratch = (*scratch, track_report)
         try:
             for item in scratch:
                 item.unlink(missing_ok=True)
+            runner.run(
+                video_track_command(video),
+                cwd=paths.work,
+                stdout_path=track_report,
+                stderr_path=paths.logs / "dolby-vision-track.log",
+            )
+            try:
+                properties = parse_video_track_properties(
+                    track_report.read_text(encoding="utf-8")
+                )
+            except (DynamicHdrError, OSError, UnicodeError) as exc:
+                raise ReviewRequired(
+                    f"the Dolby Vision RPU could not be attached to the encode: {exc}",
+                    details={"code": "dynamic_hdr_invalid_track"},
+                ) from exc
+            steps = (
+                ("base", dovi_base_stream_command(video, base)),
+                ("inject", dovi_inject_command(base, rpu, injected)),
+                ("timestamps", video_timestamps_command(video, timestamps)),
+                ("rebuild", dovi_rebuild_command(injected, timestamps, rebuilt, properties)),
+                ("duration", dovi_duration_command(rebuilt, properties["default_duration"])),
+            )
             for name, command in steps:
                 if interrupted():
                     raise ProcessInterrupted()

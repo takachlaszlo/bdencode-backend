@@ -86,6 +86,22 @@ class HdrRunner(FakeRunner):
                 self._write(stderr_path, "")
             return
         # The post-encode RPU injection: each tool leaves its (tiny) output where the worker expects it.
+        if command[0] == "mkvmerge" and "--identify" in command and command[-1].endswith(
+            "video-encoded.partial.mkv"
+        ):
+            self.commands.append(command)
+            track = {"type": "video", "properties": {
+                "default_duration": 41708333, "color_range": 1, "color_matrix_coefficients": 9,
+                "color_transfer_characteristics": 16, "color_primaries": 9}}
+            self._write(stdout_path, json.dumps({"tracks": [track]}))
+            if stderr_path is not None:
+                self._write(stderr_path, "")
+            return
+        if command[0] == "mkvpropedit":
+            self.commands.append(command)
+            if stderr_path is not None:
+                self._write(stderr_path, "")
+            return
         produced: Path | None = None
         if command[0] == "dovi_tool" and "inject-rpu" in command:
             produced = Path(command[command.index("-o") + 1])
@@ -268,12 +284,16 @@ def test_dolby_vision_profile_7_is_converted_bounded_and_verified(context) -> No
             lambda c: c[0] == "dovi_tool" and "inject-rpu" in c,
             lambda c: c[0] == "mkvextract",
             lambda c: c[0] == "mkvmerge" and "--timestamps" in c,
+            lambda c: c[0] == "mkvpropedit",
             lambda c: c[0] == "dovi_tool" and "extract-rpu" in c and c[-2].endswith("encoded-rpu.bin"),
         )
     ]
     assert order == sorted(order)
     injection = next(c for c in runner.commands if c[0] == "dovi_tool" and "inject-rpu" in c)
     assert injection[injection.index("--rpu-in") + 1].endswith("rpu.bin")
+    rebuild = next(c for c in runner.commands if c[0] == "mkvmerge" and "--timestamps" in c)
+    assert rebuild[rebuild.index("--colour-primaries") + 1] == "0:9"  # the container keeps its colour description
+    assert next(c for c in runner.commands if c[0] == "mkvpropedit")[-1] == "default-duration=41708333"
     assert paths.encoded_video.is_file()
     assert not list((paths.work / "dynamic-hdr").glob("encoded*"))  # scratch files are removed
 
@@ -372,7 +392,10 @@ class QcRunner(HdrRunner):
         command = tuple(os.fspath(item) for item in argv)
         stdout_path = kwargs.get("stdout_path")
         stderr_path = kwargs.get("stderr_path")
-        if stdout_path is not None and command[0] == "mkvmerge" and "--identify" in command:
+        if (
+            stdout_path is not None and command[0] == "mkvmerge" and "--identify" in command
+            and not command[-1].endswith("video-encoded.partial.mkv")
+        ):
             self.commands.append(command)
             self._write(stdout_path, json.dumps({
                 "container": {"properties": {"title": "Movie.2026.2160p.UHD.BluRay.x265"}},

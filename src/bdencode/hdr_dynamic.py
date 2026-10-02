@@ -312,10 +312,54 @@ def video_timestamps_command(video: Path, timestamps: Path, *, mkvextract: str =
     return [mkvextract, str(video), "timestamps_v2", f"0:{timestamps}"]
 
 
+# Matroska track properties that the rebuilt track must keep (mkvmerge name -> its option).
+_TRACK_COLOUR_OPTIONS = {
+    "color_range": "--colour-range",
+    "color_matrix_coefficients": "--colour-matrix-coefficients",
+    "color_transfer_characteristics": "--colour-transfer-characteristics",
+    "color_primaries": "--colour-primaries",
+}
+
+
+def video_track_command(video: Path, *, mkvmerge: str = "mkvmerge") -> list[str]:
+    return [mkvmerge, "--identify", "--identification-format", "json", str(video)]
+
+
+def parse_video_track_properties(text: str) -> dict[str, int]:
+    """Frame duration and colour description of the first video track of an MKV."""
+
+    try:
+        tracks = json.loads(text)["tracks"]
+        properties = next(track["properties"] for track in tracks if track.get("type") == "video")
+    except (ValueError, KeyError, TypeError, StopIteration) as exc:
+        raise DynamicHdrError("invalid_track", "the encoded video track cannot be identified") from exc
+    wanted = ("default_duration", *_TRACK_COLOUR_OPTIONS)
+    found = {key: properties[key] for key in wanted if type(properties.get(key)) is int}
+    if "default_duration" not in found or found["default_duration"] < 1:
+        raise DynamicHdrError("invalid_track", "the encoded video track has no frame duration")
+    return found
+
+
 def dovi_rebuild_command(
-    injected: Path, timestamps: Path, output: Path, *, mkvmerge: str = "mkvmerge"
+    injected: Path,
+    timestamps: Path,
+    output: Path,
+    properties: Mapping[str, int] | None = None,
+    *,
+    mkvmerge: str = "mkvmerge",
 ) -> list[str]:
-    return [mkvmerge, "--quiet", "--output", str(output), "--timestamps", f"0:{timestamps}", str(injected)]
+    command = [mkvmerge, "--quiet", "--output", str(output), "--timestamps", f"0:{timestamps}"]
+    for key, option in _TRACK_COLOUR_OPTIONS.items():
+        if properties and key in properties:
+            command += [option, f"0:{properties[key]}"]
+    return [*command, str(injected)]
+
+
+def dovi_duration_command(output: Path, default_duration_ns: int, *, mkvpropedit: str = "mkvpropedit") -> list[str]:
+    """mkvmerge derives the frame duration from the millisecond timestamps (42 ms for 24000/1001
+    video), which makes FFmpeg reject the decode; restore the encode's own value."""
+
+    return [mkvpropedit, str(output), "--edit", "track:v1", "--set", f"default-duration={default_duration_ns}"]
 
 
 def dovi_verify_commands(
