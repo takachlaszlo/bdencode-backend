@@ -976,6 +976,8 @@ du -sh "$HOME/encode/jobs"/* 2>/dev/null
 
 Ne töröld kézzel egy aktív vagy folytatandó job belső fájljait. A webes **Munka törlése** ismeri a job pontos határait és az adatbázist is frissíti.
 
+Lassú csatolású forrásnál (Windows-meghajtó WSL alatt) az előkészítés idejére a cím helyi másolata is helyet foglal a `cache/disc-stage` mappában (UHD-filmnél kb. 60 GB). A worker ezt a remux után magától törli; ha nincs elég hely, a másolás elmarad (14.3.).
+
 ### 10.6. Hibajelentéshez szükséges adatok
 
 Hasznos adatok:
@@ -1278,6 +1280,13 @@ A trackerprofilok külön, root által kezelt fájlban vannak:
 ```
 
 A fix dupe/publish endpointokat és host-allowlisteket itt, a hozzájuk tartozó API-titkokat kizárólag titkosított systemd credentialként állítsd be. Az announce URL személyes passkeyt tartalmazhat, ezért magát a root-only profilfájlt és az abból készülő torrentet/upload kitet is titokként kezeld. A részletes lépések az [5.3. fejezetben](#53-trackerprofil-és-qbittorrent-beállítása) találhatók.
+
+**Az előkészítés gyorsítása.** Két kulcs (környezeti változóval is: `BDENCODE_SOURCE_STAGING`, `BDENCODE_CROP_HWACCEL`):
+
+- `source_staging = "auto"`: lassú csatolásról (Windows-meghajtó WSL alatt, hálózati megosztás) a kiválasztott cím lemezfájljai a referencia-remux előtt párhuzamos olvasással a helyi `<data_root>/cache/disc-stage` mappába másolódnak, és a remux onnan olvas. A másolat a remux után törlődik, a félbehagyott másolatok egy nap után. Helyigény a másolás idejére: a cím mérete plusz ugyanennyi a referenciának plusz 10 GB. Ha ez nincs meg, a lemez a helyén olvasódik (lassabban), és erről esemény kerül a jobhoz. `"always"` mindig másol, `"never"` soha.
+- `crop_hwaccel = "auto"`: a teljes című crop-keresés NVIDIA GPU-n NVDEC-kel dekódol (UHD-n kb. 148 fps a CPU kb. 50 fps-e helyett), hiba esetén CPU-n ismétel. `"none"` = mindig CPU.
+
+A forrás teljes, szigorú dekódolása (integritás-ellenőrzés, UHD-n kb. egy óra) nem az előkészítésben fut, hanem a videókódolással párhuzamosan, alacsonyabb CPU-prioritással (`nice -n 10`). Sérült forrásnál leállítja a kódolást, és a job felülvizsgálatra kerül („source video integrity diagnostics require review”). A muxolás csak sikeres ellenőrzés után indul. Az előkészítés csak a remux naplóját nézi át, mert az pillanatok alatt megvan.
 
 ### 14.4. Opcionális eszközök a dinamikus HDR-hez
 

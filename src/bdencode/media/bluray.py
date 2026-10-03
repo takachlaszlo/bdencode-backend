@@ -8,6 +8,7 @@ fallback.  Every subprocess receives an argv sequence and ``shell`` is never use
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from fractions import Fraction
@@ -375,12 +376,16 @@ class BluRayScanner:
         libbluray_provider: LibblurayProvider | None = None,
         source_root: Path = DEFAULT_SOURCE_ROOT,
         max_playlists: int = 128,
+        probe_workers: int = 8,
     ) -> None:
         self.runner = runner or SubprocessCaptureRunner()
         self.capabilities = capabilities or discover_capabilities(self.runner)
         self.libbluray_provider = libbluray_provider
         self.source_root = source_root
         self.max_playlists = max_playlists
+        # Playlists are probed concurrently: each probe is a short, latency-bound read of the disc,
+        # and a UHD disc can list over a hundred playlists.
+        self.probe_workers = max(1, probe_workers)
         self.languages = LanguageResolver()
         self._hdr_static_cache: dict[Path, HdrStaticMetadata] = {}
 
@@ -406,19 +411,24 @@ class BluRayScanner:
 
         playlists: list[PlaylistCandidate] = []
         if self.capabilities.ffprobe and self.capabilities.ffprobe_bluray:
-            for playlist_id in playlist_ids:
+
+            def probe_one(playlist_id: str) -> PlaylistCandidate | None:
                 probe = self._ffprobe_playlist(root, playlist_id)
                 metadata = native_by_id.get(playlist_id, {})
                 if probe is None and not metadata:
-                    continue
+                    return None
                 if probe is not None:
                     probe = self._with_hdr_static_metadata(
                         root,
                         probe,
                         metadata,
                     )
-                playlists.append(
-                    self._playlist_from_payload(playlist_id, probe or {}, metadata)
+                return self._playlist_from_payload(playlist_id, probe or {}, metadata)
+
+            # ``map`` keeps the playlist order, whatever order the probes finish in.
+            with ThreadPoolExecutor(max_workers=self.probe_workers) as pool:
+                playlists.extend(
+                    item for item in pool.map(probe_one, playlist_ids) if item is not None
                 )
         elif native_by_id:
             playlists.extend(

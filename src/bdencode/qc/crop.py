@@ -296,6 +296,7 @@ def full_title_cropdetect_command(
     sample_fps: Decimal | int | float | str = DEFAULT_FULL_TITLE_SAMPLE_FPS,
     limit: Decimal | int | float | str = Decimal("0.094"),
     round_to: int = 2,
+    hwaccel: str | None = None,
 ) -> list[str]:
     """Build a sequential full-title crop scan with sparse observations.
 
@@ -303,6 +304,9 @@ def full_title_cropdetect_command(
     decoded frame can widen the conservative ``reset=0`` envelope.  The
     trailing ``fps`` filter only limits frames sent to the null muxer; even a
     sub-second variable-aspect/full-frame insert remains visible to the gate.
+
+    ``hwaccel="cuda"`` decodes on the GPU (NVDEC); the frames are copied back
+    to system memory, so ``cropdetect`` sees the same pictures as a CPU decode.
     """
 
     parsed_fps = _decimal(sample_fps, name="full-title crop sample FPS")
@@ -313,6 +317,8 @@ def full_title_cropdetect_command(
         raise ValueError("cropdetect limit must be between zero and one")
     if round_to < 1:
         raise ValueError("cropdetect round value must be positive")
+    if hwaccel not in (None, "cuda"):
+        raise ValueError(f"unsupported crop decode acceleration: {hwaccel}")
     filters = (
         f"cropdetect=limit={_format_decimal(parsed_limit)}:"
         f"round={round_to}:reset=0,"
@@ -327,6 +333,7 @@ def full_title_cropdetect_command(
         "-xerror",
         "-err_detect",
         "explode",
+        *(("-hwaccel", hwaccel) if hwaccel else ()),
         "-i",
         str(input_path),
         "-map",

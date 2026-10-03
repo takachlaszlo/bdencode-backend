@@ -247,6 +247,7 @@ def source_video_integrity_command(
     stream: int = 0,
     *,
     ffmpeg: str = "ffmpeg",
+    threads: int | None = None,
 ) -> list[str]:
     """Build a fail-fast, full pixel-decode scan of one video stream.
 
@@ -254,11 +255,13 @@ def source_video_integrity_command(
     progress is emitted on stdout, which lets a caller supervise a long scan
     without weakening ``-xerror``/``explode`` error handling.  No copy codec is
     selected: every source frame must pass through the decoder before the null
-    muxer accepts it.
+    muxer accepts it.  ``threads`` sets the decoder's frame threads.
     """
 
     if stream < 0:
         raise ValueError("video stream ordinal must not be negative")
+    if threads is not None and threads < 1:
+        raise ValueError("decoder thread count must be positive")
     return [
         ffmpeg,
         "-hide_banner",
@@ -273,6 +276,7 @@ def source_video_integrity_command(
         "-xerror",
         "-err_detect",
         "explode",
+        *(("-threads", str(threads)) if threads is not None else ()),
         "-i",
         str(path),
         "-map",

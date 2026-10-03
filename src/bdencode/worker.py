@@ -259,6 +259,17 @@ from .qc.integrity import (
     video_stream_hash_command,
 )
 from .queue import JobQueue
+from .media.hwaccel import cuda_decode_available
+from .source_stage import (
+    StagingInterrupted,
+    StagingUnavailable,
+    needs_staging,
+    plan_files,
+    remove_stage,
+    remove_stale_stages,
+    stage_disc,
+    stage_root_for,
+)
 from .utils import (
     atomic_write_json,
     atomic_write_text,
@@ -275,6 +286,52 @@ from .vmaf_runner import streamed_vmaf_command
 
 
 LOG = logging.getLogger(__name__)
+
+# Free space that must remain beside a staged disc copy on top of the reference
+# remux, which is about as large as the copied clips.
+STAGE_RESERVE_BYTES = 10 * 1024**3
+
+# Frame threads of the full source decode.  On a 4K HEVC reference sixteen
+# threads decode about a fifth faster than FFmpeg's default; more do not help.
+INTEGRITY_DECODE_THREADS = max(1, min(16, os.cpu_count() or 1))
+
+
+class _BackgroundRun:
+    """Run ``function(cancelled)`` on a thread beside the caller's own work."""
+
+    def __init__(
+        self, function: Callable[[Callable[[], bool]], object], *, name: str
+    ) -> None:
+        self._cancelled = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._main, args=(function,), name=name, daemon=True
+        )
+        self._thread.start()
+
+    def _main(self, function: Callable[[Callable[[], bool]], object]) -> None:
+        try:
+            function(self._cancelled.is_set)
+        except BaseException as exc:  # handed to the waiting thread
+            self._error = exc
+
+    def failed(self) -> bool:
+        return self._error is not None
+
+    def wait(self) -> None:
+        """Wait for the work and re-raise its error."""
+
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+
+    def cancel(self) -> BaseException | None:
+        """Stop the work, wait for it and return its error (if it had failed)."""
+
+        self._cancelled.set()
+        self._thread.join()
+        return self._error
+
 
 # Twenty-five distributed probes decode roughly six minutes once the open-GOP
 # preroll is included.  Real H.264/HEVC titles can need more than 90 seconds on
@@ -3071,82 +3128,151 @@ class PipelineWorker:
             outputs,
         )
 
-    def _prepare(self, job: Job, paths: JobPaths, *, advance: bool = True) -> None:
-        scan, selection = self._load_scan_and_selection(job, paths)
-        playlist = scan.playlist(selection.playlist_id)
-        pcm_bluray_audio: list[PcmBlurayAudio] = []
-        for ordinal, stream in enumerate(playlist.audio_streams):
-            if stream.codec.casefold() != "pcm_bluray":
-                continue
-            if stream.bit_depth is None:
-                raise ReviewRequired(
-                    f"Blu-ray PCM stream {stream.id} has no verified bit depth"
-                )
-            try:
-                pcm_bluray_audio.append(PcmBlurayAudio(ordinal, stream.bit_depth))
-            except ValueError as exc:
-                raise ReviewRequired(
-                    f"Blu-ray PCM stream {stream.id} has an unsupported bit depth: "
-                    f"{stream.bit_depth}"
-                ) from exc
-        remux_inputs = {
-            "scan_fingerprint": scan.fingerprint,
-            "playlist_id": selection.playlist_id,
-            "angle": selection.angle,
-            "pcm_bluray_audio": [asdict(item) for item in pcm_bluray_audio],
-            "source_clips": _playlist_source_snapshot(scan, selection.playlist_id),
-        }
-        remux_marker = paths.stages / "reference-remux.json"
-        try:
-            _activate_source_log_generation(
-                logs_root=paths.logs,
-                generation_record=(paths.analysis / "source-integrity-generation.json"),
-                remux_marker=remux_marker,
-                generation=_json_hash(remux_inputs),
-            )
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ReviewRequired(
-                f"source integrity generation record is invalid: {exc}"
-            ) from exc
-        if not _valid_stage(remux_marker, remux_inputs, [paths.reference]):
-            command = reference_remux_command(
-                ReferenceRemuxPlan(
-                    disc_root=scan.source,
-                    playlist_id=selection.playlist_id,
-                    output_path=paths.reference,
-                    angle=selection.angle,
-                    pcm_bluray_audio=tuple(pcm_bluray_audio),
-                )
-            )
-            self._runner(paths).run(
-                command,
-                cwd=paths.work,
-                stderr_path=paths.logs / "reference-remux.log",
-            )
-            _write_stage(remux_marker, remux_inputs, [paths.reference])
+    def _stage_source(
+        self, job: Job, scan: DiscScan, playlist: PlaylistCandidate
+    ) -> Path | None:
+        """Copy the selected title's disc files to local disk when the disc is on a slow mount.
 
-        integrity_report = paths.analysis / "source-video-integrity.json"
-        integrity_log = paths.logs / "source-video-integrity.log"
-        integrity_progress = paths.analysis / "source-video-integrity-progress.txt"
-        integrity_inputs = {
+        Returns the local disc root, or ``None`` when the remux reads the disc in place.
+        """
+
+        if not needs_staging(scan.source, mode=self.settings.source_staging):
+            return None
+        cache_root = self.settings.cache_root
+        clips = tuple(dict.fromkeys(segment.clip_id for segment in playlist.segments))
+        remove_stale_stages(cache_root, keep=stage_root_for(cache_root, scan.source))
+        started = time.monotonic()
+        try:
+            planned = sum(item.size for item in plan_files(scan.source, clips))
+            staged = stage_disc(
+                scan.source,
+                cache_root,
+                clips=clips,
+                reserve_bytes=planned + STAGE_RESERVE_BYTES,
+                should_stop=lambda: self._process_interrupt_requested(job.id),
+            )
+        except StagingInterrupted as exc:
+            raise ProcessInterrupted() from exc
+        except (OSError, StagingUnavailable) as exc:
+            LOG.warning("job %s: the disc is read in place: %s", job.id, exc)
+            self.database.add_event(
+                EventCreate(
+                    job_id=job.id,
+                    kind="worker.source-staging-skipped",
+                    message=f"the disc is read in place (no local copy): {exc}",
+                    payload={},
+                )
+            )
+            return None
+        seconds = time.monotonic() - started
+        self.database.add_event(
+            EventCreate(
+                job_id=job.id,
+                kind="worker.source-staged",
+                message=(
+                    f"title files copied to local disk ({planned / 1e9:.1f} GB "
+                    f"in {seconds / 60:.1f} min)"
+                ),
+                payload={"bytes": planned, "seconds": round(seconds, 1)},
+            )
+        )
+        return staged
+
+    def _crop_decode_acceleration(self, runner: Runner) -> str | None:
+        mode = self.settings.crop_hwaccel
+        if mode == "cuda":
+            return "cuda"
+        if (
+            mode == "auto"
+            and isinstance(runner, CommandRunner)
+            and cuda_decode_available()
+        ):
+            return "cuda"
+        return None
+
+    def _run_crop_scan(self, paths: JobPaths, log_path: Path) -> None:
+        """Run the full-title crop scan, on the GPU when available (CPU on failure)."""
+
+        runner = self._runner(paths)
+        hwaccel = self._crop_decode_acceleration(runner)
+        if hwaccel is not None:
+            try:
+                runner.run(
+                    full_title_cropdetect_command(paths.reference, hwaccel=hwaccel),
+                    cwd=paths.work,
+                    stderr_path=log_path,
+                )
+                return
+            except ProcessFailure:
+                LOG.warning(
+                    "job %s: the %s crop scan failed; repeating it on the CPU",
+                    paths.root.name,
+                    hwaccel,
+                )
+        runner.run(
+            full_title_cropdetect_command(paths.reference),
+            cwd=paths.work,
+            stderr_path=log_path,
+        )
+
+    @staticmethod
+    def _source_integrity_stage(
+        paths: JobPaths, reference_sha256: str
+    ) -> tuple[Path, dict[str, Any], list[Path]]:
+        """The checkpoint marker, inputs and outputs of the full source decode."""
+
+        inputs = {
             "policy_schema_version": 3,
-            "reference_sha256": sha256_file(paths.reference),
+            "reference_sha256": reference_sha256,
             "context": "source",
             "decode_mode": "full-pixel-decode",
         }
-        integrity_marker = paths.stages / "source-video-integrity.json"
-        if not _valid_stage(
-            integrity_marker,
-            integrity_inputs,
-            [integrity_report, integrity_progress],
-        ):
+        outputs = [
+            paths.analysis / "source-video-integrity.json",
+            paths.analysis / "source-video-integrity-progress.txt",
+        ]
+        return paths.stages / "source-video-integrity.json", inputs, outputs
+
+    def _source_integrity_current(self, paths: JobPaths, reference_sha256: str) -> bool:
+        marker, inputs, outputs = self._source_integrity_stage(paths, reference_sha256)
+        return _valid_stage(marker, inputs, outputs)
+
+    def _check_source_integrity(
+        self,
+        paths: JobPaths,
+        reference_sha256: str,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        low_priority: bool = False,
+    ) -> None:
+        """Fully decode the reference video and enforce the source diagnostics history.
+
+        Runs beside the video encode (``cancelled`` stops it, ``low_priority``
+        leaves the CPU to the encoder); a failure raises ``ReviewRequired``.
+        """
+
+        integrity_marker, integrity_inputs, outputs = self._source_integrity_stage(
+            paths, reference_sha256
+        )
+        integrity_report, integrity_progress = outputs
+        integrity_log = paths.logs / "source-video-integrity.log"
+        if not _valid_stage(integrity_marker, integrity_inputs, outputs):
+            command = source_video_integrity_command(
+                paths.reference, threads=INTEGRITY_DECODE_THREADS
+            )
+            if low_priority and os.name == "posix" and shutil.which("nice"):
+                command = ["nice", "-n", "10", *command]
+            options: dict[str, Any] = (
+                {} if cancelled is None else {"interrupt_requested": cancelled}
+            )
             failure: ProcessFailure | None = None
             try:
                 self._runner(paths).run(
-                    source_video_integrity_command(paths.reference),
+                    command,
                     cwd=paths.work,
                     stdout_path=integrity_progress,
                     stderr_path=integrity_log,
+                    **options,
                 )
             except ProcessFailure as exc:
                 failure = exc
@@ -3200,22 +3326,26 @@ class PipelineWorker:
                     *sticky_diagnostics,
                 )
                 raise ReviewRequired(
-                    "source video integrity diagnostics require review before encoding",
+                    "source video integrity diagnostics require review",
                     details={
                         "report": integrity_report.name,
                         "diagnostics": _public_diagnostic_summary(public_diagnostics),
                     },
                 )
-            _write_stage(
-                integrity_marker,
-                integrity_inputs,
-                [integrity_report, integrity_progress],
-            )
+            _write_stage(integrity_marker, integrity_inputs, outputs)
+        self._enforce_source_history(paths)
 
-        # Corruption reported by an earlier remux/decode attempt remains
-        # material even after a later retry succeeds.  CommandRunner preserves
-        # those stderr files as attempt-NN logs, so enforce the history on
-        # every resume instead of trusting only the latest base log/marker.
+    def _enforce_source_history(self, paths: JobPaths) -> None:
+        """Stop on corruption that any remux or source decode attempt has reported.
+
+        Corruption reported by an earlier remux/decode attempt remains material
+        even after a later retry succeeds.  CommandRunner preserves those stderr
+        files as attempt-NN logs, so the history is enforced on every resume
+        instead of trusting only the latest base log/marker.  Reading the logs
+        is cheap, so preparation checks the remux before the encode starts.
+        """
+
+        integrity_report = paths.analysis / "source-video-integrity.json"
         historical_source_logs = sorted(
             {
                 *paths.logs.glob("reference-remux*.log"),
@@ -3251,8 +3381,73 @@ class PipelineWorker:
                 },
             )
 
+    def _prepare(self, job: Job, paths: JobPaths, *, advance: bool = True) -> None:
+        scan, selection = self._load_scan_and_selection(job, paths)
+        playlist = scan.playlist(selection.playlist_id)
+        pcm_bluray_audio: list[PcmBlurayAudio] = []
+        for ordinal, stream in enumerate(playlist.audio_streams):
+            if stream.codec.casefold() != "pcm_bluray":
+                continue
+            if stream.bit_depth is None:
+                raise ReviewRequired(
+                    f"Blu-ray PCM stream {stream.id} has no verified bit depth"
+                )
+            try:
+                pcm_bluray_audio.append(PcmBlurayAudio(ordinal, stream.bit_depth))
+            except ValueError as exc:
+                raise ReviewRequired(
+                    f"Blu-ray PCM stream {stream.id} has an unsupported bit depth: "
+                    f"{stream.bit_depth}"
+                ) from exc
+        remux_inputs = {
+            "scan_fingerprint": scan.fingerprint,
+            "playlist_id": selection.playlist_id,
+            "angle": selection.angle,
+            "pcm_bluray_audio": [asdict(item) for item in pcm_bluray_audio],
+            "source_clips": _playlist_source_snapshot(scan, selection.playlist_id),
+        }
+        remux_marker = paths.stages / "reference-remux.json"
+        try:
+            _activate_source_log_generation(
+                logs_root=paths.logs,
+                generation_record=(paths.analysis / "source-integrity-generation.json"),
+                remux_marker=remux_marker,
+                generation=_json_hash(remux_inputs),
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReviewRequired(
+                f"source integrity generation record is invalid: {exc}"
+            ) from exc
+        if not _valid_stage(remux_marker, remux_inputs, [paths.reference]):
+            disc_root = self._stage_source(job, scan, playlist) or scan.source
+            command = reference_remux_command(
+                ReferenceRemuxPlan(
+                    disc_root=disc_root,
+                    playlist_id=selection.playlist_id,
+                    output_path=paths.reference,
+                    angle=selection.angle,
+                    pcm_bluray_audio=tuple(pcm_bluray_audio),
+                )
+            )
+            self._runner(paths).run(
+                command,
+                cwd=paths.work,
+                stderr_path=paths.logs / "reference-remux.log",
+            )
+            _write_stage(remux_marker, remux_inputs, [paths.reference])
+            if disc_root != scan.source:
+                remove_stage(self.settings.cache_root, scan.source)
+
+        reference_sha256 = sha256_file(paths.reference)
         source_video = playlist.video_streams[0].video
         assert source_video is not None
+        crop_report = paths.analysis / "crop-policy.json"
+        crop_marker = paths.stages / "crop-policy.json"
+        crop_log_path = paths.logs / "crop-detect-full-title.log"
+        # The full decode of the reference (source integrity) runs beside the
+        # video encode; preparation only enforces what the remux reported.
+        self._enforce_source_history(paths)
+
         if playlist.duration_seconds <= 0:
             raise ReviewRequired(
                 "title duration must be positive for distributed crop and QC sampling"
@@ -3261,20 +3456,13 @@ class PipelineWorker:
             raise ReviewRequired(
                 "source dimensions are required for distributed crop validation"
             )
-        crop_report = paths.analysis / "crop-policy.json"
         crop_inputs = self._crop_policy_inputs(
             scan,
             selection,
-            reference_sha256=sha256_file(paths.reference),
+            reference_sha256=reference_sha256,
         )
-        crop_marker = paths.stages / "crop-policy.json"
         if not _valid_stage(crop_marker, crop_inputs, [crop_report]):
-            crop_log_path = paths.logs / "crop-detect-full-title.log"
-            self._runner(paths).run(
-                full_title_cropdetect_command(paths.reference),
-                cwd=paths.work,
-                stderr_path=crop_log_path,
-            )
+            self._run_crop_scan(paths, crop_log_path)
             crop_log = crop_log_path.read_text(encoding="utf-8", errors="replace")
             try:
                 try:
@@ -3979,69 +4167,99 @@ class PipelineWorker:
         if dynamic_inputs is not None:
             inputs["dynamic_hdr"] = dynamic_inputs
 
+        check: _BackgroundRun | None = None
+
         def interrupted() -> bool:
+            if check is not None and check.failed():
+                return True
             return self._process_interrupt_requested(job.id)
 
         marker = paths.stages / "video-encode.json"
-        if not _valid_stage(marker, inputs, [paths.encoded_video]):
-            temporary_video.unlink(missing_ok=True)
-            playlist = scan.playlist(selection.playlist_id)
-
-            def persist_progress(
-                progress: float, message: str, details: dict[str, object]
-            ) -> None:
-                self.database.record_progress(
-                    job.id,
-                    progress,
-                    message=message,
-                    details=details,
-                    expected_state=JobState.ENCODING,
-                    emit_event="milestone_percent" in details,
-                )
-
-            reporter: EncodeProgressReporter | None = None
-            try:
-                reporter = EncodeProgressReporter(
-                    playlist.duration_seconds,
-                    paths.logs / "video-progress.jsonl",
-                    persist_progress,
-                )
-                reporter.start()
-            except Exception:
-                # Invalid legacy duration metadata must not turn optional
-                # progress observation into an encode failure.
-                LOG.exception(
-                    "job %s video progress reporter is unavailable; encode continues",
-                    job.id,
-                )
-
-            try:
-                self._runner(paths).run_pipeline(
-                    commands,
-                    cwd=paths.work,
-                    stderr_paths=[
-                        paths.logs / "vapoursynth.log",
-                        paths.logs / "video-encode.log",
-                    ],
-                    stderr_line_callback=reporter.handle_line if reporter else None,
-                    interrupt_requested=interrupted,
-                )
-                # Close the tiny race in which cancellation commits after the
-                # final poll but before a successful temporary output is
-                # promoted to the durable checkpoint path.
-                if interrupted():
-                    raise ProcessInterrupted()
-                if to_inject is not None:
-                    self._inject_dynamic_hdr(
-                        paths, *to_inject, temporary_video, interrupted
-                    )
-                os.replace(temporary_video, paths.encoded_video)
-                if reporter is not None:
-                    reporter.complete()
-            except BaseException:
+        encode_needed = not _valid_stage(marker, inputs, [paths.encoded_video])
+        if (
+            encode_needed
+            and isinstance(self._runner(paths), CommandRunner)
+            and not self._source_integrity_current(paths, reference_sha256)
+        ):
+            # The full decode of the reference takes most of an hour on a UHD
+            # title.  It runs at low priority beside the encode instead of
+            # before it; a corrupt source stops the encode.
+            check = _BackgroundRun(
+                lambda cancelled: self._check_source_integrity(
+                    paths, reference_sha256, cancelled=cancelled, low_priority=True
+                ),
+                name=f"source-integrity-{job.id}",
+            )
+        try:
+            if encode_needed:
                 temporary_video.unlink(missing_ok=True)
-                raise
-            _write_stage(marker, inputs, [paths.encoded_video])
+                playlist = scan.playlist(selection.playlist_id)
+
+                def persist_progress(
+                    progress: float, message: str, details: dict[str, object]
+                ) -> None:
+                    self.database.record_progress(
+                        job.id,
+                        progress,
+                        message=message,
+                        details=details,
+                        expected_state=JobState.ENCODING,
+                        emit_event="milestone_percent" in details,
+                    )
+
+                reporter: EncodeProgressReporter | None = None
+                try:
+                    reporter = EncodeProgressReporter(
+                        playlist.duration_seconds,
+                        paths.logs / "video-progress.jsonl",
+                        persist_progress,
+                    )
+                    reporter.start()
+                except Exception:
+                    # Invalid legacy duration metadata must not turn optional
+                    # progress observation into an encode failure.
+                    LOG.exception(
+                        "job %s video progress reporter is unavailable; encode continues",
+                        job.id,
+                    )
+
+                try:
+                    self._runner(paths).run_pipeline(
+                        commands,
+                        cwd=paths.work,
+                        stderr_paths=[
+                            paths.logs / "vapoursynth.log",
+                            paths.logs / "video-encode.log",
+                        ],
+                        stderr_line_callback=reporter.handle_line if reporter else None,
+                        interrupt_requested=interrupted,
+                    )
+                    # Close the tiny race in which cancellation commits after the
+                    # final poll but before a successful temporary output is
+                    # promoted to the durable checkpoint path.
+                    if interrupted():
+                        raise ProcessInterrupted()
+                    if to_inject is not None:
+                        self._inject_dynamic_hdr(
+                            paths, *to_inject, temporary_video, interrupted
+                        )
+                    os.replace(temporary_video, paths.encoded_video)
+                    if reporter is not None:
+                        reporter.complete()
+                except BaseException:
+                    temporary_video.unlink(missing_ok=True)
+                    raise
+                _write_stage(marker, inputs, [paths.encoded_video])
+        except BaseException:
+            if check is not None:
+                error = check.cancel()
+                if isinstance(error, ReviewRequired):
+                    raise error from None
+            raise
+        if check is not None:
+            check.wait()
+        else:
+            self._check_source_integrity(paths, reference_sha256)
         # Hashing and writing a multi-gigabyte checkpoint creates a real race
         # window after FFmpeg exits. Stop cleanly at the durable boundary rather
         # than entering mux/QC after shutdown or operator cancellation.

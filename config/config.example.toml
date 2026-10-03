@@ -16,3 +16,9 @@ release_profiles_path = "/etc/bdencode/release-profiles.json"
 # Automatikus SQLite mentés a <data_root>/state/backups mappába (0 = kikapcsolva).
 backup_interval_hours = 24
 backup_keep_scheduled = 14
+# A kiválasztott cím lemezfájljainak helyi másolata a referencia-remux előtt:
+# "auto" = csak lassú (hálózati / WSL 9p) csatoláson, "always", "never".
+source_staging = "auto"
+# A teljes című crop-keresés dekódolása: "auto" = NVDEC, ha elérhető (hibánál CPU),
+# "cuda" = mindig NVDEC, "none" = mindig CPU.
+crop_hwaccel = "auto"

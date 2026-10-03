@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -48,7 +49,12 @@ from bdencode.models import (
     ScanState,
     ScanUpdate,
 )
-from bdencode.process import CommandRunner, ProcessInterrupted
+from bdencode.process import (
+    CommandRunner,
+    ProcessFailure,
+    ProcessInterrupted,
+    ProcessResult,
+)
 from bdencode.qc.integrity import require_video_cadence as real_require_video_cadence
 from bdencode.qc.image_upload import ImageUploadError, UploadedImage
 from bdencode.queue import JobQueue
@@ -1280,6 +1286,130 @@ def test_prepare_checkpoint_skips_reference_remux_after_transition_crash(
         )
         == 1
     )
+
+
+def test_prepare_remuxes_a_slow_mount_disc_from_a_local_copy(context):
+    database, settings, scan, _scanner, runner, worker = context
+    (scan.source / "BDMV" / "STREAM").mkdir(parents=True)
+    (scan.source / "BDMV" / "index.bdmv").write_bytes(b"INDX0200")
+    (scan.source / "BDMV" / "STREAM" / "00099.m2ts").write_bytes(b"x" * 1000)
+    worker.settings = replace(settings, source_staging="always")
+    _enqueue(database, scan.source)
+    claimed = JobQueue(database).claim_next()
+    assert claimed is not None
+    ready = database.set_selection(worker.process_one_stage(claimed).id, _selection())
+
+    worker.process_one_stage(ready)
+
+    stage = settings.cache_root / "disc-stage"
+    remux = next(
+        command
+        for command in runner.commands
+        if command[0] == "ffmpeg" and "-playlist" in command
+    )
+    disc_input = remux[remux.index("-i") + 1]
+    assert disc_input.startswith("bluray:")
+    assert Path(disc_input.removeprefix("bluray:")).parent == stage
+    # The copy holds the disc structure but no clip the title does not play,
+    # and it is removed once the reference exists.
+    assert list(stage.iterdir()) == []
+    events = {event.kind for event in database.list_events(job_id=claimed.id)}
+    assert "worker.source-staged" in events
+
+
+def _is_integrity_decode(command: Sequence[str]) -> bool:
+    return "-progress" in command and "-xerror" in command
+
+
+def test_source_integrity_runs_in_the_encode_stage_not_in_preparation(context):
+    _database, _settings, _scan, _scanner, runner, worker = context
+    _job, encoding = _prepare_encoding(context)
+
+    # Preparation decodes the reference only for the crop scan.
+    assert not any(_is_integrity_decode(command) for command in runner.commands)
+    crop_scans = [
+        command
+        for command in runner.commands
+        if any("cropdetect=" in item for item in command)
+    ]
+    assert len(crop_scans) == 1
+    assert "-hwaccel" not in crop_scans[0]  # GPU decoding is for real runs only
+
+    result = worker.process_one_stage(encoding)
+
+    assert result.state is JobState.MUXING
+    positions = [
+        index
+        for index, command in enumerate(runner.commands)
+        if _is_integrity_decode(command)
+    ]
+    assert len(positions) == 1
+    encode = next(
+        index for index, command in enumerate(runner.commands) if command[0] == "vspipe"
+    )
+    assert positions[0] > encode
+
+
+def _concurrent_integrity(context, monkeypatch, *, corrupt: bool):
+    """Let the fake runner take the real-runner path: integrity beside the encode."""
+
+    database, settings, _scan, _scanner, runner, worker = context
+    job, encoding = _prepare_encoding(context)
+    monkeypatch.setattr(worker_module, "CommandRunner", FakeRunner)
+    real_run, real_pipeline = runner.run, runner.run_pipeline
+    integrity_started = threading.Event()
+    seen: dict[str, Any] = {}
+
+    def run(argv, **kwargs):
+        kwargs.pop("interrupt_requested", None)
+        command = tuple(os.fspath(item) for item in argv)
+        if _is_integrity_decode(command):
+            seen["integrity"] = command
+            integrity_started.set()
+            if corrupt:
+                runner._write(kwargs["stderr_path"], "Invalid NAL unit size\n")
+                raise ProcessFailure(
+                    ProcessResult(command, 1, 0.0, 0.0, None, kwargs["stderr_path"])
+                )
+        return real_run(argv, **kwargs)
+
+    def run_pipeline(commands, **kwargs):
+        # The integrity decode starts while the encode is running.
+        assert integrity_started.wait(10)
+        if corrupt:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if kwargs["interrupt_requested"]():
+                    seen["encode_stopped"] = True
+                    raise ProcessInterrupted()
+                time.sleep(0.01)
+            raise AssertionError("the encode was not stopped")
+        return real_pipeline(commands, **kwargs)
+
+    runner.run = run  # type: ignore[method-assign]
+    runner.run_pipeline = run_pipeline  # type: ignore[method-assign]
+    result = worker.process_job(encoding)
+    return result, JobPaths.create(settings, job.id), seen
+
+
+def test_source_integrity_runs_beside_the_encode_at_low_priority(context, monkeypatch):
+    result, paths, seen = _concurrent_integrity(context, monkeypatch, corrupt=False)
+
+    assert result.state not in {JobState.ENCODING, JobState.NEEDS_REVIEW}
+    assert (paths.stages / "source-video-integrity.json").is_file()
+    assert (paths.stages / "video-encode.json").is_file()
+    if os.name == "posix" and shutil.which("nice"):
+        assert seen["integrity"][:3] == ("nice", "-n", "10")
+
+
+def test_a_corrupt_source_found_beside_the_encode_stops_it(context, monkeypatch):
+    result, paths, seen = _concurrent_integrity(context, monkeypatch, corrupt=True)
+
+    assert result.state is JobState.NEEDS_REVIEW
+    assert "source video integrity" in (result.status_message or "") + (result.error or "")
+    assert seen["encode_stopped"]
+    assert not paths.encoded_video.exists()
+    assert not (paths.stages / "video-encode.json").exists()
 
 
 def test_prepare_converts_only_bluray_pcm_in_reference_remux(context):
