@@ -1281,10 +1281,11 @@ A trackerprofilok külön, root által kezelt fájlban vannak:
 
 A fix dupe/publish endpointokat és host-allowlisteket itt, a hozzájuk tartozó API-titkokat kizárólag titkosított systemd credentialként állítsd be. Az announce URL személyes passkeyt tartalmazhat, ezért magát a root-only profilfájlt és az abból készülő torrentet/upload kitet is titokként kezeld. A részletes lépések az [5.3. fejezetben](#53-trackerprofil-és-qbittorrent-beállítása) találhatók.
 
-**Az előkészítés gyorsítása.** Két kulcs (környezeti változóval is: `BDENCODE_SOURCE_STAGING`, `BDENCODE_CROP_HWACCEL`):
+**Az előkészítés gyorsítása.** Három kulcs (környezeti változóval is: `BDENCODE_SOURCE_STAGING`, `BDENCODE_CROP_HWACCEL`, `BDENCODE_SOURCE_FILTER`):
 
 - `source_staging = "auto"`: lassú csatolásról (Windows-meghajtó WSL alatt, hálózati megosztás) a kiválasztott cím lemezfájljai a referencia-remux előtt párhuzamos olvasással a helyi `<data_root>/cache/disc-stage` mappába másolódnak, és a remux onnan olvas. A másolat a remux után törlődik, a félbehagyott másolatok egy nap után. Helyigény a másolás idejére: a cím mérete plusz ugyanennyi a referenciának plusz 10 GB. Ha ez nincs meg, a lemez a helyén olvasódik (lassabban), és erről esemény kerül a jobhoz. `"always"` mindig másol, `"never"` soha.
 - `crop_hwaccel = "auto"`: a teljes című crop-keresés NVIDIA GPU-n NVDEC-kel dekódol (UHD-n kb. 148 fps a CPU kb. 50 fps-e helyett), hiba esetén CPU-n ismétel. `"none"` = mindig CPU.
+- `source_filter = "lsmas"`: a referencia VapourSynth-forrása az L-SMASH, amely a konténer csomagjaiból indexel (UHD-n kb. 90 mp). A `"bestsource"` minden képkockát dekódol az indexhez (UHD-n kb. 45 perc). A két forrás ugyanarra a képkockaszámra bitre azonos képet ad (valódi UHD-referencián ellenőrizve, véletlenszerű ugrásokkal is). Az index a crop-kereséssel egy időben készül.
 
 A forrás teljes, szigorú dekódolása (integritás-ellenőrzés, UHD-n kb. egy óra) nem az előkészítésben fut, hanem a videókódolással párhuzamosan, alacsonyabb CPU-prioritással (`nice -n 10`). Sérült forrásnál leállítja a kódolást, és a job felülvizsgálatra kerül („source video integrity diagnostics require review”). A muxolás csak sikeres ellenőrzés után indul. Az előkészítés csak a remux naplóját nézi át, mert az pillanatok alatt megvan.
 

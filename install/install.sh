@@ -544,6 +544,7 @@ env \
     -u BDENCODE_BACKUP_KEEP_SCHEDULED \
     -u BDENCODE_SOURCE_STAGING \
     -u BDENCODE_CROP_HWACCEL \
+    -u BDENCODE_SOURCE_FILTER \
     -u BDENCODE_LOG_LEVEL \
     "$release_root/venv/bin/python" -m pytest -q "$repo_root/tests"
 
@@ -561,7 +562,7 @@ install -d -m 0750 "$tool_config"
 XDG_CONFIG_HOME="$tool_config" "$tool_release/bin/vapoursynth" config
 XDG_CONFIG_HOME="$tool_config" "$tool_release/bin/vspipe" --version
 XDG_CONFIG_HOME="$tool_config" "$tool_release/bin/python" -c \
-    'from vapoursynth import core; assert all(hasattr(core,n) for n in ("bs","bwdif","vivtc","resize"))'
+    'from vapoursynth import core; assert all(hasattr(core,n) for n in ("bs","lsmas","bwdif","vivtc","resize"))'
 
 # Keep the native scanner inside the immutable tool release.  It still uses
 # Debian's libbluray, whose complete package transaction is now rollbackable.

@@ -289,7 +289,7 @@ runuser -u "$task_user" -- env \
     UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_CACHE_DIR="$UV_CACHE_DIR" \
     "$current_backend/venv/bin/uv" pip install \
     --python "$tool_release/bin/python" --upgrade \
-    'VapourSynth>=77,<78' 'vapoursynth-bestsource>=20,<21' \
+    'VapourSynth>=77,<78' 'vapoursynth-bestsource>=20,<21' 'vapoursynth-lsmas>=1310,<1311' \
     'vapoursynth-bwdif>=5.1,<6' 'vapoursynth-vivtc>=2,<3'
 install -d -m 0750 -o "$task_user" -g "$(id -gn "$task_user")" "$candidate_config"
 runuser -u "$task_user" -- env XDG_CONFIG_HOME="$candidate_config" \
@@ -323,7 +323,7 @@ runuser -u "$task_user" -- env XDG_CONFIG_HOME="$candidate_config" \
     "$tool_release/bin/vspipe" --version >>"$report_file" 2>&1
 runuser -u "$task_user" -- env XDG_CONFIG_HOME="$candidate_config" \
     "$tool_release/bin/python" -c \
-    'from vapoursynth import core; assert all(hasattr(core,n) for n in ("bs","bwdif","vivtc","resize"))'
+    'from vapoursynth import core; assert all(hasattr(core,n) for n in ("bs","lsmas","bwdif","vivtc","resize"))'
 runuser -u "$task_user" -- "$tool_release/bin/vmaf" --version >>"$report_file" 2>&1
 runuser -u "$task_user" -- "$tool_release/bin/bdencode-libbluray-scan" --help \
     >>"$report_file" 2>&1

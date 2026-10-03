@@ -1423,6 +1423,40 @@ def test_a_corrupt_source_found_beside_the_encode_stops_it(context, monkeypatch)
     assert not (paths.stages / "video-encode.json").exists()
 
 
+def test_the_source_index_is_built_beside_the_crop_scan(context, monkeypatch):
+    _database, settings, _scan, _scanner, runner, worker = context
+    # Let the fake runner take the real-runner path.
+    monkeypatch.setattr(worker_module, "CommandRunner", FakeRunner)
+    monkeypatch.setattr(worker_module, "cuda_decode_available", lambda: False)
+    runner.set_interrupt_requested = lambda _callback: runner  # type: ignore[attr-defined]
+    real_run = runner.run
+    crop_started, index_started = threading.Event(), threading.Event()
+
+    def run(argv, **kwargs):
+        kwargs.pop("interrupt_requested", None)
+        command = tuple(os.fspath(item) for item in argv)
+        if command[0] == "vspipe" and command[2].endswith("source-index.vpy"):
+            index_started.set()
+            # Each one waits for the other: they can only both finish when
+            # they run at the same time.
+            assert crop_started.wait(10)
+        if any("cropdetect=" in item for item in command):
+            crop_started.set()
+            assert index_started.wait(10)
+        return real_run(argv, **kwargs)
+
+    runner.run = run  # type: ignore[method-assign]
+    job, _encoding = _prepare_encoding(context)
+    paths = JobPaths.create(settings, job.id)
+
+    assert (paths.stages / "source-index.json").is_file()
+    index_script = (paths.work / "source-index.vpy").read_text(encoding="utf-8")
+    source_call = index_script.split("core.lsmas.LWLibavSource(")[1].split(")")[0]
+    assert ".lwi" in source_call
+    # The reference script reads the index built above.
+    assert source_call in paths.script.read_text(encoding="utf-8")
+
+
 def test_prepare_converts_only_bluray_pcm_in_reference_remux(context):
     database, _settings, scan, scanner, runner, worker = context
     audio_streams = (

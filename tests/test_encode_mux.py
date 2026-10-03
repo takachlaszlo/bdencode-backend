@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -36,8 +37,10 @@ from bdencode.mux import (
 from bdencode.vapoursynth import (
     Crop,
     ReferenceScriptPlan,
+    SourceFilter,
     TemporalFilter,
     render_reference_script,
+    script_record,
 )
 
 
@@ -100,11 +103,26 @@ def test_vapoursynth_script_is_frame_server_and_crop_auditable(tmp_path: Path) -
         crop=Crop(2, 4, 2, 4),
     )
     script = render_reference_script(plan)
-    assert "core.bs.VideoSource" in script
+    # L-SMASH by default: a packet index next to the cache path, the first
+    # video stream, and a fail-closed check of the stream's format.
+    assert "core.lsmas.LWLibavSource(" in script
+    assert f"cachefile={json.dumps(str((tmp_path / 'index').resolve()) + '.lwi')}" in script
+    assert "stream_index=0" in script
+    assert "if src.format is None:" in script
+    assert "core.bs.VideoSource" not in script
     assert "core.vivtc.VFM" in script
     assert "core.vivtc.VDecimate" in script
     assert "CropRel" in script
+    assert script.index("LWLibavSource") < script.index("VFM") < script.index("CropRel")
+    assert script_record(plan, script)["source_filter"] == "lsmas"
+
+    bestsource = replace(plan, source_filter=SourceFilter.BESTSOURCE)
+    script = render_reference_script(bestsource)
+    assert "core.bs.VideoSource" in script
+    assert "core.lsmas" not in script
     assert "exporttimestamps" not in script
+    # BestSource records keep the shape of earlier releases (valid checkpoints).
+    assert "source_filter" not in script_record(bestsource, script)
 
 
 def test_encode_pipeline_has_no_shell_syntax() -> None:

@@ -72,7 +72,7 @@ Az API-folyamat indulásakor egyszer lefutó crash recovery a félbemaradt `PREP
 
 Két összehasonlítási réteg készül:
 
-1. `REFERENCE_ALIGNED`: a forrásból BestSource-szal dekódolt, tényleges encode előtti crop/IVTC/deinterlace eredmény;
+1. `REFERENCE_ALIGNED`: a forrásból a beállított VapourSynth-forrással (alapból L-SMASH, választhatóan BestSource) dekódolt, tényleges encode előtti crop/IVTC/deinterlace eredmény;
 2. `ENCODE_DECODED`: a végleges, már muxolt MKV `v:0` sávjából dekódolt, azonos presentation frame.
 
 A kodek-összehasonlítás e két réteg között történik. Az I/P/B kategória mindig a kész encode frame típusa. Progresszív forrásnál a source bitstream frame típusa is kötelezően egyezik. Időbeli szűrés után a reference tömörítetlen, ezért ott source bitstream-típus nem értelmezhető, de ugyanazon reference index és a valós `vspipe --info` FPS-ből számított PTS kötelező.

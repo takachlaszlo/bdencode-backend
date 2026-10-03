@@ -219,6 +219,9 @@ def test_staging_and_crop_acceleration_settings_are_validated() -> None:
         Settings(source_roots=(Path("/srv/discs"),), data_root=Path("/srv/encode"), source_staging="sometimes").validate()
     with pytest.raises(ConfigurationError, match="crop_hwaccel"):
         Settings(source_roots=(Path("/srv/discs"),), data_root=Path("/srv/encode"), crop_hwaccel="vaapi").validate()
+    assert settings.source_filter == "lsmas"
+    with pytest.raises(ConfigurationError, match="source_filter"):
+        Settings(source_roots=(Path("/srv/discs"),), data_root=Path("/srv/encode"), source_filter="ffms2").validate()
 
 
 # --- crop scan and the source decode beside the encode ------------------------------------------

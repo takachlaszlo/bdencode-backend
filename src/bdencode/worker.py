@@ -278,6 +278,7 @@ from .utils import (
 from .vapoursynth import (
     Crop as VapourSynthCrop,
     ReferenceScriptPlan,
+    SourceFilter,
     TemporalFilter,
     render_reference_script,
     script_record,
@@ -3190,6 +3191,71 @@ class PipelineWorker:
             return "cuda"
         return None
 
+    def _source_plan(self, paths: JobPaths, **options: Any) -> ReferenceScriptPlan:
+        """A reference script plan with the configured source filter and its index cache."""
+
+        source_filter = SourceFilter(self.settings.source_filter)
+        return ReferenceScriptPlan(
+            source=paths.reference,
+            cache_path=paths.work / "cache" / source_filter.value,
+            source_filter=source_filter,
+            **options,
+        )
+
+    def _source_index_plan(self, paths: JobPaths) -> ReferenceScriptPlan:
+        """A script with exactly the reference script's source call, nothing after it.
+
+        The source filters key their index by source file and cache path, so
+        the index this script builds is the one every later reference script
+        reads.
+        """
+
+        return self._source_plan(paths, script_path=paths.work / "source-index.vpy")
+
+    def _start_source_index(self, job: Job, paths: JobPaths) -> _BackgroundRun | None:
+        runner = self._runner(paths)
+        if not isinstance(runner, CommandRunner):
+            return None
+        plan = self._source_index_plan(paths)
+        content = render_reference_script(plan)
+        info = paths.work / "source-index-info.txt"
+        inputs = {
+            "reference_sha256": sha256_file(paths.reference),
+            "script": script_record(plan, content),
+        }
+        marker = paths.stages / "source-index.json"
+        if _valid_stage(marker, inputs, [info]):
+            return None
+        atomic_write_text(plan.script_path, content)
+
+        def build(cancelled: Callable[[], bool]) -> None:
+            runner.run(
+                vspipe_info_command(plan.script_path),
+                cwd=paths.work,
+                stdout_path=info,
+                stderr_path=paths.logs / "source-index.log",
+                interrupt_requested=cancelled,
+            )
+            _write_stage(marker, inputs, [info])
+
+        return _BackgroundRun(build, name=f"source-index-{job.id}")
+
+    @staticmethod
+    def _finish_source_index(paths: JobPaths, index_build: _BackgroundRun) -> None:
+        """Wait for the index; a failed early build is redone by the next vspipe."""
+
+        try:
+            index_build.wait()
+        except (ProcessInterrupted, KeyboardInterrupt):
+            raise
+        except Exception:
+            LOG.warning(
+                "job %s: building the BestSource index beside the crop scan failed; "
+                "the reference script builds it instead",
+                paths.root.name,
+                exc_info=True,
+            )
+
     def _run_crop_scan(self, paths: JobPaths, log_path: Path) -> None:
         """Run the full-title crop scan, on the GPU when available (CPU on failure)."""
 
@@ -3461,113 +3527,123 @@ class PipelineWorker:
             selection,
             reference_sha256=reference_sha256,
         )
-        if not _valid_stage(crop_marker, crop_inputs, [crop_report]):
-            self._run_crop_scan(paths, crop_log_path)
-            crop_log = crop_log_path.read_text(encoding="utf-8", errors="replace")
-            try:
+        # BestSource's frame index needs a full CPU decode of the reference;
+        # it is built while the crop scan decodes on the GPU.
+        index_build = self._start_source_index(job, paths)
+        try:
+            if not _valid_stage(crop_marker, crop_inputs, [crop_report]):
+                self._run_crop_scan(paths, crop_log_path)
+                crop_log = crop_log_path.read_text(encoding="utf-8", errors="replace")
                 try:
-                    crop_evidence = parse_stable_cropdetect(
-                        crop_log,
-                        source_width=source_video.width,
-                        source_height=source_video.height,
-                    )
-                except CropPolicyError as unstable:
-                    # A title that changes aspect ratio has no dominant border;
-                    # accept it only when the log is a clean few-step envelope.
-                    explained = (
-                        variable_aspect_evidence(
+                    try:
+                        crop_evidence = parse_stable_cropdetect(
                             crop_log,
                             source_width=source_video.width,
                             source_height=source_video.height,
-                            duration_seconds=float(playlist.duration_seconds),
                         )
-                        if unstable.code == "unstable_detection"
-                        else None
+                    except CropPolicyError as unstable:
+                        # A title that changes aspect ratio has no dominant border;
+                        # accept it only when the log is a clean few-step envelope.
+                        explained = (
+                            variable_aspect_evidence(
+                                crop_log,
+                                source_width=source_video.width,
+                                source_height=source_video.height,
+                                duration_seconds=float(playlist.duration_seconds),
+                            )
+                            if unstable.code == "unstable_detection"
+                            else None
+                        )
+                        if explained is None:
+                            raise
+                        crop_evidence = explained
+                    requested_crop = ActiveCropMargins(
+                        left=selection.crop.left,
+                        top=selection.crop.top,
+                        right=selection.crop.right,
+                        bottom=selection.crop.bottom,
                     )
-                    if explained is None:
-                        raise
-                    crop_evidence = explained
-                requested_crop = ActiveCropMargins(
-                    left=selection.crop.left,
-                    top=selection.crop.top,
-                    right=selection.crop.right,
-                    bottom=selection.crop.bottom,
+                    automatic = not any(asdict(requested_crop).values())
+                    effective_crop = (
+                        automatic_crop(crop_evidence) if automatic else requested_crop
+                    )
+                    crop_decision = validate_operator_crop(effective_crop, crop_evidence)
+                except CropPolicyError as exc:
+                    atomic_write_json(
+                        crop_report,
+                        {
+                            "schema_version": 1,
+                            "status": "needs_review",
+                            "code": exc.code,
+                            "message": str(exc),
+                        },
+                    )
+                    raise ReviewRequired(
+                        f"crop policy requires review: {exc}",
+                        details={"code": exc.code, "report": crop_report.name},
+                    ) from exc
+                aspect_profile = parse_aspect_profile(
+                    crop_log,
+                    source_width=source_video.width,
+                    source_height=source_video.height,
+                    duration_seconds=float(playlist.duration_seconds),
                 )
-                automatic = not any(asdict(requested_crop).values())
-                effective_crop = (
-                    automatic_crop(crop_evidence) if automatic else requested_crop
-                )
-                crop_decision = validate_operator_crop(effective_crop, crop_evidence)
-            except CropPolicyError as exc:
                 atomic_write_json(
                     crop_report,
                     {
                         "schema_version": 1,
-                        "status": "needs_review",
-                        "code": exc.code,
-                        "message": str(exc),
+                        "status": "passed",
+                        "selection_mode": "automatic" if automatic else "manual",
+                        "evidence": crop_evidence.to_dict(),
+                        "decision": crop_decision.to_dict(),
+                        "aspect_profile": (
+                            aspect_profile.to_dict() if aspect_profile else None
+                        ),
                     },
                 )
-                raise ReviewRequired(
-                    f"crop policy requires review: {exc}",
-                    details={"code": exc.code, "report": crop_report.name},
-                ) from exc
-            aspect_profile = parse_aspect_profile(
-                crop_log,
-                source_width=source_video.width,
-                source_height=source_video.height,
-                duration_seconds=float(playlist.duration_seconds),
-            )
-            atomic_write_json(
-                crop_report,
-                {
-                    "schema_version": 1,
-                    "status": "passed",
-                    "selection_mode": "automatic" if automatic else "manual",
-                    "evidence": crop_evidence.to_dict(),
-                    "decision": crop_decision.to_dict(),
-                    "aspect_profile": (
-                        aspect_profile.to_dict() if aspect_profile else None
-                    ),
-                },
-            )
-            _write_stage(crop_marker, crop_inputs, [crop_report])
-            if aspect_profile is not None and aspect_profile.variable:
+                _write_stage(crop_marker, crop_inputs, [crop_report])
+                if aspect_profile is not None and aspect_profile.variable:
+                    self.database.add_event(
+                        EventCreate(
+                            job_id=job.id,
+                            kind="worker.variable-aspect",
+                            message=aspect_profile.summary(),
+                            payload=aspect_profile.to_dict(),
+                        )
+                    )
+
+            try:
+                crop_document = json.loads(crop_report.read_text(encoding="utf-8"))
+                effective_crop_raw = crop_document["decision"]["requested"]
+                effective_crop = VapourSynthCrop(**effective_crop_raw)
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ReviewRequired(f"automatic crop report is invalid: {exc}") from exc
+            if effective_crop != selection.crop:
+                effective_selection = parse_selection(
+                    job,
+                    scan,
+                    crop_override=effective_crop,
+                )
+                selection = replace(effective_selection, tracks=selection.tracks)
                 self.database.add_event(
                     EventCreate(
                         job_id=job.id,
-                        kind="worker.variable-aspect",
-                        message=aspect_profile.summary(),
-                        payload=aspect_profile.to_dict(),
+                        kind="worker.auto-crop",
+                        message="automatic crop applied from full-title evidence",
+                        payload={"crop": asdict(effective_crop)},
                     )
                 )
 
-        try:
-            crop_document = json.loads(crop_report.read_text(encoding="utf-8"))
-            effective_crop_raw = crop_document["decision"]["requested"]
-            effective_crop = VapourSynthCrop(**effective_crop_raw)
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ReviewRequired(f"automatic crop report is invalid: {exc}") from exc
-        if effective_crop != selection.crop:
-            effective_selection = parse_selection(
-                job,
-                scan,
-                crop_override=effective_crop,
-            )
-            selection = replace(effective_selection, tracks=selection.tracks)
-            self.database.add_event(
-                EventCreate(
-                    job_id=job.id,
-                    kind="worker.auto-crop",
-                    message="automatic crop applied from full-title evidence",
-                    payload={"crop": asdict(effective_crop)},
-                )
-            )
-
-        # Resolve uncertain retained audio tracks now: this avoids discovering
-        # a language problem only after a multi-hour video encode. Manual track
-        # language choices remain authoritative and skip content inference.
-        selection = self._resolve_selected_languages(job, scan, selection, paths)
+            # Resolve uncertain retained audio tracks now: this avoids discovering
+            # a language problem only after a multi-hour video encode. Manual track
+            # language choices remain authoritative and skip content inference.
+            selection = self._resolve_selected_languages(job, scan, selection, paths)
+        except BaseException:
+            if index_build is not None:
+                index_build.cancel()
+            raise
+        if index_build is not None:
+            self._finish_source_index(paths, index_build)
         try:
             dynamic_plan = resolve_selection_dynamic_hdr(scan, selection)
         except DynamicHdrError as exc:
@@ -3609,9 +3685,8 @@ class PipelineWorker:
             )
         atomic_write_json(paths.plan_json, encode_plan.to_dict())
 
-        script_plan = ReferenceScriptPlan(
-            source=paths.reference,
-            cache_path=paths.work / "cache" / "bestsource",
+        script_plan = self._source_plan(
+            paths,
             script_path=paths.script,
             temporal_filter=selection.temporal_filter,
             crop=selection.crop,
@@ -3946,9 +4021,8 @@ class PipelineWorker:
             ) from exc
 
         sample_script = work / "sample.vpy"
-        sample_plan = ReferenceScriptPlan(
-            source=paths.reference,
-            cache_path=paths.work / "cache" / "bestsource",
+        sample_plan = self._source_plan(
+            paths,
             script_path=sample_script,
             temporal_filter=selection.temporal_filter,
             crop=selection.crop,

@@ -22,3 +22,6 @@ source_staging = "auto"
 # A teljes című crop-keresés dekódolása: "auto" = NVDEC, ha elérhető (hibánál CPU),
 # "cuda" = mindig NVDEC, "none" = mindig CPU.
 crop_hwaccel = "auto"
+# A referencia VapourSynth-forrása: "lsmas" (L-SMASH, UHD-n kb. 90 mp-es index)
+# vagy "bestsource" (minden képkockát dekódol az indexhez, UHD-n kb. 45 perc).
+source_filter = "lsmas"

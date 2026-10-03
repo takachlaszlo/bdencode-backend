@@ -310,7 +310,7 @@ def _vapoursynth_plugins() -> dict[str, Any]:
     code = (
         "from vapoursynth import core; "
         "import json; "
-        "print(json.dumps({n:hasattr(core,n) for n in ('bs','bwdif','vivtc','resize')}))"
+        "print(json.dumps({n:hasattr(core,n) for n in ('bs','lsmas','bwdif','vivtc','resize')}))"
     )
     try:
         completed = subprocess.run(
