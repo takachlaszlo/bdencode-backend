@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bdencode-backend"
-version = "2.7.0"
+version = "2.7.1"
 description = "Headless, persistent Blu-ray and UHD Blu-ray encoding backend"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,8 @@ language = [
   "faster-whisper==1.2.1",
 ]
 test = [
+  # The speech samples are decoded with numpy (faster-whisper's own dependency).
+  "numpy>=1.24",
   "pytest>=8,<9",
   "pytest-cov>=5,<7",
 ]

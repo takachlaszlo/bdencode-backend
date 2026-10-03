@@ -302,6 +302,17 @@ def test_worker_systemd_unit_waits_for_notify_readiness() -> None:
     assert "Type=simple\n" not in unit
 
 
+def test_worker_systemd_unit_reaches_only_the_wsl_gpu_device() -> None:
+    unit = (
+        Path(__file__).parents[1] / "deploy" / "systemd" / "bdencode-worker.service.in"
+    ).read_text(encoding="utf-8")
+
+    # The private /dev stays; only the WSL GPU node is added (optional binding).
+    assert "PrivateDevices=true\n" in unit
+    assert "BindPaths=-/dev/dxg\n" in unit
+    assert "DeviceAllow=/dev/dxg rw\n" in unit
+
+
 def test_worker_maintenance_markers_are_fail_closed(
     tmp_path: Path, monkeypatch
 ) -> None:
