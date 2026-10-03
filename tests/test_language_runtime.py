@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import os
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -17,9 +19,15 @@ from bdencode.media.language_runtime import (
 
 
 def _wav_bytes() -> bytes:
-    # The runtime only needs a valid, non-empty RIFF/WAVE extraction artifact;
+    # A real 16 kHz mono 16-bit PCM extraction (one second of silence);
     # faster-whisper is replaced by a fake in these unit tests.
-    return b"RIFF" + (64).to_bytes(4, "little") + b"WAVEfmt " + b"\x00" * 64
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\x00\x00" * 16000)
+    return buffer.getvalue()
 
 
 class FakeRunner:
@@ -126,6 +134,10 @@ def test_cpu_int8_runtime_extracts_six_samples_and_returns_provenance(media):
         assert command[command.index("-ac") + 1] == "1"
         assert command[command.index("-ar") + 1] == "16000"
     assert all(call[1]["vad_filter"] is True for call in model.calls)
+    # The samples reach faster-whisper decoded (not as paths for PyAV).
+    for audio, _kwargs in model.calls:
+        assert str(audio.dtype) == "float32"
+        assert audio.shape == (16000,)
     json.dumps(result)  # explicitly JSON-compatible
 
 

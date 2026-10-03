@@ -30,6 +30,9 @@ CPUQuota=@CPU_QUOTA@
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
+# The WSL GPU device (NVDEC decoding of the crop scan); absent elsewhere.
+BindPaths=-/dev/dxg
+DeviceAllow=/dev/dxg rw
 ProtectSystem=strict
 ProtectHome=read-only
 ProtectKernelTunables=true

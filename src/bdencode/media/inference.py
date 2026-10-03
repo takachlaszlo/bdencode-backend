@@ -237,7 +237,34 @@ def language_consensus(
 
 
 class FasterWhisperModel(Protocol):
-    def transcribe(self, audio: str, **kwargs: Any) -> tuple[Iterable[Any], Any]: ...
+    def transcribe(self, audio: Any, **kwargs: Any) -> tuple[Iterable[Any], Any]: ...
+
+
+WHISPER_SAMPLE_RATE = 16000
+
+
+def read_pcm_wav(wav_path: Path) -> Any:
+    """The 16 kHz mono 16-bit PCM sample as float32 values in [-1, 1).
+
+    faster-whisper would decode a file path itself through PyAV, but
+    faster-whisper 1.2.1 passes ``metadata_errors`` to ``av.open``, which newer
+    PyAV releases reject.  The samples are extracted in exactly this format, so
+    they are read here and handed over as an array.
+    """
+
+    import wave
+
+    import numpy
+
+    with wave.open(str(wav_path), "rb") as handle:
+        if (
+            handle.getnchannels() != 1
+            or handle.getsampwidth() != 2
+            or handle.getframerate() != WHISPER_SAMPLE_RATE
+        ):
+            raise ValueError(f"{wav_path.name} is not 16 kHz mono 16-bit PCM")
+        frames = handle.readframes(handle.getnframes())
+    return numpy.frombuffer(frames, dtype="<i2").astype(numpy.float32) / 32768.0
 
 
 def detect_with_faster_whisper(
@@ -246,7 +273,7 @@ def detect_with_faster_whisper(
     window: SampleWindow,
 ) -> ContentLanguageSample:
     segments, info = model.transcribe(
-        str(wav_path),
+        read_pcm_wav(wav_path),
         beam_size=1,
         vad_filter=True,
         condition_on_previous_text=False,
