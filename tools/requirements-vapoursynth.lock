@@ -2,5 +2,6 @@
 # them after a smoke test while the encode queue is idle.
 VapourSynth==77
 vapoursynth-bestsource==20.0
+vapoursynth-lsmas==1310.0.0.0
 vapoursynth-bwdif==5.1
 vapoursynth-vivtc==2.0

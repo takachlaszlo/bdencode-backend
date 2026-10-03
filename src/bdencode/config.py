@@ -64,6 +64,10 @@ class Settings:
     # Decode for the full-title crop scan: "auto" uses NVDEC when ffmpeg and the
     # driver support it (falling back to the CPU), "none" always uses the CPU.
     crop_hwaccel: str = "auto"
+    # VapourSynth source of the reference: "lsmas" (L-SMASH, packet index in
+    # about 90 s for a UHD title) or "bestsource" (decodes every frame for its
+    # index, about 45 min for a UHD title).
+    source_filter: str = "lsmas"
 
     @property
     def state_root(self) -> Path:
@@ -120,6 +124,8 @@ class Settings:
             raise ConfigurationError("source_staging must be auto, always or never")
         if self.crop_hwaccel not in {"auto", "cuda", "none"}:
             raise ConfigurationError("crop_hwaccel must be auto, cuda or none")
+        if self.source_filter not in {"lsmas", "bestsource"}:
+            raise ConfigurationError("source_filter must be lsmas or bestsource")
         if (
             not self.ai_model
             or len(self.ai_model) > 100
