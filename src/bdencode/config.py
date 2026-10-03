@@ -58,6 +58,12 @@ class Settings:
     # backups are always available.
     backup_interval_hours: int = 24
     backup_keep_scheduled: int = 14
+    # Copy the selected title's disc files to local disk before the reference
+    # remux: "auto" does it for slow (network / WSL 9p) mounts only.
+    source_staging: str = "auto"
+    # Decode for the full-title crop scan: "auto" uses NVDEC when ffmpeg and the
+    # driver support it (falling back to the CPU), "none" always uses the CPU.
+    crop_hwaccel: str = "auto"
 
     @property
     def state_root(self) -> Path:
@@ -110,6 +116,10 @@ class Settings:
             )
         if not 1 <= self.backup_keep_scheduled <= 60:
             raise ConfigurationError("backup_keep_scheduled must be between 1 and 60")
+        if self.source_staging not in {"auto", "always", "never"}:
+            raise ConfigurationError("source_staging must be auto, always or never")
+        if self.crop_hwaccel not in {"auto", "cuda", "none"}:
+            raise ConfigurationError("crop_hwaccel must be auto, cuda or none")
         if (
             not self.ai_model
             or len(self.ai_model) > 100

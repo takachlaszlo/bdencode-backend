@@ -542,6 +542,8 @@ env \
     -u BDENCODE_AI_TIMEOUT_SECONDS \
     -u BDENCODE_BACKUP_INTERVAL_HOURS \
     -u BDENCODE_BACKUP_KEEP_SCHEDULED \
+    -u BDENCODE_SOURCE_STAGING \
+    -u BDENCODE_CROP_HWACCEL \
     -u BDENCODE_LOG_LEVEL \
     "$release_root/venv/bin/python" -m pytest -q "$repo_root/tests"
 
